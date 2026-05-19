@@ -1,0 +1,28 @@
+target/
+.omx/
+.clawd-agents/
+.claude/
+.config/
+*.env
+*.key
+
+# Build artifacts
+target/
+dist/
+
+# Tool caches
+.clawd-*
+.omc/
+.sandbox-home/
+.sandbox-tmp/
+.DS_Store
+.claude/sessions/
+__pycache__/
+*.pyc
+
+# ARIS runtime state (per-project traces, caches, installed-skills manifest)
+.aris/
+
+# Web console local build/dependency artifacts
+web/frontend/node_modules/
+web/frontend/dist/
