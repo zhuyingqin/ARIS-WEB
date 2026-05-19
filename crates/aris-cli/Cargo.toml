@@ -1,0 +1,29 @@
+[package]
+name = "aris-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aris"
+path = "src/main.rs"
+
+[dependencies]
+api = { path = "../api" }
+commands = { path = "../commands" }
+compat-harness = { path = "../compat-harness" }
+crossterm = "0.28"
+ctrlc = "3"
+serde = { version = "1", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+pulldown-cmark = "0.13"
+runtime = { path = "../runtime" }
+serde_json = "1"
+sha2 = "0.10"
+syntect = "5"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tools = { path = "../tools" }
+
+[lints]
+workspace = true

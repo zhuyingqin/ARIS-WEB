@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - aris-code
+      - main
+  push:
+    branches:
+      - aris-code
+      - main
+
+# Cancel in-progress runs for the same PR/branch when new commits land.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Minimum viable gate: ensures aris-code branch + every PR can build
+  # and pass the regression test suite that protects v0.4.x fixes.
+  #
+  # Intentionally NOT included yet (tracked in follow-up tickets):
+  #   - cargo fmt --check         (pre-existing fmt inconsistencies; needs single cleanup PR first)
+  #   - cargo clippy -D warnings  (pre-existing pedantic warnings; tighten incrementally)
+  #   - macos cargo test          (one pre-existing macos-specific failure in tools::repl_executes_python_code)
+  test:
+    name: cargo build + test (ubuntu)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ubuntu-cargo-
+
+      - name: cargo build (workspace)
+        run: cargo build --workspace --all-targets
+
+      - name: cargo test (workspace, serial)
+        # --test-threads=1 prevents cwd race conditions in tests that spawn
+        # subprocesses (e.g. tools::web_search_*, subagent_runtime_*) which
+        # share process-global cwd on ubuntu runners.
+        run: cargo test --workspace -- --test-threads=1
+
+  build-macos:
+    name: cargo build (macos)
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            macos-cargo-
+
+      - name: cargo build (workspace)
+        run: cargo build --workspace --all-targets

@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: aris-code-darwin-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: aris-code-darwin-x64
+          # Build Linux releases on Ubuntu 22.04 so the resulting GNU binary
+          # stays compatible with Ubuntu 22.04 users (glibc 2.35).
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: aris-code-linux-x64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: aris-code-windows-x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # v0.4.9: native-tls (api + aris-cli + tools, all crates) requires
+      # OpenSSL system headers on Linux. ubuntu-22.04 runners ship libssl3
+      # by default but NOT libssl-dev / pkg-config. Without these the
+      # build fails on openssl-sys with "could not find OpenSSL". macOS
+      # uses Secure Transport (no system dep) and Windows uses SChannel.
+      - name: Install OpenSSL deps (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cp target/${{ matrix.target }}/release/aris aris
+          chmod +x aris
+          tar czf ${{ matrix.artifact }}.tar.gz aris
+          shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item "target/${{ matrix.target }}/release/aris.exe" "aris.exe"
+          Compress-Archive -Path "aris.exe" -DestinationPath "${{ matrix.artifact }}.zip"
+          (Get-FileHash "${{ matrix.artifact }}.zip" -Algorithm SHA256).Hash.ToLower() + "  ${{ matrix.artifact }}.zip" | Out-File "${{ matrix.artifact }}.zip.sha256" -Encoding ASCII
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.tar.gz.sha256
+            ${{ matrix.artifact }}.zip
+            ${{ matrix.artifact }}.zip.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            aris-code-darwin-arm64.tar.gz
+            aris-code-darwin-arm64.tar.gz.sha256
+            aris-code-darwin-x64.tar.gz
+            aris-code-darwin-x64.tar.gz.sha256
+            aris-code-linux-x64.tar.gz
+            aris-code-linux-x64.tar.gz.sha256
+            aris-code-windows-x64.zip
+            aris-code-windows-x64.zip.sha256
+          generate_release_notes: true

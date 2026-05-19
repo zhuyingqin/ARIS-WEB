@@ -1,0 +1,125 @@
+# INTRODUCTION_REVISED.md — ARIS-Code Paper Introduction (Revision 1)
+
+**Source**: INTRODUCTION_DRAFT.md (draft v1)
+**Review basis**: INTRO_REVIEW.md (5 critical, 4 minor, 1 structural)
+**Date**: 2026-05-19
+**Changes**: 10 issues addressed (see INTRO_REVISION_SUMMARY.md for detail)
+**Status**: Revision 1 — ready for external review
+
+---
+
+## Introduction
+
+Academic research involves many repetitive, time-consuming tasks: literature search,
+idea generation, experiment planning, paper writing, review, and rebuttal. Researchers
+report spending a significant portion of their time on these meta tasks rather than
+core scientific work, and this burden grows at an accelerating rate as the volume of
+published research increases. For example, a researcher iterating between literature
+review and experiment planning must manually coordinate between multiple separate tools,
+each with its own interface and state management — creating friction that compounds
+across the full research lifecycle. The research enterprise increasingly needs
+automation that goes beyond single-tool assistance to cover the full research pipeline
+end-to-end.
+
+Prior work on LLM-based multi-agent systems has advanced the field in important ways.
+Voyager introduced a lifelong learning agent with a skill library for embodied tasks
+(Wang et al., 2023). CAMEL proposed multi-agent role-playing for collaborative task-solving
+(AI et al., 2023). Reflexion demonstrated verbal self-reflection as a mechanism for improving
+LLM agents (Shinn et al., 2023). AutoGen and Swarms provided multi-agent conversation
+frameworks with customizable roles (Wu et al., 2023; Swarms, 2024). Meanwhile, research
+assistants such as Semantic Scholar and Elicit offer single-agent assistance for isolated
+literature tasks, and coding assistants such as Claude Code provide tool-augmented
+development support. Despite this progress, no existing system combines end-to-end
+academic research automation via a CLI with (1) a dedicated adversarial reviewer separate
+from the executor, (2) cross-provider executor-reviewer pairing, (3) a 74-skill bundled
+ecosystem, and (4) a browser-based DAG workflow interface. Key limitations of prior
+systems that ARIS-Code addresses include: (1) no system connects idea discovery,
+literature survey, experiment planning, paper writing, review, and submission as a
+unified command-line interface; (2) no system implements a dedicated adversarial reviewer
+separate from the executor agent, instead relying on self-reflection within a single
+model's biases; (3) all prior multi-agent systems use a single LLM provider, limiting
+the diversity needed for genuinely adversarial evaluation; (4) no system bundles a large
+domain-specific skill ecosystem for research automation; and (5) no system provides a
+browser-based workflow orchestration interface for non-technical researchers.
+
+The key insight behind ARIS-Code is that research quality can be improved through an
+**executor-reviewer adversarial loop**: one LLM (the Executor) generates research artifacts
+— ideas, text, code, experimental plans — while a separate, independently prompted LLM
+(the Reviewer) critiques the output using a formal review protocol. Crucially, the Executor
+and Reviewer can be from **different providers** (e.g., Claude for execution, GPT for review),
+enabling cross-provider adversarial quality control with the goal of eliminating
+shared-model bias from the review process. This architecture generalizes the self-reflection
+idea in Reflexion (Shinn et al., 2023) to a two-agent, cross-provider design with explicit
+iteration termination criteria. The loop continues until the Reviewer assesses quality as
+sufficient — or a maximum iteration bound is reached. To our knowledge, no prior multi-agent
+system has implemented this executor-reviewer pairing across different providers with formal
+review protocols.
+
+ARIS-Code is a terminal-based multi-agent research CLI built around this executor-reviewer
+loop. The Executor layer runs a configurable primary LLM that executes research tasks via
+natural-language instructions from the user. The Reviewer layer runs an independent,
+configurable LLM that evaluates Executor output through the LlmReview tool with
+task-specific review criteria. The skill ecosystem bundles 74 skills covering the full
+research pipeline — idea-discovery, research-lit, experiment-plan, paper-write,
+paper-compile, auto-review-loop, rebuttal, and resubmit-pipeline, among others — along
+with supporting helpers such as reusable prompt templates and tool wrappers. Each skill
+is version-pinned via SKILLS_SOURCE_COMMIT for reproducible execution. Skills are resolved
+through a canonical fallback chain (`.aris/tools/` → `tools/` → `$ARIS_REPO/tools/` →
+`$ARIS_CACHE_DIR/<version>/`) ensuring consistent availability across environments.
+ARIS Web provides a local browser-based console for DAG-based multi-agent workflow
+orchestration with node-level editing, enabling non-technical researchers to compose
+multi-step research pipelines visually. The system supports Anthropic, OpenAI, Gemini,
+GLM, MiniMax, DeepSeek, Kimi, Qwen, and Doubao as Executor, Reviewer, or both, with
+automatic stream restart on connection failure and canonical resolver-based reliability
+engineering.
+
+This paper makes the following contributions:
+
+1. **A multi-agent executor-reviewer CLI for end-to-end research automation.** ARIS-Code
+   is, to our knowledge, the first system to cover the full academic research pipeline
+   via a natural-language CLI with a dedicated adversarial Reviewer LLM in an iterative loop.
+
+2. **A cross-provider adversarial architecture for research quality control.** We design
+   an executor-reviewer architecture that pairs LLMs from different providers (e.g.,
+   Claude Executor + GPT Reviewer) with the goal of eliminating shared-model bias in
+   the review process — a configuration that single-provider multi-agent systems cannot realize.
+
+3. **A large-scale open-source research automation skill ecosystem with canonical
+   resolution and version pinning.** ARIS-Code bundles 74 skills and supporting helpers
+   covering idea generation, literature review, experiment planning, paper writing,
+   review, rebuttal, and submission, with version-pinned reproducibility via
+   SKILLS_SOURCE_COMMIT.
+
+4. **A local web console with DAG-based multi-agent workflow orchestration.** ARIS Web
+   provides a browser-based interface for composing and executing multi-step research
+   pipelines, lowering the barrier for non-technical researchers to benefit from
+   multi-agent automation.
+
+The remainder of this paper is organized as follows. Section 2 provides background
+on multi-agent LLM orchestration, executor-reviewer patterns, and research automation
+tools. Section 3 describes the system design, including the executor-reviewer loop,
+skill ecosystem, canonical resolver, and provider architecture. Section 4 details the
+implementation of ARIS Web, the workflow orchestrator, the 74 skills, and the version
+pinning mechanism. Section 5 presents case studies and qualitative evaluation from
+the v0.4.11 release, including examples of the executor-reviewer loop on research
+writing and experiment planning tasks. Section 6 discusses related work, and
+Section 7 addresses limitations and future directions.
+
+---
+
+## Evidence Flags (Post-Revision)
+
+| Location | Claim | Status |
+|----------|-------|--------|
+| P1, sentence 3 | "grows at an accelerating rate" | OK — softened from "exponentially" |
+| P1, pain point | Concrete example added | OK — no citation needed |
+| P2, sentence 4 | Conjunctive claim for gap | OK — ties to ARIS-Code's specific features |
+| P3 | Cross-provider framed as design goal | OK — not empirical claim |
+| P5, contribution 3 | "large-scale" not "largest" | OK — superlative removed |
+| P5, contribution 1 | Tied to CLI + adversarial reviewer | OK — not redundant with P2 |
+| P4 | "embedded helpers" defined briefly | OK — parenthetical added |
+| P6 | Section 5 now specific | OK — case studies + qualitative evaluation |
+
+---
+
+*Revision complete. 10 issues addressed. No new evidence collection required.*
