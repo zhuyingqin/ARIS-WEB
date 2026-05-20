@@ -26,49 +26,11 @@
 
 ## 📰 最新动态
 
-> **v0.4.11** (2026-05-18) — **Skills 包刷新 / research workflow 同步 release**。Binary runtime 行为相对 v0.4.10 基本不变；嵌入的 skill 集合追上 `main` 当前状态。**新嵌入 10 个 skill**：`/citation-audit`（第四层文献审计：存在性 + metadata + 引用 context 覆盖）+ `/experiment-queue`（SSH 多 seed 任务队列，含 OOM retry + 残留 screen 清理）+ `/kill-argument`（理论论文双线对抗审）+ `/resubmit-pipeline`（W5：纯文本换会议投稿，含 kill-argument 门）+ `/paper-talk`（端到端 conference talk pipeline）+ `/slides-polish`（逐页 Codex 排版审）+ `/overleaf-sync`（通过 Git bridge 双向同步 Overleaf，token 走 Keychain）+ `/gemini-search` + `/openalex`（更广文献源）+ `/qzcli`（启智平台 GPU 任务管理）。**46 个已有 SKILL.md 刷新** —— 最重要的是 canonical resolver chain 全面铺开（修复真实用户事故：research-wiki 因硬编码 `tools/research_wiki.py` 空了一周）+ submission assurance gate + external verifier 上线（paper-writing Phase 6 现在能跑通）+ proof-checker `--restatement-check` / `--deep-fix` opt-in flag。**Helpers**：tools/ 9 → 18 个；`research_wiki.py` 从 315 行刷到 767 行（含 canonical `ingest_paper` API；否则 SKILL.md 调的 API 在 bundle 里不存在）。**Sync 基础设施**：`tools/sync_main_skills.sh` 自动化 main → bundle rsync（含 symlink 前置检测 + codex-mirror prune + `SKILLS_SOURCE_COMMIT` 钉版本）；3 个新 CI drift test 覆盖全部 4 个 resolver layer pattern。**Gemini MCP** 在 `/research-lit` 改成 `model: 'auto-gemini-3'`。全程 Codex MCP（gpt-5.5 xhigh）4 轮交叉评审。
-
-> **v0.4.10** (2026-05-17) — **流式 + MCP 可靠性 release**。**C6**（关闭 `#228` 那条 "error decoding response body" 中流报错循环）：Anthropic `MessageStream` 和 OpenAI SSE 循环均支持 chunk decode 失败 / 早 EOF 时整段重启请求（`ARIS_STREAM_RETRY`，默认 2，clamp 0..=5，只在尚未输出任何内容时触发，输出不会撕裂）。**M3**（关闭 `#151` / `#172` "Calling codex..." 卡死）：MCP stdio `request()` 加 300s 默认超时同时覆盖 send + read（env `MCP_REQUEST_TIMEOUT_SECS` 覆盖，clamp 1..=1800）；`response.id ↔ request.id` 关联校验；`ensure_server_ready()` 用 `try_wait()` 检测进程死亡并透明 respawn；任何失败路径都 `kill().await` 回收子进程让下次调用从干净状态开始。新增 3 个 MCP regression test。**C8/P4**：OpenAI 流式请求体加 `stream_options.include_usage: true`，解析 `prompt_tokens_details.cached_tokens` → `cache_read_input_tokens`；Anthropic `MessageStart.usage`（含 input + cache 两半）和 `MessageDelta.usage`（含 output）合并，让 post-compaction cache 命中率显示真实数字。**C9** 多 provider 计费：GPT-5.5/5.4/o1/o3/o4（cache_read = input × 0.1，OpenAI 实际 prefix-cache 折扣——此前 generic 50% 高估了 5 倍）、Gemini 2.5/2.0、DeepSeek V3/V4/R1（区分 cache_hit / cache_miss）、GLM、MiniMax、Kimi/Moonshot、MiMo、Qwen、Doubao；`has_word()` 边界匹配让 `openai/o3-mini` / `provider/<model>` 正确路由 tier。**清理**：9 个 dead-code warning 修复，`aris setup` help 文案 + doctor 字符串与实际行为同步，对 v0.4.10 触及的 7 个文件跑 `cargo fmt`。全程 Codex MCP（gpt-5.5 xhigh）交叉评审。
-
-> **v0.4.9** (2026-05-17) — **关闭 Codex v0.4.7 audit 残留 (L1+L3+L4)** + skill-helper 子系统收尾。**L1**：`tools` crate 也切到 `native-tls`，三个 reqwest 消费者 TLS 统一（DashScope 类 endpoint 走 LlmReview reviewer path 也能用了，不只是主 executor）。Linux CI 装 OpenSSL dev headers。**L3**：ApiClient trait 加 `on_session_compacted()`；OpenAI message-index-keyed reasoning_cache 在 auto-compaction 后清空，post-compaction replay 不再 aim 错误 index。**L4**：拆 `supports_reasoning_content_replay` predicate（超集含 Kimi/Moonshot/Xiaomi-MiMo/DeepSeek-R1 — 这些 emit reasoning_content 但不接受 reasoning_effort）+ 32K char 单 turn cap + 128K char 总 cache cap（oldest-eviction）。另：2 个新 skill 嵌入（`/figure-spec` + `/paper-illustration-image2` 含 `scripts/` 子目录，新 resolver Layer 0b = `$ARIS_CACHE_DIR/skills/<name>/scripts/`）；`research_wiki.py` 从 skill-local 提升到 shared `tools/`（9+ 调用方）；5 个 SKILL.md 迁移到 fallback chain（`exa-search`, `semantic-scholar`, `arxiv`, `idea-creator`）；inventory cargo test + smoke shell 脚本防 H6 regression。
-
-> **v0.4.8** (2026-05-17) — **Skill helper 子系统重写** + **两个社区 bug 修复**。Bundled helper 现在 startup 时提取到 `~/.config/aris/cache/<version>/`（而不是 cwd）；每次 Skill 调用都会输出 `helperReport`（含 cache dir + 4 层 resolver preamble）。`/skills export` 一并导出 helper。新 `integration-contract.md` 定义 6 个失败策略（A gate / B side-effect / C forensic / D1 cascade / D2 multi-source / E diagnostic）。8 个 shared helper（arxiv/deepxiv/exa/S2/openalex fetcher + save_trace + verify_papers + verify_paper_audits）嵌入二进制。`/research-lit` + `/deepxiv` SKILL.md 迁移到 fallback chain。修复：(a) `gpt-5.5 + tools` 在 OpenAI 400 错误（gpt-5.5/o3/o4 + tools 时剥离 `reasoning_effort`），(b) Custom reviewer 每次启动变 gpt-5.5（`/setup` 菜单选项 9 vs 8 bug + `LlmReview` 不再为 Custom fallback gpt-5.5）。
-
-> **v0.4.7** (2026-05-16) — **DashScope Coding Plan 405 修复**（#159）通过 `native-tls` 切换 — 贡献者 [@GetIT-Sunday](https://github.com/GetIT-Sunday) (#225) | **所有 reasoning model 的 `reasoning_content` replay**（OpenAI o1/o3/o4、DeepSeek-R1 等），不再只是 Kimi — 配合 v0.4.5 `reasoning_effort='xhigh'` 让多轮 reasoning 对话连贯 — 贡献者 [@GetIT-Sunday](https://github.com/GetIT-Sunday) (#226) | 清理：删除 600+ 行 `rusty-claude-cli` 原型死代码（`app.rs` / `args.rs` / `runtime/sse.rs`）+ 未使用的 `rustyline` 依赖 + 用户面 "Claw Code" → "ARIS-Code" 品牌统一。
-
-> **v0.4.6** (2026-05-14) — **🚨 两个长期静默 bug 修复**：(1) `PermissionMode::Prompt` 因 derived-`Ord` 顺序错误**一直在静默放过所有 tool 调用**（用户选"问我"实际等同直接 allow），现在正确路由到 prompter；(2) system prompt 写死 `current_date = "2026-03-31"`，导致 model 把 2026-03 之后所有真实数据（包括用户自己的 arXiv 论文）都判为"未来 / prompt injection"——现在用 `runtime::today_iso()` 真实系统时间。另外 **Custom OpenAI 兼容 provider**（`/setup` 选项 11，reviewer 选项 9）+ dynamic `/models` 自动发现 — 贡献者 [@Anduin9527](https://github.com/Anduin9527) (#221 + #222)。
-
-> **v0.4.5** (2026-05-13) — **推理模型一等公民支持** — `reasoning_effort='xhigh'` 真正发到请求体（GPT-5.5 / o1 / o3 / o4 / DeepSeek-thinking）| **Thinking content blocks** 全链路打通（修 #161 unknown variant + 400 Bad Request）| **多 tool result 合并** 修复（`tool_use_ids_without_tool_result` 并发 tool 错）| **DeepSeek V4 Pro** + **Xiaomi MiMo** + **Qwen 3.6** + **Doubao** 加入 `/setup`（选项 7-10）| **Claude Code 对象式 hooks** 解析器 | 默认模型升级到 **Claude Opus 4.7 + GPT-5.5** | REPL 输入加固：折行不再无限复制 / Cmd+V 多行粘贴不再每行 auto-submit / CJK 字符在折行边界正确渲染 | 新增 CI workflow | 贡献者: [@GO-player-hhy](https://github.com/GO-player-hhy) (#186), [@Jxy-yxJ](https://github.com/Jxy-yxJ) (#171), [@GetIT-Sunday](https://github.com/GetIT-Sunday) (#216 部分)
-
-> **v0.4.4** (2026-04-20) — **`/setup` 配 Claude 中转站不再强制走 Bearer**(修 ModelScope / newcli.com 等只认 x-api-key 的代理) | `/setup` 加入常用第三方代理 URL 提示(OpenRouter / DeepSeek / DashScope / ModelScope 等) | Provider 切换时清干净残留 state | 自定义 base URL 不再被 `/setup` 二次覆盖 | LlmReview executor 猜错 model 时自动 fallback 到配置的 reviewer | 修复 #158 / #162
-
-> **v0.4.3** (2026-04-17) — **第三方 Anthropic-compat 代理(Bedrock 等)支持** — 跳过代理不认的 beta flag | `anthropic` provider 也正确传播自定义 base URL(之前只有 `anthropic-compat`) | 贡献者 [@screw-44](https://github.com/screw-44)
-
-> **v0.4.2** (2026-04-17) — **Auto-compaction 崩溃修复**(skill 跑完后的空响应问题) | OpenAI-compat executor 下 compaction 摘要不再丢失 | 自定义 executor base URL 启动 setup 后生效 | shell 预设 API key 不再被清掉 | `EXECUTOR_BASE_URL` trim + 空值处理
-
-> **v0.4.1** (2026-04-15) — Reviewer/Executor 自动重试 (429/5xx/网络抖动) | Ctrl+C 后标志污染修复 | 每次 reviewer 请求新 HTTP client(绕过坏连接池) | 详细错误链
+> **2026-05-20 — Web Orchestrator 更新。** Web 控制台现在把工作流明确建模为负责规划编排的 `Agent`、独立执行的 `SubAgent` 和人工检查的 `Gate`。执行默认按同层批次推进：当前所有 ready 的 Agent/SubAgent 并行运行，整批完成后暂停，等待一次人工批量批准，再进入下游节点。
 >
-> **v0.4.0** (2026-04-15) — **Plan 模式** (`/plan`) | Ctrl+C 协作式中断(不再直接退出) | API 错误不再退出 REPL | 工具输出折叠 | 同步 62 个 skills
+> 面向关键词检索的动态 fan-out 已上线。关键词规划节点可以输出 `{"keyword_groups":[...]}`，SubAgent 模板会在运行时按每个关键词组自动展开为独立的文献检索 SubAgent，并支持 `{{item.name}}`、`{{item.keywords}}` 等占位符。Web 编辑器入口为 **Advanced node settings → Dynamic fan-out**。
 >
-> <details><summary>历史版本</summary>
->
-> **v0.3.9** (2026-04-11) — 代理/自定义 base URL | 本地模型 (LM Studio/Ollama) | Research Wiki | 自进化 Meta-Optimize | Session 原子写入 | Bash 安全校验 | Windows (experimental)
->
-> **v0.3.5** (2026-04-08) — Research Wiki | 自进化 Meta-Optimize | Session 原子写入 | Bash 安全校验 | Windows 支持
->
-> **v0.3.3** (2026-04-04) — 修复所有 Claude Code hooks 配置崩溃路径
->
-> **v0.3.0** (2026-04-03) — 多文件记忆索引 | 结构化任务系统 (TodoWrite) | `/plan` | 安全加固
->
-> **v0.2.2** (2026-04-03) — `/plan` 步骤规划 | `/tasks` 持久任务
->
-> **v0.2.1** (2026-04-03) — 持久记忆 | Kimi K2.5 多轮修复 | 中文光标修复
->
-> **v0.2.0** (2026-04-02) — 开源发布 | Kimi + MiniMax + GLM | 智能路由 | CI/CD
->
-> **v0.1.0** (2026-04-02) — 首次发布 | 多执行者/审阅者 | 42 个技能
->
-> </details>
+> 现有 Flow 也可以通过新需求继续让 LLM 更新；MiniMax 中国区执行链路接入 Anthropic-compatible endpoint；README 截图已替换为当前 Web 控制台界面。
 >
 > [完整更新日志 →](CHANGELOG.md)
 
