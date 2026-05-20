@@ -45,11 +45,18 @@ from app.models import (  # noqa: E402
     UpdateAgentConfigRequest,
     UpdateTeamConfigRequest,
     WorkflowEdge,
+    WorkflowEvent,
     WorkflowGraph,
     WorkflowNode,
     WorkflowRecord,
 )
-from app.runner import RunManager, build_aris_command, build_aris_prompt, summarize_codex_event  # noqa: E402
+from app.runner import (  # noqa: E402
+    RunManager,
+    build_aris_command,
+    build_aris_prompt,
+    expand_codex_payload_events,
+    summarize_codex_event,
+)
 from app.skills import parse_skill_frontmatter, scan_skills  # noqa: E402
 from app.storage import (  # noqa: E402
     WorkspaceStore,
@@ -66,6 +73,7 @@ from app.workflows import (  # noqa: E402
     WorkflowManager,
     build_workflow_generation_prompt,
     build_workflow_refinement_prompt,
+    expand_replayed_workflow_event,
     missing_concrete_outputs,
     normalize_workflow_graph,
     paper_introduction_template_graph,
@@ -985,6 +993,9 @@ def test_workflow_forwards_run_system_events_as_run_events(tmp_path: Path) -> No
         assert events[-1].message == "Run queued"
 
     assert workflow_event_type_for_run_stream("codex") == "aris"
+    assert workflow_event_type_for_run_stream("thinking") == "thinking"
+    assert workflow_event_type_for_run_stream("tool") == "tool"
+    assert workflow_event_type_for_run_stream("result") == "result"
     assert workflow_event_type_for_run_stream("system") == "run"
     asyncio.run(run())
 
@@ -1031,6 +1042,53 @@ def test_run_manager_handles_large_stdout_lines(tmp_path: Path) -> None:
         assert any(event.stream == "stdout" and len(event.message) == 70000 for event in events)
 
     asyncio.run(run())
+
+
+def test_expand_codex_payload_events_preserves_transcript_order() -> None:
+    events = expand_codex_payload_events(
+        "run-transcript",
+        {
+            "message": "done",
+            "events": [
+                {"kind": "thinking", "iteration": 1, "thinking": "plan"},
+                {"kind": "tool_use", "iteration": 1, "name": "WebSearch", "input": {"query": "paper"}},
+                {
+                    "kind": "tool_result",
+                    "iteration": 1,
+                    "tool_name": "WebSearch",
+                    "output": "found",
+                    "is_error": False,
+                },
+                {"kind": "assistant_text", "iteration": 1, "text": "done"},
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        },
+    )
+    assert [event.stream for event in events] == ["thinking", "tool", "tool", "result"]
+    assert events[-1].payload["kind"] == "final_result"
+
+
+def test_expand_replayed_workflow_event_splits_legacy_aris_payload() -> None:
+    expanded = expand_replayed_workflow_event(
+        WorkflowEvent(
+            workflow_id="wf",
+            timestamp="2026-05-20T00:00:00Z",
+            event_type="aris",
+            node_id="lit",
+            run_id="run-lit",
+            message="done",
+            payload={
+                "message": "done",
+                "events": [
+                    {"kind": "thinking", "iteration": 1, "thinking": "plan"},
+                    {"kind": "assistant_text", "iteration": 1, "text": "done"},
+                ],
+            },
+        )
+    )
+    assert [event.event_type for event in expanded] == ["thinking", "result"]
+    assert {event.node_id for event in expanded} == {"lit"}
+    assert {event.timestamp for event in expanded} == {"2026-05-20T00:00:00Z"}
 
 
 def test_run_manager_env_overrides_are_scoped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

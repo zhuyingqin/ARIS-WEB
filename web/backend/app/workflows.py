@@ -28,7 +28,7 @@ from .pricing import (
     extract_usage_from_payload,
     pricing_for_model,
 )
-from .runner import RunManager, build_aris_command
+from .runner import RunManager, build_aris_command, expand_codex_payload_events
 from .skills import SkillInfo, get_skill, scan_skills
 from .storage import get_run, last_message_path, node_output_path, utc_now
 from .team_configs import get_team_config
@@ -82,9 +82,31 @@ def _safe_node_slug(value: object, fallback: str) -> str:
 def workflow_event_type_for_run_stream(stream: str) -> str:
     if stream == "codex":
         return "aris"
+    if stream in {"thinking", "tool", "result"}:
+        return stream
     if stream in {"stdout", "stderr"}:
         return stream
     return "run"
+
+
+def expand_replayed_workflow_event(event: WorkflowEvent) -> list[WorkflowEvent]:
+    if event.event_type != "aris" or not isinstance(event.payload, dict):
+        return [event]
+    expanded = expand_codex_payload_events(event.run_id or "", event.payload)
+    if len(expanded) == 1 and expanded[0].stream == "codex":
+        return [event]
+    return [
+        WorkflowEvent(
+            workflow_id=event.workflow_id,
+            timestamp=event.timestamp,
+            event_type=workflow_event_type_for_run_stream(item.stream),
+            node_id=event.node_id,
+            run_id=event.run_id,
+            message=item.message,
+            payload=item.payload,
+        )
+        for item in expanded
+    ]
 
 
 def concrete_output_paths(outputs) -> list[Path]:
@@ -1469,7 +1491,10 @@ class WorkflowManager:
         return self._require(workspace, workflow_id)
 
     async def replay_events(self, workspace: Path, workflow_id: str) -> list[WorkflowEvent]:
-        return replay_workflow_events(workspace, workflow_id)
+        events: list[WorkflowEvent] = []
+        for event in replay_workflow_events(workspace, workflow_id):
+            events.extend(expand_replayed_workflow_event(event))
+        return events
 
     async def _expand_fanout_node(
         self,
@@ -1923,15 +1948,18 @@ class WorkflowManager:
         effective_skill_id = node.skill or (config.skill if config else None)
         effective_model = node.model or (config.model if config else None)
         effective_effort = node.effort or (config.effort if config else None) or effective_effort_override()
-        # Workflow nodes keep `skill` as an orchestration label, but the web
-        # runner executes a compact node prompt. Loading a full SKILL.md for
-        # every DAG node can dominate context and make simple flow steps stall.
-        skill = SkillInfo(
+        # Prefer the node/config skill so web-launched sub-agents follow the
+        # same ARIS skill contract as direct catalog runs. Fall back to a
+        # compact generic executor only for ad-hoc nodes.
+        fallback_skill = SkillInfo(
             id="workflow-agent",
             name="workflow-agent",
             description="Compact ARIS Web workflow node executor",
             source_path="(workflow node)",
         )
+        skill = get_skill(effective_skill_id) if effective_skill_id else None
+        if skill is None:
+            skill = fallback_skill
         prompt = self._build_node_prompt(workspace, record, node)
         attempt_number = node.attempt + 1
         subagent_dir = workspace / ".aris" / "web" / "workflows" / record.id / "nodes" / node.id / f"attempt-{attempt_number}"
@@ -2113,6 +2141,7 @@ Prompt prefix from config:
 Output contract from config:
 {config.output_contract or "(none)"}
 """
+        effective_skill_label = node.skill or (config.skill if config else None)
         actor_label = "SubAgent" if node.type == "sub_agent" else "Agent"
         return f"""You are executing one {actor_label} node in an ARIS Web multi-agent workflow.
 
@@ -2124,7 +2153,7 @@ Node id: {node.id}
 Node name: {node.name}
 Node type: {node.type}
 Node role: {node.role or "agent"}
-Suggested skill label: {("/" + node.skill) if node.skill else "(none)"}
+Suggested skill label: {("/" + effective_skill_label) if effective_skill_label else "(none)"}
 Expected inputs:
 {inputs_text}
 Expected outputs:
@@ -2160,7 +2189,7 @@ Execution requirements:
 - Produce every expected output that names a concrete file path. If the expected output is `INTRO_RELATED_WORK.md`, `INTRO_OUTLINE.md`, `INTRODUCTION_DRAFT.md`, `INTRO_REVIEW.md`, `INTRODUCTION_REVISED.md`, or `INTRO_REVISION_SUMMARY.md`, write that exact file before finishing.
 - Declared concrete outputs belong at their requested workspace-relative paths, not inside ARIS_SUBAGENT_DIR, unless the output itself is explicitly under `.aris/`.
 - Treat upstream node outputs as read-only context. Do not rewrite upstream artifacts unless the current node explicitly declares that output path.
-- Treat the suggested skill label as workflow metadata. Do not load the full skill instructions unless the node cannot be completed from this prompt and available project files.
+- When a suggested skill label is present, treat that ARIS skill as the node's execution contract. Load its SKILL.md with the Skill tool when it is relevant to the node, especially for literature search or research review, while keeping this node prompt as the local scope and output contract.
 - Follow the agent configuration profile when present. Node fields override config defaults for skill/model/effort.
 - Respect the output contract from config when present.
 - Keep a concise final summary that names files created or changed.

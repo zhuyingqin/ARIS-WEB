@@ -1,23 +1,30 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   applyNodeChanges,
   Background,
   Controls,
+  Handle,
   MarkerType,
   MiniMap,
+  Position,
   ReactFlow,
   type Connection,
   type Edge,
   type EdgeChange,
   type Node,
   type NodeChange,
+  type NodeProps,
+  type NodeTypes,
 } from "@xyflow/react"
 import "@xyflow/react/dist/style.css"
 import {
   Activity,
   Bot,
   BookOpen,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   CheckCircle2,
   ClipboardCheck,
   Cpu,
@@ -48,6 +55,7 @@ import type {
   ArtifactInfo,
   GlobalApiProvider,
   RunEvent,
+  RunOutput,
   RunRecord,
   SkillInfo,
   TeamConfig,
@@ -241,6 +249,77 @@ function outputFilePaths(outputs: WorkflowPort[]) {
     .filter(Boolean)
 }
 
+function artifactExtension(path: string) {
+  return path.split(/[?#]/)[0].split(".").pop()?.toLowerCase() ?? ""
+}
+
+function isMarkdownArtifact(path: string) {
+  return ["md", "markdown"].includes(artifactExtension(path))
+}
+
+function isImageArtifact(path: string) {
+  return ["png", "jpg", "jpeg", "webp", "svg"].includes(artifactExtension(path))
+}
+
+function isFrameArtifact(path: string) {
+  return ["html", "htm", "pdf"].includes(artifactExtension(path))
+}
+
+function artifactLabel(path: string) {
+  return path.split("/").filter(Boolean).pop() ?? path
+}
+
+function artifactByPath(artifacts: ArtifactInfo[] | undefined) {
+  return new Map((artifacts ?? []).map((artifact) => [artifact.path.replace(/^\.\//, ""), artifact]))
+}
+
+function artifactOutputSection(text: string) {
+  const lines = text.split(/\r?\n/)
+  const start = lines.findIndex((line) =>
+    /输出文件|output artifact|output file|files? written|written files/i.test(line),
+  )
+  if (start < 0) return text
+  const collected: string[] = []
+  for (let index = start; index < lines.length; index += 1) {
+    if (index > start && /^(#{1,6}\s+|\*\*[^*]+\*\*:?\s*$)/.test(lines[index].trim())) break
+    collected.push(lines[index])
+  }
+  return collected.join("\n")
+}
+
+function extractArtifactPathsFromRunOutput(output: RunOutput | undefined, artifacts: ArtifactInfo[] | undefined) {
+  if (!output || !artifacts?.length) return []
+  const textParts = [
+    typeof output.node_output?.text === "string" ? output.node_output.text : "",
+    output.last_message,
+  ].filter(Boolean)
+  const text = artifactOutputSection(textParts.join("\n"))
+  const byPath = artifactByPath(artifacts)
+  const byName = new Map<string, ArtifactInfo[]>()
+  for (const artifact of artifacts) {
+    const list = byName.get(artifact.name) ?? []
+    list.push(artifact)
+    byName.set(artifact.name, list)
+  }
+  const paths = new Set<string>()
+  for (const artifact of artifacts) {
+    if (text.includes(artifact.path)) paths.add(artifact.path)
+  }
+  const filePattern = /[`"'(]?(?:\.\/)?([A-Za-z0-9_.\-/]+?\.(?:md|markdown|html?|pdf|txt|jsonl?|csv|tsv|tex|bib|docx|pptx|xlsx|png|jpe?g|webp|svg))/gi
+  let match: RegExpExecArray | null
+  while ((match = filePattern.exec(text)) !== null) {
+    const candidate = match[1].replace(/^\.\//, "").replace(/[),.;:]+$/g, "")
+    if (byPath.has(candidate)) {
+      paths.add(candidate)
+      continue
+    }
+    const name = artifactLabel(candidate)
+    const named = byName.get(name)
+    if (named?.length === 1) paths.add(named[0].path)
+  }
+  return [...paths]
+}
+
 function slug(value: string) {
   const normalized = value
     .toLowerCase()
@@ -366,6 +445,25 @@ function nodeKindLabel(node: WorkflowNodeInfo) {
   return "Agent"
 }
 
+type WorkflowFlowNodeData = {
+  label: ReactNode
+}
+
+function WorkflowFlowNode({ data }: NodeProps) {
+  const nodeData = data as WorkflowFlowNodeData
+  return (
+    <>
+      <Handle type="target" position={Position.Left} />
+      {nodeData.label}
+      <Handle type="source" position={Position.Right} />
+    </>
+  )
+}
+
+const workflowNodeTypes: NodeTypes = {
+  workflow: WorkflowFlowNode,
+}
+
 function isExecutableNode(node: WorkflowNodeInfo) {
   return node.type === "agent" || node.type === "sub_agent"
 }
@@ -415,7 +513,6 @@ function NodeResultPanel({ workflow, node }: { workflow: WorkflowRecord; node: W
     enabled: Boolean(runId),
     refetchInterval: node.status === "running" ? 2500 : false,
   })
-  const outputFiles = outputFilePaths(node.outputs)
   const finalText =
     typeof outputQuery.data?.node_output?.text === "string"
       ? outputQuery.data.node_output.text
@@ -426,8 +523,8 @@ function NodeResultPanel({ workflow, node }: { workflow: WorkflowRecord; node: W
     const socket = new WebSocket(api.workflowNodeStreamUrl(workflow, node.id))
     socket.onmessage = (message) => {
       const event = JSON.parse(message.data) as WorkflowEvent
-      setNodeEvents((current) => [...current, event].slice(-180))
-      if (runId && ["node", "run"].includes(event.event_type)) {
+      setNodeEvents((current) => [...current, event].slice(-1000))
+      if (runId && ["node", "run", "result"].includes(event.event_type)) {
         queryClient.invalidateQueries({ queryKey: ["run-output", workflow.workspace, runId] })
       }
     }
@@ -468,16 +565,6 @@ function NodeResultPanel({ workflow, node }: { workflow: WorkflowRecord; node: W
           </>
         )}
       </div>
-      {outputFiles.length > 0 && (
-        <div className="node-output-list">
-          {outputFiles.map((path) => (
-            <a href={api.artifactUrlForPath(workflow.workspace, path)} key={path} rel="noreferrer" target="_blank">
-              <FileText size={13} />
-              {path}
-            </a>
-          ))}
-        </div>
-      )}
       {node.error && <p className="error-text">{node.error}</p>}
       {runId ? (
         <div className="node-result-output">
@@ -494,7 +581,7 @@ function NodeResultPanel({ workflow, node }: { workflow: WorkflowRecord; node: W
       )}
       {nodeEvents.length > 0 && (
         <div className="node-event-log" ref={nodeEventLogRef}>
-          {nodeEvents.slice(-60).map((event, index) => (
+          {nodeEvents.map((event, index) => (
             <div className={`term-line term-${event.event_type}`} key={`${event.timestamp}-${index}`}>
               <span>{event.timestamp.slice(11, 19)}</span>
               <b>{event.event_type}</b>
@@ -507,6 +594,208 @@ function NodeResultPanel({ workflow, node }: { workflow: WorkflowRecord; node: W
   )
 }
 
+type NodeArtifactPreview = {
+  workspace: string
+  path: string
+  nodeId: string
+  nodeName: string
+  artifact?: ArtifactInfo
+}
+
+function renderInlineMarkdown(text: string): ReactNode[] {
+  const nodes: ReactNode[] = []
+  const pattern = /(`[^`]+`|\*\*[^*]+\*\*|\[[^\]]+\]\([^)]+\))/g
+  let lastIndex = 0
+  let match: RegExpExecArray | null
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > lastIndex) nodes.push(text.slice(lastIndex, match.index))
+    const token = match[0]
+    if (token.startsWith("`")) {
+      nodes.push(<code key={`${match.index}-code`}>{token.slice(1, -1)}</code>)
+    } else if (token.startsWith("**")) {
+      nodes.push(<strong key={`${match.index}-strong`}>{token.slice(2, -2)}</strong>)
+    } else {
+      const link = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/)
+      if (link) {
+        nodes.push(
+          <a href={link[2]} key={`${match.index}-link`} rel="noreferrer" target="_blank">
+            {link[1]}
+          </a>,
+        )
+      } else {
+        nodes.push(token)
+      }
+    }
+    lastIndex = match.index + token.length
+  }
+  if (lastIndex < text.length) nodes.push(text.slice(lastIndex))
+  return nodes
+}
+
+function renderMarkdownTable(lines: string[], key: string) {
+  const rows = lines.map((line) =>
+    line
+      .trim()
+      .replace(/^\|/, "")
+      .replace(/\|$/, "")
+      .split("|")
+      .map((cell) => cell.trim()),
+  )
+  const [head, , ...body] = rows
+  return (
+    <div className="markdown-table-wrap" key={key}>
+      <table>
+        <thead>
+          <tr>{head.map((cell, index) => <th key={index}>{renderInlineMarkdown(cell)}</th>)}</tr>
+        </thead>
+        <tbody>
+          {body.map((row, rowIndex) => (
+            <tr key={rowIndex}>{row.map((cell, index) => <td key={index}>{renderInlineMarkdown(cell)}</td>)}</tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function MarkdownPreview({ text }: { text: string }) {
+  const blocks: ReactNode[] = []
+  const lines = text.replace(/\r\n/g, "\n").split("\n")
+  let index = 0
+  while (index < lines.length) {
+    const line = lines[index]
+    if (!line.trim()) {
+      index += 1
+      continue
+    }
+    const fence = line.match(/^```(\w+)?\s*$/)
+    if (fence) {
+      const codeLines: string[] = []
+      index += 1
+      while (index < lines.length && !lines[index].startsWith("```")) {
+        codeLines.push(lines[index])
+        index += 1
+      }
+      index += index < lines.length ? 1 : 0
+      blocks.push(
+        <pre className="markdown-code" key={`code-${index}`}>
+          <code>{codeLines.join("\n")}</code>
+        </pre>,
+      )
+      continue
+    }
+    const heading = line.match(/^(#{1,6})\s+(.+)$/)
+    if (heading) {
+      const level = Math.min(heading[1].length, 4)
+      const content = renderInlineMarkdown(heading[2])
+      if (level === 1) blocks.push(<h1 key={`heading-${index}`}>{content}</h1>)
+      else if (level === 2) blocks.push(<h2 key={`heading-${index}`}>{content}</h2>)
+      else if (level === 3) blocks.push(<h3 key={`heading-${index}`}>{content}</h3>)
+      else blocks.push(<h4 key={`heading-${index}`}>{content}</h4>)
+      index += 1
+      continue
+    }
+    if (/^\s*\|.+\|\s*$/.test(line) && index + 1 < lines.length && /^\s*\|?[\s:|-]+\|[\s:|-]*$/.test(lines[index + 1])) {
+      const tableLines = [line, lines[index + 1]]
+      index += 2
+      while (index < lines.length && /^\s*\|.+\|\s*$/.test(lines[index])) {
+        tableLines.push(lines[index])
+        index += 1
+      }
+      blocks.push(renderMarkdownTable(tableLines, `table-${index}`))
+      continue
+    }
+    if (/^\s*[-*+]\s+/.test(line)) {
+      const items: string[] = []
+      while (index < lines.length && /^\s*[-*+]\s+/.test(lines[index])) {
+        items.push(lines[index].replace(/^\s*[-*+]\s+/, ""))
+        index += 1
+      }
+      blocks.push(<ul key={`ul-${index}`}>{items.map((item, itemIndex) => <li key={itemIndex}>{renderInlineMarkdown(item)}</li>)}</ul>)
+      continue
+    }
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items: string[] = []
+      while (index < lines.length && /^\s*\d+\.\s+/.test(lines[index])) {
+        items.push(lines[index].replace(/^\s*\d+\.\s+/, ""))
+        index += 1
+      }
+      blocks.push(<ol key={`ol-${index}`}>{items.map((item, itemIndex) => <li key={itemIndex}>{renderInlineMarkdown(item)}</li>)}</ol>)
+      continue
+    }
+    if (/^\s*>\s?/.test(line)) {
+      const quoteLines: string[] = []
+      while (index < lines.length && /^\s*>\s?/.test(lines[index])) {
+        quoteLines.push(lines[index].replace(/^\s*>\s?/, ""))
+        index += 1
+      }
+      blocks.push(<blockquote key={`quote-${index}`}>{quoteLines.map((item, itemIndex) => <p key={itemIndex}>{renderInlineMarkdown(item)}</p>)}</blockquote>)
+      continue
+    }
+    const paragraph: string[] = []
+    while (
+      index < lines.length &&
+      lines[index].trim() &&
+      !/^```/.test(lines[index]) &&
+      !/^(#{1,6})\s+/.test(lines[index]) &&
+      !/^\s*[-*+]\s+/.test(lines[index]) &&
+      !/^\s*\d+\.\s+/.test(lines[index]) &&
+      !/^\s*>\s?/.test(lines[index])
+    ) {
+      paragraph.push(lines[index].trim())
+      index += 1
+    }
+    blocks.push(<p key={`p-${index}`}>{renderInlineMarkdown(paragraph.join(" "))}</p>)
+  }
+  return <article className="markdown-preview">{blocks}</article>
+}
+
+function NodeArtifactDialog({ preview, onClose }: { preview: NodeArtifactPreview | null; onClose: () => void }) {
+  const [text, setText] = useState("")
+  const [error, setError] = useState("")
+  const path = preview?.artifact?.path ?? preview?.path ?? ""
+
+  useEffect(() => {
+    setText("")
+    setError("")
+    if (!preview || isImageArtifact(path) || isFrameArtifact(path)) return
+    fetch(api.artifactUrlForPath(preview.workspace, path))
+      .then((response) => {
+        if (!response.ok) throw new Error(response.statusText)
+        return response.text()
+      })
+      .then(setText)
+      .catch((nextError: Error) => setError(nextError.message))
+  }, [path, preview])
+
+  return (
+    <Dialog open={Boolean(preview)} title={preview ? `${preview.nodeName} · ${artifactLabel(path)}` : "Node artifact"} onClose={onClose}>
+      {preview && (
+        <div className="node-artifact-reader">
+          <div className="node-artifact-reader-meta">
+            <Badge>{preview.artifact?.kind ?? (artifactExtension(path) || "file")}</Badge>
+            <span>{path}</span>
+            <a className="btn btn-secondary" href={api.artifactUrlForPath(preview.workspace, path)} rel="noreferrer" target="_blank">
+              Open raw
+            </a>
+          </div>
+          {error ? (
+            <p className="error-text">{error}</p>
+          ) : isImageArtifact(path) ? (
+            <img className="preview-image" src={api.artifactUrlForPath(preview.workspace, path)} alt={artifactLabel(path)} />
+          ) : isFrameArtifact(path) ? (
+            <iframe className="preview-frame" src={api.artifactUrlForPath(preview.workspace, path)} title={artifactLabel(path)} />
+          ) : isMarkdownArtifact(path) ? (
+            text ? <MarkdownPreview text={text} /> : <p className="muted">Loading Markdown...</p>
+          ) : (
+            <pre className="preview-text">{text || "Loading..."}</pre>
+          )}
+        </div>
+      )}
+    </Dialog>
+  )
+}
+
 function OrchestratorPage({ workspace }: { workspace: string }) {
   const queryClient = useQueryClient()
   const [selectedId, setSelectedId] = useState("")
@@ -516,8 +805,12 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
   const [goal, setGoal] = useState("")
   const [title, setTitle] = useState("")
   const [template, setTemplate] = useState<(typeof workflowTemplateOptions)[number]["value"]>("paper_introduction")
+  const [flowPanelCollapsed, setFlowPanelCollapsed] = useState(false)
+  const [generatorCollapsed, setGeneratorCollapsed] = useState(true)
+  const [canvasToolsCollapsed, setCanvasToolsCollapsed] = useState(true)
   const [selectedNodeId, setSelectedNodeId] = useState("")
   const [selectedEdgeId, setSelectedEdgeId] = useState("")
+  const [artifactPreview, setArtifactPreview] = useState<NodeArtifactPreview | null>(null)
   const [teamDialogOpen, setTeamDialogOpen] = useState(false)
   const [selectedTeamId, setSelectedTeamId] = useState("")
   const [teamPrefix, setTeamPrefix] = useState("")
@@ -541,11 +834,42 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
     queryFn: () => api.teamConfigs(workspace),
     enabled: Boolean(workspace),
   })
+  const workspaceArtifacts = useQuery({
+    queryKey: ["artifacts", workspace],
+    queryFn: () => api.artifacts(workspace),
+    enabled: Boolean(workspace),
+    refetchInterval: draft?.status === "running" ? 5000 : false,
+  })
+  const nodesWithRuns = useMemo(() => (draft?.graph_json.nodes ?? []).filter((node) => Boolean(node.run_id)), [draft?.graph_json.nodes])
+  const nodeOutputQueries = useQueries({
+    queries: nodesWithRuns.map((node) => ({
+      queryKey: ["run-output", workspace, node.run_id],
+      queryFn: () => api.runOutput(workspace, node.run_id as string),
+      enabled: Boolean(workspace && node.run_id),
+      staleTime: 5000,
+    })),
+  })
+  const nodeOutputSignature = nodeOutputQueries.map((query) => query.dataUpdatedAt).join(":")
+  const runOutputByRunId = useMemo(() => {
+    const next = new Map<string, RunOutput>()
+    nodesWithRuns.forEach((node, index) => {
+      const data = nodeOutputQueries[index]?.data
+      if (node.run_id && data) next.set(node.run_id, data)
+    })
+    return next
+  }, [nodeOutputSignature, nodesWithRuns])
   const selected = (workflows.data ?? []).find((workflow) => workflow.id === selectedId) ?? workflows.data?.[0]
+  const artifactsByPath = useMemo(() => artifactByPath(workspaceArtifacts.data), [workspaceArtifacts.data])
 
   useEffect(() => {
     if (!selectedId && workflows.data?.[0]) setSelectedId(workflows.data[0].id)
   }, [selectedId, workflows.data])
+
+  useEffect(() => {
+    if (!workflows.data) return
+    setGeneratorCollapsed(workflows.data.length > 0)
+    setFlowPanelCollapsed(workflows.data.length > 0)
+  }, [workflows.data?.length])
 
   useEffect(() => {
     if (!selectedTeamId && teamConfigs.data?.[0]) setSelectedTeamId(teamConfigs.data[0].id)
@@ -571,6 +895,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
       setEvents((current) => [...current, event].slice(-800))
       if (["workflow", "node"].includes(event.event_type)) {
         queryClient.invalidateQueries({ queryKey: ["workflows", workspace] })
+        queryClient.invalidateQueries({ queryKey: ["artifacts", workspace] })
       }
     }
     return () => socket.close()
@@ -583,6 +908,8 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
       setSelectedId(workflow.id)
       setDraft(cloneWorkflow(workflow))
       setDirty(false)
+      setFlowPanelCollapsed(true)
+      setGeneratorCollapsed(true)
     },
   })
   const generateWorkflow = useMutation({
@@ -592,6 +919,8 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
       setSelectedId(workflow.id)
       setDraft(cloneWorkflow(workflow))
       setDirty(false)
+      setFlowPanelCollapsed(true)
+      setGeneratorCollapsed(true)
     },
   })
   const refineWorkflow = useMutation({
@@ -607,6 +936,8 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
       setDraft(cloneWorkflow(workflow))
       setSelectedNodeId(workflow.graph_json.nodes[0]?.id ?? "")
       setDirty(false)
+      setFlowPanelCollapsed(true)
+      setGeneratorCollapsed(true)
     },
   })
   const saveWorkflow = useMutation({
@@ -835,8 +1166,17 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
           ? { borderLeft: `4px solid ${accent}` }
           : undefined
         const sequence = nodeSequence.get(node.id) ?? 0
+        const runOutput = node.run_id ? runOutputByRunId.get(node.run_id) : undefined
+        const nodeArtifactPaths = [
+          ...outputFilePaths(node.outputs),
+          ...extractArtifactPathsFromRunOutput(runOutput, workspaceArtifacts.data),
+        ]
+        const nodeArtifacts = [...new Set(nodeArtifactPaths)]
+          .map((path) => artifactsByPath.get(path))
+          .filter((artifact): artifact is ArtifactInfo => Boolean(artifact))
         return {
           id: node.id,
+          type: "workflow",
           position: { x: node.position?.x ?? 0, y: node.position?.y ?? 0 },
           data: {
             label: (
@@ -878,6 +1218,33 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                   <span>{roleLabel}</span>
                 )}
                 {skillLabel && <small>{skillLabel}</small>}
+                {nodeArtifacts.length > 0 && (
+                  <div className="flow-node-artifacts">
+                    {nodeArtifacts.slice(0, 3).map((artifact) => (
+                      <button
+                        aria-label={`Open ${artifact.name}`}
+                        className="flow-node-artifact nodrag nopan"
+                        key={artifact.id}
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          setArtifactPreview({
+                            workspace: draft?.workspace ?? workspace,
+                            path: artifact.path,
+                            nodeId: node.id,
+                            nodeName: node.name,
+                            artifact,
+                          })
+                        }}
+                        title={artifact.path}
+                        type="button"
+                      >
+                        <FileText size={12} />
+                        <span>{artifactLabel(artifact.path)}</span>
+                      </button>
+                    ))}
+                    {nodeArtifacts.length > 3 && <span className="flow-node-artifact-more">+{nodeArtifacts.length - 3}</span>}
+                  </div>
+                )}
               </div>
             ),
           },
@@ -885,7 +1252,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
           style,
         }
       }),
-    [draft, agentConfigs.data, nodeSequence],
+    [artifactsByPath, draft, agentConfigs.data, nodeSequence, runOutputByRunId, workspace, workspaceArtifacts.data],
   )
   useEffect(() => {
     if (!isDraggingNode) {
@@ -994,16 +1361,21 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
   }
 
   return (
-    <div className="orchestrator-grid workflow-layout">
+    <div className={`orchestrator-grid workflow-layout ${flowPanelCollapsed ? "flows-collapsed" : ""}`}>
       <aside className="orchestrator-left panel">
         <div className="panel-head compact-head">
           <div>
             <h2>Flows</h2>
             <p>{(workflows.data ?? []).length} local workflows</p>
           </div>
-          <Button variant="secondary" onClick={() => workflows.refetch()} type="button" aria-label="Refresh flows" title="Refresh flows">
-            <RefreshCcw size={15} />
-          </Button>
+          <div className="panel-head-actions">
+            <Button variant="secondary" onClick={() => workflows.refetch()} type="button" aria-label="Refresh flows" title="Refresh flows">
+              <RefreshCcw size={15} />
+            </Button>
+            <Button variant="secondary" onClick={() => setFlowPanelCollapsed(true)} type="button" aria-label="Hide flows" title="Hide flows">
+              <ChevronRight size={15} />
+            </Button>
+          </div>
         </div>
         <div className="workflow-list">
           {(workflows.data ?? []).map((workflow) => {
@@ -1015,6 +1387,8 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                 onClick={() => {
                   setSelectedId(workflow.id)
                   setDirty(false)
+                  setFlowPanelCollapsed(true)
+                  setGeneratorCollapsed(true)
                 }}
                 type="button"
               >
@@ -1036,60 +1410,73 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
             </div>
           )}
         </div>
-        <div className="generator-box">
-          <div className="form-section-title">
-            <Sparkles size={14} />
-            Create / Update Flow
-          </div>
-          <label>Flow goal</label>
-          <Textarea
-            rows={5}
-            value={goal}
-            onChange={(event) => setGoal(event.target.value)}
-            placeholder="Describe a new flow, or changes to apply to the selected flow..."
-          />
-          <label>Title</label>
-          <Input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Optional title" />
-          <label>Template</label>
-          <Select
-            value={template}
-            onChange={(event) => setTemplate(event.target.value as (typeof workflowTemplateOptions)[number]["value"])}
+        <div className={`generator-box ${generatorCollapsed ? "generator-box-collapsed" : ""}`}>
+          <button
+            aria-expanded={!generatorCollapsed}
+            className="generator-toggle"
+            onClick={() => setGeneratorCollapsed((current) => !current)}
+            title={generatorCollapsed ? "Expand flow editor" : "Collapse flow editor"}
+            type="button"
           >
-            {workflowTemplateOptions.map((item) => (
-              <option key={item.value} value={item.value}>
-                {item.label}
-              </option>
-            ))}
-          </Select>
-          <div className="generator-actions">
-            <Button
-              variant="secondary"
-              onClick={handleCreateTemplate}
-              disabled={!workspace || createWorkflow.isPending || refineWorkflow.isPending}
-              type="button"
-            >
-              <GitBranch size={15} />
-              Use Template
-            </Button>
-            <Button
-              onClick={handleGenerate}
-              disabled={!workspace || generateWorkflow.isPending || refineWorkflow.isPending}
-              type="button"
-            >
-              <Wand2 size={15} />
-              Generate New
-            </Button>
-            <Button
-              onClick={handleRefine}
-              disabled={!workspace || !draft || draft.status === "running" || !goal.trim() || refineWorkflow.isPending}
-              type="button"
-            >
-              <Wand2 size={15} />
-              Update Flow
-            </Button>
-          </div>
-          {(createWorkflow.error || generateWorkflow.error || refineWorkflow.error) && (
-            <p className="error-text">{(createWorkflow.error || generateWorkflow.error || refineWorkflow.error)?.message}</p>
+            <span className="generator-toggle-title">
+              <Sparkles size={14} />
+              Create / Update Flow
+            </span>
+            {generatorCollapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
+          </button>
+          {!generatorCollapsed && (
+            <div className="generator-content">
+              <label>Flow goal</label>
+              <Textarea
+                rows={5}
+                value={goal}
+                onChange={(event) => setGoal(event.target.value)}
+                placeholder="Describe a new flow, or changes to apply to the selected flow..."
+              />
+              <label>Title</label>
+              <Input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Optional title" />
+              <label>Template</label>
+              <Select
+                value={template}
+                onChange={(event) => setTemplate(event.target.value as (typeof workflowTemplateOptions)[number]["value"])}
+              >
+                {workflowTemplateOptions.map((item) => (
+                  <option key={item.value} value={item.value}>
+                    {item.label}
+                  </option>
+                ))}
+              </Select>
+              <div className="generator-actions">
+                <Button
+                  variant="secondary"
+                  onClick={handleCreateTemplate}
+                  disabled={!workspace || createWorkflow.isPending || refineWorkflow.isPending}
+                  type="button"
+                >
+                  <GitBranch size={15} />
+                  Use Template
+                </Button>
+                <Button
+                  onClick={handleGenerate}
+                  disabled={!workspace || generateWorkflow.isPending || refineWorkflow.isPending}
+                  type="button"
+                >
+                  <Wand2 size={15} />
+                  Generate New
+                </Button>
+                <Button
+                  onClick={handleRefine}
+                  disabled={!workspace || !draft || draft.status === "running" || !goal.trim() || refineWorkflow.isPending}
+                  type="button"
+                >
+                  <Wand2 size={15} />
+                  Update Flow
+                </Button>
+              </div>
+              {(createWorkflow.error || generateWorkflow.error || refineWorkflow.error) && (
+                <p className="error-text">{(createWorkflow.error || generateWorkflow.error || refineWorkflow.error)?.message}</p>
+              )}
+            </div>
           )}
         </div>
       </aside>
@@ -1114,20 +1501,45 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                 <h1>{draft.title}</h1>
                 <p>{draft.goal || "No goal set"}</p>
               </div>
+              {flowPanelCollapsed && (
+                <div className="console-actions">
+                  <Button
+                    variant="secondary"
+                    onClick={() => setFlowPanelCollapsed(false)}
+                    type="button"
+                    aria-label="Show flows"
+                    title="Show flows"
+                  >
+                    <GitBranch size={15} />
+                    Flows
+                  </Button>
+                </div>
+              )}
             </div>
             {deleteWorkflow.error && <p className="error-text">{deleteWorkflow.error.message}</p>}
             <div className="flow-shell">
-              <div className="flow-canvas-toolbar" aria-label="Flow canvas actions">
+              <div className={`flow-canvas-toolbar ${canvasToolsCollapsed ? "flow-canvas-toolbar-collapsed" : ""}`} aria-label="Flow canvas actions">
+                <Button
+                  className="flow-canvas-toolbar-toggle"
+                  variant="secondary"
+                  onClick={() => setCanvasToolsCollapsed((current) => !current)}
+                  type="button"
+                  aria-label={canvasToolsCollapsed ? "Expand canvas tools" : "Collapse canvas tools"}
+                  title={canvasToolsCollapsed ? "Expand tools" : "Collapse tools"}
+                >
+                  {canvasToolsCollapsed ? <ChevronRight size={15} /> : <ChevronLeft size={15} />}
+                  {!canvasToolsCollapsed && "Tools"}
+                </Button>
                 <div className="canvas-actions-group">
-                  <Button variant="secondary" onClick={() => addNode("agent")} type="button">
+                  <Button variant="secondary" onClick={() => addNode("agent")} type="button" title="Agent">
                     <Cpu size={15} />
                     Agent
                   </Button>
-                  <Button variant="secondary" onClick={() => addNode("sub_agent")} type="button">
+                  <Button variant="secondary" onClick={() => addNode("sub_agent")} type="button" title="SubAgent">
                     <Plus size={15} />
                     SubAgent
                   </Button>
-                  <Button variant="secondary" onClick={() => addNode("human_gate")} type="button">
+                  <Button variant="secondary" onClick={() => addNode("human_gate")} type="button" title="Gate">
                     <ClipboardCheck size={15} />
                     Gate
                   </Button>
@@ -1142,7 +1554,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                     Team
                   </Button>
                   {selectedEdge && (
-                    <Button variant="secondary" onClick={() => removeEdges([selectedEdge.id])} type="button">
+                    <Button variant="secondary" onClick={() => removeEdges([selectedEdge.id])} type="button" title="Remove selected edge">
                       <XCircle size={15} />
                       Edge
                     </Button>
@@ -1165,6 +1577,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                     onClick={() => draft && saveWorkflow.mutate(draft)}
                     disabled={!dirty || saveWorkflow.isPending}
                     type="button"
+                    title="Save"
                   >
                     <Save size={15} />
                     Save
@@ -1174,13 +1587,14 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                     onClick={handleDeleteWorkflow}
                     disabled={deleteWorkflow.isPending}
                     type="button"
+                    title="Delete"
                   >
                     <Trash2 size={15} />
                     Delete
                   </Button>
                 </div>
                 <div className="canvas-actions-group">
-                  <Button onClick={() => executeWorkflow.mutate(draft)} disabled={executeWorkflow.isPending} type="button">
+                  <Button onClick={() => executeWorkflow.mutate(draft)} disabled={executeWorkflow.isPending} type="button" title="Run">
                     <Play size={15} />
                     Run
                   </Button>
@@ -1189,6 +1603,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                     onClick={() => (draft.status === "paused" ? resumeWorkflow.mutate(draft) : pauseWorkflow.mutate(draft))}
                     disabled={pauseWorkflow.isPending || resumeWorkflow.isPending}
                     type="button"
+                    title={draft.status === "paused" ? "Resume" : "Pause"}
                   >
                     {draft.status === "paused" ? <Play size={15} /> : <Pause size={15} />}
                     {draft.status === "paused" ? "Resume" : "Pause"}
@@ -1208,6 +1623,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                     onClick={() => cancelWorkflow.mutate(draft)}
                     disabled={cancelWorkflow.isPending}
                     type="button"
+                    title="Cancel"
                   >
                     <Square size={15} />
                     Cancel
@@ -1217,6 +1633,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
               <ReactFlow
                 nodes={canvasNodes}
                 edges={flowEdges}
+                nodeTypes={workflowNodeTypes}
                 onNodesChange={onNodesChange}
                 onEdgesChange={onEdgesChange}
                 fitView
@@ -1812,6 +2229,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
           <p className="muted">Select a DAG node to edit it.</p>
         )}
       </aside>
+      <NodeArtifactDialog preview={artifactPreview} onClose={() => setArtifactPreview(null)} />
     </div>
   )
 }

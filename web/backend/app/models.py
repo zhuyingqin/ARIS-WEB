@@ -87,7 +87,7 @@ class RunRecord(BaseModel):
 class RunEvent(BaseModel):
     run_id: str
     timestamp: str
-    stream: Literal["system", "stdout", "stderr", "codex"]
+    stream: Literal["system", "stdout", "stderr", "codex", "thinking", "tool", "result"]
     message: str
     payload: dict[str, Any] | None = None
 
@@ -431,7 +431,7 @@ class WorkflowRecord(BaseModel):
 class WorkflowEvent(BaseModel):
     workflow_id: str
     timestamp: str
-    event_type: Literal["workflow", "node", "run", "stdout", "stderr", "aris"]
+    event_type: Literal["workflow", "node", "run", "stdout", "stderr", "aris", "thinking", "tool", "result"]
     message: str
     node_id: str | None = None
     run_id: str | None = None

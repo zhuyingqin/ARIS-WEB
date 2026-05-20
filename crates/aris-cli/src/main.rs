@@ -1556,6 +1556,8 @@ impl LiveCli {
                 })),
                 "tool_uses": collect_tool_uses(&summary),
                 "tool_results": collect_tool_results(&summary),
+                "thinking": collect_thinking(&summary),
+                "events": collect_transcript_events(&summary),
                 "usage": {
                     "input_tokens": summary.usage.input_tokens,
                     "output_tokens": summary.usage.output_tokens,
@@ -4040,6 +4042,75 @@ fn collect_tool_results(summary: &runtime::TurnSummary) -> Vec<serde_json::Value
         .collect()
 }
 
+fn collect_thinking(summary: &runtime::TurnSummary) -> Vec<serde_json::Value> {
+    summary
+        .assistant_messages
+        .iter()
+        .enumerate()
+        .flat_map(|(message_index, message)| {
+            message.blocks.iter().filter_map(move |block| match block {
+                ContentBlock::Thinking { thinking, signature } => Some(json!({
+                    "iteration": message_index + 1,
+                    "thinking": thinking,
+                    "signature": signature,
+                })),
+                _ => None,
+            })
+        })
+        .collect()
+}
+
+fn collect_transcript_events(summary: &runtime::TurnSummary) -> Vec<serde_json::Value> {
+    let mut events = Vec::new();
+    for (message_index, message) in summary.assistant_messages.iter().enumerate() {
+        let iteration = message_index + 1;
+        for block in &message.blocks {
+            match block {
+                ContentBlock::Thinking { thinking, signature } => events.push(json!({
+                    "kind": "thinking",
+                    "iteration": iteration,
+                    "thinking": thinking,
+                    "signature": signature,
+                })),
+                ContentBlock::Text { text } => events.push(json!({
+                    "kind": "assistant_text",
+                    "iteration": iteration,
+                    "text": text,
+                })),
+                ContentBlock::ToolUse { id, name, input } => events.push(json!({
+                    "kind": "tool_use",
+                    "iteration": iteration,
+                    "id": id,
+                    "name": name,
+                    "input": input,
+                })),
+                ContentBlock::ToolResult { .. } => {}
+            }
+        }
+        if let Some(result_message) = summary.tool_results.get(message_index) {
+            for block in &result_message.blocks {
+                if let ContentBlock::ToolResult {
+                    tool_use_id,
+                    tool_name,
+                    output,
+                    is_error,
+                } = block
+                {
+                    events.push(json!({
+                        "kind": "tool_result",
+                        "iteration": iteration,
+                        "tool_use_id": tool_use_id,
+                        "tool_name": tool_name,
+                        "output": output,
+                        "is_error": is_error,
+                    }));
+                }
+            }
+        }
+    }
+    events
+}
+
 fn slash_command_completion_candidates() -> Vec<(String, String)> {
     let mut candidates: Vec<(String, String)> = slash_command_specs()
         .iter()
@@ -5026,16 +5097,20 @@ fn discover_all_skills() -> Vec<(String, String, &'static str)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_tool_specs, format_compact_report, format_cost_report, format_model_report,
-        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        normalize_permission_mode, parse_args, parse_git_status_metadata, print_help_to,
-        push_output_block, render_config_report, render_memory_report, render_repl_help,
-        resolve_model_alias, response_to_events, resume_supported_slash_commands, status_context,
-        CliAction, CliOutputFormat, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        collect_thinking, collect_transcript_events, filter_tool_specs, final_assistant_text,
+        format_compact_report, format_cost_report, format_model_report, format_model_switch_report,
+        format_permissions_report, format_permissions_switch_report, format_resume_report,
+        format_status_report, format_tool_call_start, format_tool_result, normalize_permission_mode,
+        parse_args, parse_git_status_metadata, print_help_to, push_output_block,
+        render_config_report, render_memory_report, render_repl_help, resolve_model_alias,
+        response_to_events, resume_supported_slash_commands, status_context, CliAction,
+        CliOutputFormat, SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
     use api::{MessageResponse, OutputContentBlock, Usage};
-    use runtime::{AssistantEvent, ContentBlock, ConversationMessage, MessageRole, PermissionMode};
+    use runtime::{
+        AssistantEvent, ContentBlock, ConversationMessage, MessageRole, PermissionMode, TokenUsage,
+        TurnSummary,
+    };
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -5556,6 +5631,65 @@ mod tests {
         assert_eq!(converted[1].role, "assistant");
         assert_eq!(converted[2].role, "user");
     }
+
+    #[test]
+    fn prompt_json_transcript_preserves_thinking_tools_and_final_text() {
+        let summary = TurnSummary {
+            assistant_messages: vec![
+                ConversationMessage::assistant(vec![
+                    ContentBlock::Thinking {
+                        thinking: "consider search terms".to_string(),
+                        signature: "sig".to_string(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "toolu_1".to_string(),
+                        name: "WebSearch".to_string(),
+                        input: r#"{"query":"agent literature"}"#.to_string(),
+                    },
+                    ContentBlock::Text {
+                        text: "I found candidates.".to_string(),
+                    },
+                ]),
+                ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "Final summary".to_string(),
+                }]),
+            ],
+            tool_results: vec![ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "toolu_1".to_string(),
+                    tool_name: "WebSearch".to_string(),
+                    output: "paper A".to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+            }],
+            iterations: 2,
+            usage: TokenUsage::default(),
+            auto_compaction: None,
+        };
+
+        assert_eq!(final_assistant_text(&summary), "Final summary");
+        let thinking = collect_thinking(&summary);
+        assert_eq!(thinking[0]["thinking"], "consider search terms");
+
+        let events = collect_transcript_events(&summary);
+        let kinds = events
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                "thinking",
+                "tool_use",
+                "assistant_text",
+                "tool_result",
+                "assistant_text"
+            ]
+        );
+    }
+
     #[test]
     fn repl_help_mentions_history_completion_and_multiline() {
         let help = render_repl_help();

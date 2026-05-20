@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import uuid
 from pathlib import Path
@@ -251,7 +252,8 @@ class RunManager:
             if not line.strip():
                 continue
             try:
-                events.append(RunEvent(**json.loads(line)))
+                event = RunEvent(**json.loads(line))
+                events.extend(expand_replayed_run_event(event))
             except Exception:
                 continue
         return events
@@ -343,10 +345,17 @@ class RunManager:
             if name == "stdout":
                 try:
                     payload = json.loads(text)
-                    event_stream = "codex"
-                    message = summarize_codex_event(payload)
+                    for event in expand_codex_payload_events(run_id, payload):
+                        await self._append_event(workspace, event)
+                    continue
                 except json.JSONDecodeError:
                     payload = None
+            elif name == "stderr":
+                text = clean_terminal_text(text)
+                message = text
+                if is_nonfatal_diagnostic(text):
+                    event_stream = "system"
+                    payload = {"kind": "diagnostic", "level": "warning", "source_stream": "stderr"}
             await self._append_event(
                 workspace,
                 RunEvent(
@@ -368,9 +377,17 @@ class RunManager:
 
     async def _write_last_message_from_events(self, workspace: Path, run_id: str) -> None:
         output_path = last_message_path(workspace, run_id)
-        collected = [
+        events = await self.replay_events(workspace, run_id)
+        final_messages = [
             event.message
-            for event in await self.replay_events(workspace, run_id)
+            for event in events
+            if event.stream == "result"
+            and isinstance(event.payload, dict)
+            and event.payload.get("kind") == "final_result"
+        ]
+        collected = final_messages or [
+            event.message
+            for event in events
             if event.stream in {"stdout", "codex"}
         ]
         if not collected:
@@ -430,6 +447,226 @@ def _try_extract_json(body: str) -> Any | None:
                 pass
         break
     return None
+
+
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def clean_terminal_text(text: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", text).strip()
+
+
+def is_nonfatal_diagnostic(text: str) -> bool:
+    normalized = text.lower()
+    return any(
+        token in normalized
+        for token in (
+            "warning:",
+            "retrying",
+            "restart",
+            "rate limit",
+            "premature eof",
+            "continuing without",
+        )
+    )
+
+
+def expand_codex_payload_events(run_id: str, payload: dict[str, Any]) -> list[RunEvent]:
+    """Expand one-shot ARIS JSON into readable terminal transcript events."""
+    now = utc_now()
+    if not is_aris_final_payload(payload):
+        return [
+            RunEvent(
+                run_id=run_id,
+                timestamp=now,
+                stream="codex",
+                message=summarize_codex_event(payload),
+                payload=payload,
+            )
+        ]
+
+    events: list[RunEvent] = []
+    final_text = str(payload.get("message") or "").strip()
+    transcript = payload.get("events")
+    if isinstance(transcript, list):
+        last_final_text_index = _last_matching_text_event_index(transcript, final_text)
+        for index, item in enumerate(transcript):
+            if not isinstance(item, dict):
+                continue
+            event = codex_transcript_item_to_event(
+                run_id,
+                item,
+                payload if index == last_final_text_index else None,
+                force_final=index == last_final_text_index,
+            )
+            if event is not None:
+                events.append(event)
+    else:
+        events.extend(fallback_codex_events(run_id, payload))
+
+    if final_text and not any(
+        event.stream == "result"
+        and isinstance(event.payload, dict)
+        and event.payload.get("kind") == "final_result"
+        for event in events
+    ):
+        events.append(
+            RunEvent(
+                run_id=run_id,
+                timestamp=utc_now(),
+                stream="result",
+                message=final_text,
+                payload={**payload, "kind": "final_result"},
+            )
+        )
+    if not events:
+        events.append(
+            RunEvent(
+                run_id=run_id,
+                timestamp=utc_now(),
+                stream="codex",
+                message=summarize_codex_event(payload),
+                payload=payload,
+            )
+        )
+    return events
+
+
+def is_aris_final_payload(payload: dict[str, Any]) -> bool:
+    return any(key in payload for key in ("message", "tool_uses", "tool_results", "usage", "events"))
+
+
+def expand_replayed_run_event(event: RunEvent) -> list[RunEvent]:
+    if event.stream != "codex" or not isinstance(event.payload, dict) or not is_aris_final_payload(event.payload):
+        return [event]
+    expanded = expand_codex_payload_events(event.run_id, event.payload)
+    if len(expanded) == 1 and expanded[0].stream == "codex":
+        return [event]
+    return [
+        RunEvent(
+            run_id=event.run_id,
+            timestamp=event.timestamp,
+            stream=item.stream,
+            message=item.message,
+            payload=item.payload,
+        )
+        for item in expanded
+    ]
+
+
+def _last_matching_text_event_index(transcript: list[Any], final_text: str) -> int | None:
+    if not final_text:
+        return None
+    normalized_final = final_text.strip()
+    for index in range(len(transcript) - 1, -1, -1):
+        item = transcript[index]
+        if not isinstance(item, dict) or item.get("kind") != "assistant_text":
+            continue
+        if str(item.get("text") or "").strip() == normalized_final:
+            return index
+    return None
+
+
+def codex_transcript_item_to_event(
+    run_id: str,
+    item: dict[str, Any],
+    full_payload: dict[str, Any] | None = None,
+    *,
+    force_final: bool = False,
+) -> RunEvent | None:
+    kind = str(item.get("kind") or "")
+    if kind == "thinking":
+        thinking = str(item.get("thinking") or "").strip()
+        if not thinking:
+            return None
+        return RunEvent(
+            run_id=run_id,
+            timestamp=utc_now(),
+            stream="thinking",
+            message=thinking,
+            payload={"kind": "thinking", "iteration": item.get("iteration")},
+        )
+    if kind == "assistant_text":
+        text = str(item.get("text") or "").strip()
+        if not text:
+            return None
+        stream = "result" if force_final else "codex"
+        payload = {**(full_payload or {}), "kind": "final_result" if force_final else "assistant_text"}
+        return RunEvent(
+            run_id=run_id,
+            timestamp=utc_now(),
+            stream=stream,
+            message=text,
+            payload=payload,
+        )
+    if kind == "tool_use":
+        name = str(item.get("name") or "tool")
+        detail = summarize_tool_input(item.get("input"))
+        return RunEvent(
+            run_id=run_id,
+            timestamp=utc_now(),
+            stream="tool",
+            message=f"{name} call{(': ' + detail) if detail else ''}",
+            payload={"kind": "tool_use", **item},
+        )
+    if kind == "tool_result":
+        name = str(item.get("tool_name") or "tool")
+        output = str(item.get("output") or "").strip()
+        is_error = bool(item.get("is_error"))
+        summary = truncate_text(output, 1400)
+        label = f"{name} error" if is_error else f"{name} result"
+        return RunEvent(
+            run_id=run_id,
+            timestamp=utc_now(),
+            stream="stderr" if is_error else "tool",
+            message=f"{label}{(': ' + summary) if summary else ''}",
+            payload={"kind": "tool_result", **item},
+        )
+    return None
+
+
+def fallback_codex_events(run_id: str, payload: dict[str, Any]) -> list[RunEvent]:
+    events: list[RunEvent] = []
+    for thinking in payload.get("thinking") or []:
+        if isinstance(thinking, dict):
+            event = codex_transcript_item_to_event(run_id, {"kind": "thinking", **thinking})
+            if event is not None:
+                events.append(event)
+    for tool_use in payload.get("tool_uses") or []:
+        if isinstance(tool_use, dict):
+            event = codex_transcript_item_to_event(run_id, {"kind": "tool_use", **tool_use})
+            if event is not None:
+                events.append(event)
+    for tool_result in payload.get("tool_results") or []:
+        if isinstance(tool_result, dict):
+            event = codex_transcript_item_to_event(run_id, {"kind": "tool_result", **tool_result})
+            if event is not None:
+                events.append(event)
+    return events
+
+
+def summarize_tool_input(value: Any) -> str:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return truncate_text(value, 280)
+    if isinstance(value, dict):
+        for key in ("query", "url", "path", "pattern", "skill", "prompt"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return truncate_text(candidate.strip(), 280)
+        return truncate_text(json.dumps(value, ensure_ascii=False), 280)
+    if value is None:
+        return ""
+    return truncate_text(str(value), 280)
+
+
+def truncate_text(text: str, limit: int) -> str:
+    cleaned = clean_terminal_text(text)
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: max(0, limit - 3)].rstrip() + "..."
 
 
 def summarize_codex_event(payload: dict[str, Any]) -> str:

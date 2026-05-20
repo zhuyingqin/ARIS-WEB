@@ -48,7 +48,7 @@ export type RunRecord = {
 export type RunEvent = {
   run_id: string
   timestamp: string
-  stream: "system" | "stdout" | "stderr" | "codex"
+  stream: "system" | "stdout" | "stderr" | "codex" | "thinking" | "tool" | "result"
   message: string
   payload?: Record<string, unknown> | null
 }
@@ -282,7 +282,7 @@ export type WorkflowRecord = {
 export type WorkflowEvent = {
   workflow_id: string
   timestamp: string
-  event_type: "workflow" | "node" | "run" | "stdout" | "stderr" | "aris"
+  event_type: "workflow" | "node" | "run" | "stdout" | "stderr" | "aris" | "thinking" | "tool" | "result"
   message: string
   node_id?: string | null
   run_id?: string | null
