@@ -7,9 +7,10 @@ import ssl
 import urllib.error
 import urllib.request
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from .agent_configs import get_agent_config
 from .global_settings import build_runtime_env, effective_effort_override, effective_model_override, openai_compatible_settings
@@ -49,6 +50,7 @@ except Exception:  # pragma: no cover - certifi may be unavailable in minimal in
 
 TERMINAL_NODE_STATUSES = {"succeeded", "skipped", "cancelled", "failed"}
 SUCCESS_NODE_STATUSES = {"succeeded", "skipped"}
+EXECUTABLE_NODE_TYPES = {"agent", "sub_agent"}
 
 
 @dataclass
@@ -70,6 +72,11 @@ def model_dict(value):
 
 def _slug(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+
+
+def _safe_node_slug(value: object, fallback: str) -> str:
+    slug = _slug(str(value))
+    return slug[:42].strip("-") or fallback
 
 
 def workflow_event_type_for_run_stream(stream: str) -> str:
@@ -141,10 +148,10 @@ def missing_concrete_outputs(workspace: Path, node: WorkflowNode) -> list[str]:
     for output_path in concrete_output_paths(node.outputs):
         resolved = (workspace / output_path).resolve()
         if workspace.resolve() not in [resolved, *resolved.parents]:
-            missing.append(str(output_path))
+            missing.append(output_path.as_posix())
             continue
         if not resolved.exists():
-            missing.append(str(output_path))
+            missing.append(output_path.as_posix())
     return missing
 
 
@@ -174,6 +181,9 @@ def normalize_workflow_graph(graph: WorkflowGraph, known_skills: set[str] | None
         node_ids.add(node_id)
         skill = node.skill.strip() if isinstance(node.skill, str) and node.skill.strip() else None
         config_file = node.config_file.strip() if isinstance(node.config_file, str) and node.config_file.strip() else None
+        if node.type in {"agent", "human_gate"}:
+            skill = None
+            config_file = None
         if skill and known_skills is not None and skill not in known_skills:
             raise ValueError(f"Unknown skill for node {node_id}: {skill}")
         normalized_nodes.append(
@@ -215,7 +225,13 @@ def normalize_workflow_graph(graph: WorkflowGraph, known_skills: set[str] | None
         WorkflowEdge(id=f"{source}->{target}", source=source, target=target)
         for source, target in sorted(edge_pairs)
     ]
-    return WorkflowGraph(nodes=normalized_nodes, edges=normalized_edges)
+    return WorkflowGraph(
+        schema_version=2,
+        nodes=normalized_nodes,
+        edges=normalized_edges,
+        max_concurrency=graph.max_concurrency,
+        class_limits=graph.class_limits,
+    )
 
 
 def _assert_acyclic(deps_by_node: dict[str, set[str]]) -> None:
@@ -244,6 +260,7 @@ def research_template_graph(goal: str, known_skills: set[str] | None = None) -> 
     nodes = [
         WorkflowNode(
             id="planner",
+            type="agent",
             name="Frame the research problem",
             role="planner",
             skill=skill("research-refine"),
@@ -253,6 +270,7 @@ def research_template_graph(goal: str, known_skills: set[str] | None = None) -> 
         ),
         WorkflowNode(
             id="literature",
+            type="sub_agent",
             name="Map related work",
             role="literature scout",
             skill=skill("research-lit"),
@@ -264,6 +282,7 @@ def research_template_graph(goal: str, known_skills: set[str] | None = None) -> 
         ),
         WorkflowNode(
             id="experiment-plan",
+            type="agent",
             name="Design experiments",
             role="experiment planner",
             skill=skill("experiment-plan"),
@@ -284,6 +303,7 @@ def research_template_graph(goal: str, known_skills: set[str] | None = None) -> 
         ),
         WorkflowNode(
             id="implementation",
+            type="sub_agent",
             name="Implement and run pilot",
             role="experiment executor",
             skill=skill("experiment-bridge"),
@@ -295,6 +315,7 @@ def research_template_graph(goal: str, known_skills: set[str] | None = None) -> 
         ),
         WorkflowNode(
             id="review",
+            type="sub_agent",
             name="Adversarial review",
             role="reviewer",
             skill=skill("research-review"),
@@ -315,6 +336,7 @@ def research_template_graph(goal: str, known_skills: set[str] | None = None) -> 
         ),
         WorkflowNode(
             id="report",
+            type="sub_agent",
             name="Write report or paper draft",
             role="writer",
             skill=skill("paper-writing"),
@@ -342,6 +364,7 @@ def paper_introduction_template_graph(goal: str, known_skills: set[str] | None =
     nodes = [
         WorkflowNode(
             id="intro-context",
+            type="agent",
             name="Build introduction context",
             role="paper context scout",
             skill=skill("paper-plan"),
@@ -351,6 +374,7 @@ def paper_introduction_template_graph(goal: str, known_skills: set[str] | None =
         ),
         WorkflowNode(
             id="literature-positioning",
+            type="sub_agent",
             name="Map positioning and gap",
             role="literature positioning agent",
             skill=skill("research-lit"),
@@ -366,6 +390,7 @@ def paper_introduction_template_graph(goal: str, known_skills: set[str] | None =
         ),
         WorkflowNode(
             id="intro-outline",
+            type="agent",
             name="Plan introduction arc",
             role="introduction story planner",
             skill=skill("paper-plan"),
@@ -381,6 +406,7 @@ def paper_introduction_template_graph(goal: str, known_skills: set[str] | None =
         ),
         WorkflowNode(
             id="draft-introduction",
+            type="sub_agent",
             name="Draft LaTeX introduction",
             role="introduction writer",
             skill=skill("paper-write"),
@@ -397,6 +423,7 @@ def paper_introduction_template_graph(goal: str, known_skills: set[str] | None =
         ),
         WorkflowNode(
             id="review-introduction",
+            type="sub_agent",
             name="Review introduction claims",
             role="adversarial introduction reviewer",
             skill=skill("research-review"),
@@ -411,6 +438,7 @@ def paper_introduction_template_graph(goal: str, known_skills: set[str] | None =
         ),
         WorkflowNode(
             id="revise-introduction",
+            type="sub_agent",
             name="Revise introduction",
             role="introduction revision agent",
             skill=skill("paper-write"),
@@ -455,33 +483,151 @@ def build_workflow_generation_prompt(goal: str, skills: list[SkillInfo]) -> str:
 
 Return ONLY valid JSON, with no Markdown fences or prose. The JSON must match:
 {{
+  "schema_version": 2,
   "title": "short workflow title",
   "goal": "user goal",
   "nodes": [
     {{
       "id": "stable-slug",
-      "type": "agent",
+      "type": "agent|sub_agent|human_gate",
       "name": "human readable name",
       "role": "planner|literature scout|experiment planner|executor|reviewer|writer",
       "skill": "one skill id from the catalog or null",
       "prompt": "specific task prompt",
       "gate": "none|before|after|both",
       "depends_on": ["upstream-node-id"],
+      "fanout": null,
       "position": {{"x": 0, "y": 0}}
     }}
   ],
   "edges": [{{"id": "source->target", "source": "source", "target": "target"}}]
 }}
 
-Use 5-7 nodes. Use type="agent" for Sub-Agent work and type="human_gate" for visible human checkpoints.
+Use 5-7 nodes. Use type="agent" only for planning/orchestration nodes that decide what should happen next.
+Use type="sub_agent" for independent execution work such as literature search, implementation, writing, or review.
+Use type="human_gate" for visible human checkpoints.
 Include at least one human_gate before expensive implementation and one human_gate after review.
 For human_gate nodes set skill to null and gate to "none".
+For sub_agent nodes, assume a fresh isolated run with no memory beyond declared upstream outputs and artifacts.
+When a planner/keyword node produces a variable-length JSON array, create one template sub_agent with a fanout object:
+  "fanout": {{"source": "keyword-node-id", "path": "keyword_groups", "name_template": "Literature search: {{{{item.name}}}}", "max_items": 12}}
+The fanout template will expand at runtime into one independent SubAgent per JSON item. Downstream nodes depending on the template will wait for all generated SubAgents. Use prompt placeholders like {{{{item.name}}}}, {{{{item.keywords}}}}, {{{{item}}}}, {{{{index}}}}, and {{{{number}}}}.
 Do not include model, effort, config_file, inputs, or outputs unless the user explicitly asked for those overrides.
 The DAG must be acyclic. Prefer research workflow skills from this catalog:
 {catalog}
 
 User goal:
 {goal}
+"""
+
+
+WORKFLOW_PROMPT_RUNTIME_FIELDS = {
+    "status",
+    "run_id",
+    "error",
+    "approved_before",
+    "approved_after",
+    "attempt",
+    "usage",
+    "fanout_parent_id",
+    "fanout_item",
+}
+
+
+def workflow_graph_prompt_payload(graph: WorkflowGraph) -> dict:
+    data = model_dict(graph)
+    for node in data.get("nodes", []):
+        if not isinstance(node, dict):
+            continue
+        for field in WORKFLOW_PROMPT_RUNTIME_FIELDS:
+            node.pop(field, None)
+    return data
+
+
+def reset_workflow_execution_state(graph: WorkflowGraph) -> WorkflowGraph:
+    nodes: list[WorkflowNode] = []
+    for node in graph.nodes:
+        update = {
+            "status": "queued",
+            "run_id": None,
+            "error": None,
+            "approved_before": False,
+            "approved_after": False,
+            "attempt": 0,
+            "usage": None,
+        }
+        nodes.append(node.copy(update=update) if not hasattr(node, "model_copy") else node.model_copy(update=update))
+    return (
+        graph.copy(update={"nodes": nodes})
+        if not hasattr(graph, "model_copy")
+        else graph.model_copy(update={"nodes": nodes})
+    )
+
+
+def build_workflow_refinement_prompt(
+    workflow: WorkflowRecord,
+    current_graph: WorkflowGraph,
+    instructions: str,
+    skills: list[SkillInfo],
+) -> str:
+    catalog = "\n".join(
+        f"- {skill.id}: {skill.description[:180]}"
+        for skill in skills
+        if skill.id
+    )
+    current_graph_json = json.dumps(workflow_graph_prompt_payload(current_graph), ensure_ascii=False, indent=2)
+    return f"""You are updating an existing ARIS-Code multi-agent research workflow DAG for the local web console.
+
+Return ONLY valid JSON, with no Markdown fences or prose. Return the complete updated workflow, not a patch.
+
+Current workflow title:
+{workflow.title}
+
+Current workflow goal:
+{workflow.goal}
+
+Current workflow graph:
+{current_graph_json}
+
+New user requirements:
+{instructions}
+
+The JSON must match:
+{{
+  "schema_version": 2,
+  "title": "short workflow title",
+  "goal": "updated user goal",
+  "nodes": [
+    {{
+      "id": "stable-slug",
+      "type": "agent|sub_agent|human_gate",
+      "name": "human readable name",
+      "role": "planner|literature scout|experiment planner|executor|reviewer|writer",
+      "skill": "one skill id from the catalog or null",
+      "prompt": "specific task prompt",
+      "gate": "none|before|after|both",
+      "depends_on": ["upstream-node-id"],
+      "fanout": null,
+      "position": {{"x": 0, "y": 0}}
+    }}
+  ],
+  "edges": [{{"id": "source->target", "source": "source", "target": "target"}}]
+}}
+
+Preserve stable node ids, positions, prompts, and edges when they still satisfy the new requirements.
+Only add, remove, rename, or reorder nodes when the new requirements make that necessary.
+Use type="agent" only for planning/orchestration nodes that decide what should happen next.
+Use type="sub_agent" for independent execution work such as literature search, implementation, writing, or review.
+Use type="human_gate" for visible human checkpoints.
+For human_gate nodes set skill to null and gate to "none".
+For sub_agent nodes, assume a fresh isolated run with no memory beyond declared upstream outputs and artifacts.
+When the new requirements need variable-length parallel work based on upstream output, use a fanout template sub_agent:
+  "fanout": {{"source": "keyword-node-id", "path": "keyword_groups", "name_template": "Literature search: {{{{item.name}}}}", "max_items": 12}}
+The template expands at runtime into one independent SubAgent per JSON item. Downstream nodes depending on the template will wait for all generated SubAgents. Use prompt placeholders like {{{{item.name}}}}, {{{{item.keywords}}}}, {{{{item}}}}, {{{{index}}}}, and {{{{number}}}}.
+Do not include runtime fields such as status, run_id, error, approved_before, approved_after, attempt, or usage.
+Do not include model, effort, config_file, inputs, or outputs unless the user explicitly asked for those overrides.
+The DAG must be acyclic. Prefer research workflow skills from this catalog:
+{catalog}
 """
 
 
@@ -511,6 +657,8 @@ def parse_generated_workflow_text(text: str) -> tuple[str | None, str | None, Wo
             continue
         graph_data = data.get("graph_json") if isinstance(data.get("graph_json"), dict) else data
         if isinstance(graph_data, dict) and "nodes" in graph_data:
+            graph_data = dict(graph_data)
+            graph_data.setdefault("schema_version", 2)
             return data.get("title"), data.get("goal"), WorkflowGraph(**graph_data)
     raise ValueError("ARIS did not return a parseable workflow JSON object")
 
@@ -574,8 +722,7 @@ async def _generate_workflow_graph_direct(prompt: str) -> tuple[str | None, str 
     return parse_generated_workflow_text(raw)
 
 
-async def generate_workflow_graph_with_aris(workspace: Path, goal: str) -> tuple[str | None, str | None, WorkflowGraph]:
-    prompt = build_workflow_generation_prompt(goal, scan_skills())
+async def generate_workflow_graph_from_prompt(workspace: Path, prompt: str) -> tuple[str | None, str | None, WorkflowGraph]:
     direct = await _generate_workflow_graph_direct(prompt)
     if direct is not None:
         return direct
@@ -592,6 +739,178 @@ async def generate_workflow_graph_with_aris(workspace: Path, goal: str) -> tuple
         detail = (stderr or stdout).decode("utf-8", errors="replace")[-2000:]
         raise ValueError(detail or f"ARIS exited with code {process.returncode}")
     return parse_generated_workflow_text(stdout.decode("utf-8", errors="replace"))
+
+
+async def generate_workflow_graph_with_aris(workspace: Path, goal: str) -> tuple[str | None, str | None, WorkflowGraph]:
+    return await generate_workflow_graph_from_prompt(workspace, build_workflow_generation_prompt(goal, scan_skills()))
+
+
+async def refine_workflow_graph_with_aris(
+    workspace: Path,
+    workflow: WorkflowRecord,
+    current_graph: WorkflowGraph,
+    instructions: str,
+) -> tuple[str | None, str | None, WorkflowGraph]:
+    prompt = build_workflow_refinement_prompt(workflow, current_graph, instructions, scan_skills())
+    return await generate_workflow_graph_from_prompt(workspace, prompt)
+
+
+_MISSING = object()
+
+
+def _json_path_get(root: Any, path: str) -> Any:
+    if path in {"", ".", "$"}:
+        return root
+    current = root
+    normalized = path[2:] if path.startswith("$.") else path
+    for raw_part in normalized.split("."):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if isinstance(current, dict):
+            current = current.get(part, _MISSING)
+        elif isinstance(current, list) and part.isdigit():
+            index = int(part)
+            current = current[index] if 0 <= index < len(current) else _MISSING
+        else:
+            return _MISSING
+        if current is _MISSING:
+            return _MISSING
+    return current
+
+
+def _coerce_fanout_items(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        items: list[dict[str, Any]] = []
+        for key, item_value in value.items():
+            if isinstance(item_value, dict):
+                item = dict(item_value)
+                item.setdefault("name", key)
+                item.setdefault("key", key)
+                items.append(item)
+            else:
+                items.append({"name": key, "key": key, "value": item_value, "keywords": item_value})
+        return items
+    return []
+
+
+def _try_extract_json_value(text: str) -> Any | None:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+    raw = _extract_json_blob(stripped)
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def _load_node_output_value(workspace: Path, source_node: WorkflowNode, path: str) -> Any:
+    if not source_node.run_id:
+        return _MISSING
+    raw: Any = None
+    output_path = node_output_path(workspace, source_node.run_id)
+    if output_path.exists():
+        try:
+            raw = json.loads(output_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            raw = None
+    if raw is None:
+        message_path = last_message_path(workspace, source_node.run_id)
+        if message_path.exists():
+            text = message_path.read_text(encoding="utf-8", errors="replace")
+            try:
+                raw = json.loads(text)
+            except json.JSONDecodeError:
+                raw = {"text": text, "json": _try_extract_json_value(text)}
+    if raw is None:
+        return _MISSING
+
+    roots: list[Any] = []
+    if isinstance(raw, dict) and raw.get("json") is not None:
+        roots.append(raw["json"])
+    roots.append(raw)
+    if isinstance(raw, dict) and isinstance(raw.get("text"), str):
+        parsed_text = _try_extract_json_value(raw["text"])
+        if parsed_text is not None:
+            roots.append(parsed_text)
+
+    for root in roots:
+        value = _json_path_get(root, path)
+        if value is not _MISSING:
+            return value
+    return _MISSING
+
+
+def _template_value_to_text(value: Any) -> str:
+    if value is _MISSING or value is None:
+        return ""
+    if isinstance(value, list) and all(not isinstance(item, (dict, list)) for item in value):
+        return ", ".join(str(item) for item in value)
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _template_lookup(item: Any, token: str, index: int) -> Any:
+    if token == "index":
+        return index
+    if token == "number":
+        return index + 1
+    if token == "item":
+        return item
+    if token.startswith("item."):
+        return _json_path_get(item, token[5:])
+    if isinstance(item, dict):
+        return _json_path_get(item, token)
+    return _MISSING
+
+
+def _render_fanout_template(template: str, item: Any, index: int) -> str:
+    def replace(match: re.Match[str]) -> str:
+        return _template_value_to_text(_template_lookup(item, match.group(1).strip(), index))
+
+    return re.sub(r"\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}", replace, template)
+
+
+def _fanout_item_label(item: Any, index: int) -> str:
+    if isinstance(item, dict):
+        for key in ("name", "label", "title", "group", "key", "id"):
+            value = item.get(key)
+            if value is not None and str(value).strip():
+                return str(value)
+        keywords = item.get("keywords")
+        if isinstance(keywords, list) and keywords:
+            return str(keywords[0])
+        if isinstance(keywords, str) and keywords.strip():
+            return keywords
+    elif item is not None and str(item).strip():
+        return str(item)
+    return f"item-{index + 1}"
+
+
+def _render_port_templates(ports: list[Any], item: Any, index: int) -> list[Any]:
+    rendered = []
+    for port in ports:
+        data = model_dict(port) if hasattr(port, "dict") or hasattr(port, "model_dump") else deepcopy(port)
+        if isinstance(data, dict):
+            for key in ("name", "description"):
+                if isinstance(data.get(key), str):
+                    data[key] = _render_fanout_template(data[key], item, index)
+            rendered.append(data)
+        elif isinstance(data, str):
+            rendered.append(_render_fanout_template(data, item, index))
+        else:
+            rendered.append(data)
+    return rendered
 
 
 class WorkflowEventBus:
@@ -675,6 +994,53 @@ class WorkflowManager:
             generated_goal or goal,
             normalized,
         )
+
+    async def refine(
+        self,
+        workspace: Path,
+        workflow_id: str,
+        instructions: str,
+        *,
+        title: str | None = None,
+        graph: WorkflowGraph | None = None,
+    ) -> WorkflowRecord:
+        instructions = instructions.strip()
+        if not instructions:
+            raise ValueError("Refinement instructions must not be empty")
+        record = self._require(workspace, workflow_id)
+        if record.status == "running":
+            raise ValueError("Pause or cancel the workflow before updating it with AI")
+
+        skills = {skill.id for skill in scan_skills()}
+        current_graph = normalize_workflow_graph(graph or record.graph_json, skills)
+        generated_title, generated_goal, generated_graph = await refine_workflow_graph_with_aris(
+            workspace,
+            record,
+            current_graph,
+            instructions,
+        )
+        normalized = reset_workflow_execution_state(normalize_workflow_graph(generated_graph, skills))
+        update_workflow(
+            workspace,
+            workflow_id,
+            title=title or record.title or generated_title,
+            goal=generated_goal or record.goal,
+            status="draft",
+            graph_json=normalized,
+            clear_error=True,
+        )
+        updated = self._require(workspace, workflow_id)
+        await self._append_event(
+            workspace,
+            WorkflowEvent(
+                workflow_id=workflow_id,
+                timestamp=utc_now(),
+                event_type="workflow",
+                message="Workflow updated from AI instructions",
+                payload={"node_count": len(updated.graph_json.nodes)},
+            ),
+        )
+        return updated
 
     async def update(
         self,
@@ -765,6 +1131,7 @@ class WorkflowManager:
             new_nodes.append(
                 WorkflowNode(
                     id=node_id,
+                    type="sub_agent",
                     name=role.name,
                     role=role.role,
                     config_file=role.config_file,
@@ -811,6 +1178,7 @@ class WorkflowManager:
                 new_edges.append(WorkflowEdge(id=f"{source_id}->{target_id}", source=source_id, target=target_id))
 
         next_graph = WorkflowGraph(
+            schema_version=2,
             nodes=[*graph.nodes, *new_nodes],
             edges=[*graph.edges, *new_edges],
             max_concurrency=graph.max_concurrency,
@@ -912,6 +1280,37 @@ class WorkflowManager:
         await self._tick(workspace, workflow_id)
         return self._require(workspace, workflow_id)
 
+    async def approve_batch(self, workspace: Path, workflow_id: str) -> WorkflowRecord:
+        record = self._require(workspace, workflow_id)
+        graph = record.graph_json
+        batch_nodes = [
+            node
+            for node in graph.nodes
+            if node.type in EXECUTABLE_NODE_TYPES
+            and node.status == "waiting_approval"
+            and node.run_id
+            and not node.approved_after
+        ]
+        if not batch_nodes:
+            raise ValueError("No completed execution batch is waiting for approval")
+        for node in batch_nodes:
+            node.approved_after = True
+            node.status = "succeeded"
+            node.error = None
+        update_workflow(workspace, workflow_id, status="running", graph_json=graph, clear_error=True)
+        await self._append_event(
+            workspace,
+            WorkflowEvent(
+                workflow_id=workflow_id,
+                timestamp=utc_now(),
+                event_type="workflow",
+                message=f"Batch approved: {len(batch_nodes)} node(s)",
+                payload={"approved_nodes": [node.id for node in batch_nodes]},
+            ),
+        )
+        await self._tick(workspace, workflow_id)
+        return self._require(workspace, workflow_id)
+
     async def skip_node(self, workspace: Path, workflow_id: str, node_id: str) -> WorkflowRecord:
         record = self._require(workspace, workflow_id)
         graph = record.graph_json
@@ -960,6 +1359,149 @@ class WorkflowManager:
     async def replay_events(self, workspace: Path, workflow_id: str) -> list[WorkflowEvent]:
         return replay_workflow_events(workspace, workflow_id)
 
+    async def _expand_fanout_node(
+        self,
+        workspace: Path,
+        workflow_id: str,
+        graph: WorkflowGraph,
+        node: WorkflowNode,
+    ) -> bool:
+        if node.type != "sub_agent" or node.fanout is None:
+            return False
+        nodes_by_id = {item.id: item for item in graph.nodes}
+        source_id = node.fanout.source or (node.depends_on[0] if node.depends_on else "")
+        source_node = nodes_by_id.get(source_id)
+        if source_node is None:
+            node.status = "failed"
+            node.error = "Fan-out source node not found"
+            update_workflow(workspace, workflow_id, graph_json=graph)
+            await self._append_event(
+                workspace,
+                WorkflowEvent(workflow_id=workflow_id, timestamp=utc_now(), event_type="node", node_id=node.id, message=f"Fan-out failed: {node.error}"),
+            )
+            return True
+        if source_node.status not in SUCCESS_NODE_STATUSES:
+            node.status = "failed"
+            node.error = f"Fan-out source is not complete: {source_id}"
+            update_workflow(workspace, workflow_id, graph_json=graph)
+            await self._append_event(
+                workspace,
+                WorkflowEvent(workflow_id=workflow_id, timestamp=utc_now(), event_type="node", node_id=node.id, message=f"Fan-out failed: {node.error}"),
+            )
+            return True
+
+        value = _load_node_output_value(workspace, source_node, node.fanout.path.strip())
+        items = [] if value is _MISSING else _coerce_fanout_items(value)
+        max_items = max(0, int(node.fanout.max_items or 0))
+        if max_items:
+            items = items[:max_items]
+        if not items:
+            if node.fanout.empty_policy == "succeed":
+                node.status = "succeeded"
+                node.error = None
+                update_workflow(workspace, workflow_id, graph_json=graph)
+                await self._append_event(
+                    workspace,
+                    WorkflowEvent(workflow_id=workflow_id, timestamp=utc_now(), event_type="node", node_id=node.id, message=f"Fan-out produced no items: {node.name}"),
+                )
+                return True
+            node.status = "failed"
+            node.error = f"Fan-out found no items at path: {node.fanout.path or '(root)'}"
+            update_workflow(workspace, workflow_id, graph_json=graph)
+            await self._append_event(
+                workspace,
+                WorkflowEvent(workflow_id=workflow_id, timestamp=utc_now(), event_type="node", node_id=node.id, message=f"Fan-out failed: {node.error}"),
+            )
+            return True
+
+        existing_children = {item.id for item in graph.nodes if item.fanout_parent_id == node.id}
+        if existing_children:
+            graph.nodes = [item for item in graph.nodes if item.id not in existing_children]
+            for item in graph.nodes:
+                item.depends_on = [dep for dep in item.depends_on if dep not in existing_children]
+
+        existing_ids = {item.id for item in graph.nodes}
+        generated_ids: list[str] = []
+        downstream_nodes = [item for item in graph.nodes if item.id != node.id and node.id in item.depends_on]
+        base_x = float(node.position.get("x", 0))
+        base_y = float(node.position.get("y", 0))
+        for index, item in enumerate(items):
+            label = _fanout_item_label(item, index)
+            base_id = f"{node.id}-{_safe_node_slug(label, f'item-{index + 1}')}"
+            child_id = base_id
+            suffix = 2
+            while child_id in existing_ids:
+                child_id = f"{base_id}-{suffix}"
+                suffix += 1
+            existing_ids.add(child_id)
+            generated_ids.append(child_id)
+            rendered_name = _render_fanout_template(node.fanout.name_template or "{{item.name}}", item, index).strip()
+            if not rendered_name:
+                rendered_name = f"{node.name}: {label}"
+            child = WorkflowNode(
+                id=child_id,
+                type="sub_agent",
+                name=rendered_name,
+                role=node.role,
+                skill=node.skill,
+                config_file=node.config_file,
+                prompt=_render_fanout_template(node.prompt, item, index),
+                model=node.model,
+                effort=node.effort,
+                gate=node.gate,
+                depends_on=list(node.depends_on),
+                inputs=_render_port_templates(node.inputs, item, index),
+                outputs=_render_port_templates(node.outputs, item, index),
+                position={"x": base_x + (index + 1) * 220, "y": base_y + 90},
+                timeout_seconds=node.timeout_seconds,
+                retry=deepcopy(node.retry),
+                failure_policy=node.failure_policy,
+                concurrency_class=node.concurrency_class,
+                fanout_parent_id=node.id,
+                fanout_item=item,
+                team_id=node.team_id,
+                team_instance_id=node.team_instance_id,
+                team_role_id=node.team_role_id,
+            )
+            graph.nodes.append(child)
+
+        for item in downstream_nodes:
+            next_deps: list[str] = []
+            for dep in item.depends_on:
+                if dep == node.id:
+                    for child_id in generated_ids:
+                        if child_id not in next_deps:
+                            next_deps.append(child_id)
+                elif dep not in next_deps:
+                    next_deps.append(dep)
+            item.depends_on = next_deps
+
+        node.status = "succeeded"
+        node.error = None
+        node.approved_after = True
+        # Rebuild edges from the updated dependency lists so stale
+        # template->downstream edges do not get reintroduced by normalization.
+        next_graph = WorkflowGraph(
+            schema_version=2,
+            nodes=graph.nodes,
+            edges=[],
+            max_concurrency=graph.max_concurrency,
+            class_limits=graph.class_limits,
+        )
+        normalized = normalize_workflow_graph(next_graph, {skill.id for skill in scan_skills()})
+        update_workflow(workspace, workflow_id, graph_json=normalized)
+        await self._append_event(
+            workspace,
+            WorkflowEvent(
+                workflow_id=workflow_id,
+                timestamp=utc_now(),
+                event_type="workflow",
+                message=f"Fan-out expanded {node.name}: {len(generated_ids)} SubAgent node(s)",
+                payload={"template_node": node.id, "source_node": source_id, "generated_nodes": generated_ids},
+            ),
+        )
+        return True
+
     async def _tick(self, workspace: Path, workflow_id: str) -> None:
         record = self._require(workspace, workflow_id)
         if record.status != "running":
@@ -985,6 +1527,33 @@ class WorkflowManager:
                 )
             return
 
+        active = self._active.setdefault(workflow_id, set())
+        if active:
+            return
+
+        batch_waiting = [
+            node
+            for node in graph.nodes
+            if node.type in EXECUTABLE_NODE_TYPES
+            and node.status == "waiting_approval"
+            and node.run_id
+            and not node.approved_after
+        ]
+        if batch_waiting:
+            if record.status != "paused":
+                update_workflow(workspace, workflow_id, status="paused", graph_json=graph)
+                await self._append_event(
+                    workspace,
+                    WorkflowEvent(
+                        workflow_id=workflow_id,
+                        timestamp=utc_now(),
+                        event_type="workflow",
+                        message=f"Execution batch waiting for approval: {len(batch_waiting)} node(s)",
+                        payload={"nodes": [node.id for node in batch_waiting]},
+                    ),
+                )
+            return
+
         ready = []
         nodes_by_id = {node.id: node for node in graph.nodes}
         for node in graph.nodes:
@@ -992,6 +1561,10 @@ class WorkflowManager:
                 continue
             if not all(nodes_by_id[dep].status in SUCCESS_NODE_STATUSES for dep in node.depends_on):
                 continue
+            if node.fanout is not None:
+                await self._expand_fanout_node(workspace, workflow_id, graph, node)
+                await self._tick(workspace, workflow_id)
+                return
             if node.type == "human_gate":
                 node.status = "waiting_approval"
                 update_workflow(workspace, workflow_id, status="paused", graph_json=graph)
@@ -1010,31 +1583,8 @@ class WorkflowManager:
                 return
             ready.append(node)
 
-        global_limit = graph.max_concurrency or self.max_concurrency
-        class_limits = graph.class_limits or {}
-        # Count currently-active nodes by concurrency_class.
-        active_by_class: dict[str, int] = {}
-        for node in graph.nodes:
-            if node.id in active:
-                cls = node.concurrency_class or "default"
-                active_by_class[cls] = active_by_class.get(cls, 0) + 1
-
-        scheduled: list[WorkflowNode] = []
-        for node in ready:
-            if len(active) + len(scheduled) >= global_limit:
-                break
-            cls = node.concurrency_class or "default"
-            # Class-specific cap, including nodes scheduled in this pass.
-            class_active = active_by_class.get(cls, 0) + sum(
-                1 for s in scheduled if (s.concurrency_class or "default") == cls
-            )
-            class_cap = class_limits.get(cls, global_limit)
-            if class_active >= class_cap:
-                continue
-            scheduled.append(node)
-
-        if scheduled:
-            for node in scheduled:
+        if ready:
+            for node in ready:
                 node.status = "running"
                 active.add(node.id)
                 asyncio.create_task(self._run_node_task(workspace, workflow_id, node.id))
@@ -1046,8 +1596,6 @@ class WorkflowManager:
         # must be transitively blocked by a failed/cancelled dependency under
         # a non-halt failure_policy. Mark them skipped so the workflow can
         # conclude instead of sitting in "running" forever.
-        if active:
-            return
         if any(node.status == "waiting_approval" for node in graph.nodes):
             return
         nodes_by_id_post = {node.id: node for node in graph.nodes}
@@ -1117,22 +1665,7 @@ class WorkflowManager:
                         failure_error = "Missing expected output file(s): " + ", ".join(missing_outputs)
 
                 if failure_error is None:
-                    if node.gate in {"after", "both"} and not node.approved_after:
-                        node.status = "waiting_approval"
-                        update_workflow(workspace, workflow_id, status="paused", graph_json=graph)
-                        await self._append_event(
-                            workspace,
-                            WorkflowEvent(
-                                workflow_id=workflow_id,
-                                timestamp=utc_now(),
-                                event_type="node",
-                                node_id=node_id,
-                                run_id=node.run_id,
-                                message=f"Node waiting for post-run approval: {node.name}",
-                            ),
-                        )
-                        return
-                    node.status = "succeeded"
+                    node.status = "waiting_approval"
                     node.error = None
                     update_workflow(workspace, workflow_id, graph_json=graph)
                     await self._append_event(
@@ -1143,10 +1676,9 @@ class WorkflowManager:
                             event_type="node",
                             node_id=node_id,
                             run_id=node.run_id,
-                            message=f"Node succeeded: {node.name}",
+                            message=f"Node completed and waiting for batch approval: {node.name}",
                         ),
                     )
-                    await self._tick(workspace, workflow_id)
                     return
 
                 # Failure path: consult retry policy.
@@ -1263,8 +1795,8 @@ class WorkflowManager:
         return await self._run_node_with_aris(workspace, record, node)
 
     async def _run_node_with_aris(self, workspace: Path, record: WorkflowRecord, node: WorkflowNode) -> NodeRunResult:
-        config = get_agent_config(workspace, node.config_file) if node.config_file else None
-        if node.config_file and config is None:
+        config = get_agent_config(workspace, node.config_file) if node.type == "sub_agent" and node.config_file else None
+        if node.type == "sub_agent" and node.config_file and config is None:
             raise ValueError(f"Agent config not found: {node.config_file}")
         effective_skill_id = node.skill or (config.skill if config else None)
         effective_model = node.model or (config.model if config else None)
@@ -1330,11 +1862,14 @@ class WorkflowManager:
             while True:
                 current = get_run(workspace, run.id)
                 if current and current.status in {"succeeded", "failed", "cancelled"}:
+                    run_error = current.error
+                    if current.status != "succeeded" and not run_error:
+                        run_error = await self._latest_run_error(workspace, run.id)
                     return NodeRunResult(
                         run_id=run.id,
                         succeeded=current.status == "succeeded",
-                        message=current.error or current.status,
-                        error=current.error if current.status != "succeeded" else None,
+                        message=run_error or current.status,
+                        error=run_error if current.status != "succeeded" else None,
                     )
                 if deadline is not None and loop.time() >= deadline:
                     # Node exceeded its wall-clock budget; cancel the underlying run
@@ -1375,9 +1910,20 @@ class WorkflowManager:
         finally:
             await self.run_manager.bus.unsubscribe(run.id, queue)
 
+    async def _latest_run_error(self, workspace: Path, run_id: str) -> str | None:
+        events = await self.run_manager.replay_events(workspace, run_id)
+        for event in reversed(events):
+            message = event.message.strip()
+            if event.stream == "stderr" and message and not message.startswith("Run `aris "):
+                return message
+        for event in reversed(events):
+            if event.stream == "system" and "failed" in event.message.lower():
+                return event.message.strip()
+        return None
+
     def _build_node_prompt(self, workspace: Path, record: WorkflowRecord, node: WorkflowNode) -> str:
-        config = get_agent_config(workspace, node.config_file) if node.config_file else None
-        if node.config_file and config is None:
+        config = get_agent_config(workspace, node.config_file) if node.type == "sub_agent" and node.config_file else None
+        if node.type == "sub_agent" and node.config_file and config is None:
             raise ValueError(f"Agent config not found: {node.config_file}")
         upstream = []
         nodes_by_id = {item.id: item for item in record.graph_json.nodes}
@@ -1415,6 +1961,9 @@ class WorkflowManager:
         inputs_text = _render_port_summary(node.inputs, kind="expected inputs")
         if not node.inputs:
             inputs_text = "(none declared)"
+        fanout_assignment = ""
+        if node.fanout_item is not None:
+            fanout_assignment = json.dumps(node.fanout_item, ensure_ascii=False, indent=2)
         config_text = "(none)"
         config_prefix = ""
         if config:
@@ -1435,7 +1984,8 @@ Prompt prefix from config:
 Output contract from config:
 {config.output_contract or "(none)"}
 """
-        return f"""You are executing one node in an ARIS Web multi-agent workflow.
+        actor_label = "SubAgent" if node.type == "sub_agent" else "Agent"
+        return f"""You are executing one {actor_label} node in an ARIS Web multi-agent workflow.
 
 Workflow title: {record.title}
 Workflow goal:
@@ -1443,6 +1993,7 @@ Workflow goal:
 
 Node id: {node.id}
 Node name: {node.name}
+Node type: {node.type}
 Node role: {node.role or "agent"}
 Suggested skill label: {("/" + node.skill) if node.skill else "(none)"}
 Expected inputs:
@@ -1459,6 +2010,9 @@ Sub-agent execution namespace:
 Agent configuration profile:
 {config_text}
 
+Dynamic fan-out assignment:
+{fanout_assignment or "(none)"}
+
 Upstream node outputs:
 {upstream_text}
 
@@ -1468,6 +2022,7 @@ Node task prompt:
 Execution requirements:
 - The subprocess current working directory is already the workspace.
 - Work only inside this workspace.
+- Treat this as a fresh run. Do not assume any prior conversation, memory, or hidden state exists.
 - Use ARIS_SUBAGENT_DIR for scratch files, intermediate notes, private analysis artifacts, and temporary per-agent state.
 - Do not use Bash, shell scripts, PowerShell, REPL tools, or sub-agent spawning from the web runner.
 - Use the available workspace-safe tools directly: read/write/edit/glob/grep/WebSearch/WebFetch/Skill/LlmReview.
@@ -1475,6 +2030,7 @@ Execution requirements:
 - Use relative paths such as `.` and `paper/...` for file operations; do not use absolute workspace paths in commands or tool inputs.
 - Produce every expected output that names a concrete file path. If the expected output is `INTRO_RELATED_WORK.md`, `INTRO_OUTLINE.md`, `INTRODUCTION_DRAFT.md`, `INTRO_REVIEW.md`, `INTRODUCTION_REVISED.md`, or `INTRO_REVISION_SUMMARY.md`, write that exact file before finishing.
 - Declared concrete outputs belong at their requested workspace-relative paths, not inside ARIS_SUBAGENT_DIR, unless the output itself is explicitly under `.aris/`.
+- Treat upstream node outputs as read-only context. Do not rewrite upstream artifacts unless the current node explicitly declares that output path.
 - Treat the suggested skill label as workflow metadata. Do not load the full skill instructions unless the node cannot be completed from this prompt and available project files.
 - Follow the agent configuration profile when present. Node fields override config defaults for skill/model/effort.
 - Respect the output contract from config when present.
@@ -1534,7 +2090,7 @@ Execution requirements:
 
         # Resolve which model produced these tokens — node override > config
         # default. If we can't price it, surface counts with cost_usd=None.
-        config = get_agent_config(workspace, node.config_file) if node.config_file else None
+        config = get_agent_config(workspace, node.config_file) if node.type == "sub_agent" and node.config_file else None
         model_name = node.model or (config.model if config else None)
         pricing = pricing_for_model(model_name)
         cost_usd: float | None = None
@@ -1588,6 +2144,8 @@ Execution requirements:
     def _descendants(graph: WorkflowGraph, node_id: str) -> set[str]:
         children: dict[str, set[str]] = {}
         for node in graph.nodes:
+            if node.fanout_parent_id:
+                children.setdefault(node.fanout_parent_id, set()).add(node.id)
             for dep in node.depends_on:
                 children.setdefault(dep, set()).add(node.id)
         result: set[str] = set()

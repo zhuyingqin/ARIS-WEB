@@ -621,6 +621,19 @@ label {
   border-top: 1px solid var(--divider);
 }
 
+.generator-actions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+  align-items: stretch;
+  min-width: 0;
+}
+
+.generator-actions .btn {
+  width: 100%;
+  min-width: 0;
+}
+
 .form-section-title {
   display: flex;
   align-items: center;
@@ -892,6 +905,11 @@ label {
 }
 
 .node-kind-agent {
+  background: var(--violet-soft);
+  color: var(--violet-text);
+}
+
+.node-kind-sub_agent {
   background: var(--brand-soft);
   color: var(--brand);
 }
@@ -984,6 +1002,14 @@ label {
   background: var(--warning-soft);
 }
 
+.flow-node-agent {
+  border-color: #c4b5fd;
+}
+
+.flow-node-sub_agent {
+  border-color: var(--brand-soft-2);
+}
+
 .react-flow__handle {
   width: 10px;
   height: 10px;
@@ -1044,31 +1070,6 @@ label {
   line-height: 1.55;
 }
 
-.generation-console {
-  max-height: 168px;
-  overflow: auto;
-  border-radius: var(--radius);
-  background: var(--terminal-bg);
-  color: var(--terminal-fg);
-  padding: 10px 12px;
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  font-size: var(--fs-sm);
-  line-height: 1.55;
-  text-align: left;
-}
-
-.empty-state .generation-console {
-  width: min(620px, 100%);
-  margin-top: 8px;
-}
-
-.generation-line {
-  grid-template-columns: 62px 76px minmax(0, 1fr);
-}
-
-.generation-ok    { color: #b8f5cf; }
-.generation-error { color: #fdbcbc; }
-
 .node-action-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1096,6 +1097,33 @@ label {
 
 .advanced-node-settings summary::-webkit-details-marker { display: none; }
 .advanced-node-settings[open] > * + * { margin-top: 9px; }
+
+.fanout-config {
+  display: grid;
+  gap: 9px;
+  border-top: 1px solid var(--divider);
+  padding-top: 10px;
+}
+
+.fanout-preview {
+  display: grid;
+  gap: 6px;
+  border: 1px solid var(--divider);
+  border-radius: var(--radius);
+  padding: 8px;
+  background: var(--surface);
+}
+
+.fanout-preview pre {
+  max-height: 150px;
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-muted);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: var(--fs-xs);
+}
 
 .empty-state {
   display: grid;

@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .config import WEB_HOME
+from .config import REPO_ROOT, WEB_HOME
 from .models import GlobalApiProvider, GlobalSettings, UpdateGlobalSettingsRequest
 from .storage import utc_now
 
@@ -14,7 +14,7 @@ DEFAULT_BASE_URLS: dict[str, str] = {
     "openai": "https://api.openai.com/v1",
     "gemini": "https://generativelanguage.googleapis.com/v1beta/openai",
     "glm": "https://open.bigmodel.cn/api/paas/v4",
-    "minimax": "https://api.minimax.chat/v1",
+    "minimax": "https://api.minimaxi.com/anthropic",
     "kimi": "https://api.moonshot.cn/v1",
 }
 
@@ -28,7 +28,9 @@ DEFAULT_MODELS: dict[str, str] = {
 
 MANAGED_ENV_KEYS = {
     "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
     "EXECUTOR_API_KEY",
     "EXECUTOR_BASE_URL",
     "EXECUTOR_PROVIDER",
@@ -40,6 +42,19 @@ MANAGED_ENV_KEYS = {
     "ARIS_REASONING_EFFORT",
     "ARIS_REVIEWER_MODEL",
 }
+
+
+LOCAL_BIN_DIR = REPO_ROOT / ".aris-bin"
+
+
+def _prepend_local_bin(env: dict[str, str]) -> None:
+    if not LOCAL_BIN_DIR.exists():
+        return
+    current_path = env.get("PATH", "")
+    local_bin = str(LOCAL_BIN_DIR)
+    entries = [entry for entry in current_path.split(os.pathsep) if entry]
+    if not any(Path(entry).resolve() == LOCAL_BIN_DIR.resolve() for entry in entries):
+        env["PATH"] = os.pathsep.join([local_bin, *entries]) if entries else local_bin
 
 
 def settings_path(home: Path = WEB_HOME) -> Path:
@@ -100,7 +115,12 @@ def applies_to(
     elif provider == "glm":
         envs.extend(["EXECUTOR_PROVIDER=openai", "EXECUTOR_API_KEY", "GLM_API_KEY", "EXECUTOR_BASE_URL"])
     elif provider == "minimax":
-        envs.extend(["EXECUTOR_PROVIDER=openai", "EXECUTOR_API_KEY", "MINIMAX_API_KEY", "EXECUTOR_BASE_URL"])
+        envs.extend([
+            "EXECUTOR_PROVIDER=anthropic",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_BASE_URL",
+            "MINIMAX_API_KEY",
+        ])
     elif provider == "kimi":
         envs.extend(["EXECUTOR_PROVIDER=openai", "EXECUTOR_API_KEY", "KIMI_API_KEY", "EXECUTOR_BASE_URL"])
     else:
@@ -197,6 +217,8 @@ def openai_compatible_settings(home: Path = WEB_HOME) -> dict[str, str] | None:
     model = effective_model_override(home)
     if not base_url or not model:
         return None
+    if provider == "minimax" and "anthropic" in base_url.rstrip("/").lower():
+        return None
     return {
         "provider": provider,
         "api_key": api_key,
@@ -208,6 +230,7 @@ def openai_compatible_settings(home: Path = WEB_HOME) -> dict[str, str] | None:
 
 def build_runtime_env(base_env: dict[str, str] | None = None, home: Path = WEB_HOME) -> dict[str, str]:
     env = dict(base_env if base_env is not None else os.environ)
+    _prepend_local_bin(env)
     raw = _read_raw(home)
     if not raw:
         return env
@@ -225,7 +248,7 @@ def build_runtime_env(base_env: dict[str, str] | None = None, home: Path = WEB_H
         env["ANTHROPIC_API_KEY"] = api_key
         if base_url:
             env["ANTHROPIC_BASE_URL"] = base_url
-    elif provider in {"openai", "gemini", "glm", "minimax", "kimi"}:
+    elif provider in {"openai", "gemini", "glm", "kimi"}:
         env["EXECUTOR_PROVIDER"] = "openai"
         env["EXECUTOR_API_KEY"] = api_key
         if provider == "openai":
@@ -234,11 +257,15 @@ def build_runtime_env(base_env: dict[str, str] | None = None, home: Path = WEB_H
             env["GEMINI_API_KEY"] = api_key
         elif provider == "glm":
             env["GLM_API_KEY"] = api_key
-        elif provider == "minimax":
-            env["MINIMAX_API_KEY"] = api_key
         elif provider == "kimi":
             env["KIMI_API_KEY"] = api_key
         env["EXECUTOR_BASE_URL"] = base_url or DEFAULT_BASE_URLS.get(provider, "")
+    elif provider == "minimax":
+        env["EXECUTOR_PROVIDER"] = "anthropic"
+        env["ANTHROPIC_API_KEY"] = api_key
+        env["ANTHROPIC_BASE_URL"] = base_url or DEFAULT_BASE_URLS["minimax"]
+        env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
+        env["MINIMAX_API_KEY"] = api_key
     else:
         env["EXECUTOR_PROVIDER"] = "openai"
         env["EXECUTOR_API_KEY"] = api_key

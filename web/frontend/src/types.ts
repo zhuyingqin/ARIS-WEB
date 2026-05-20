@@ -209,9 +209,17 @@ export type NodeUsage = {
   model?: string | null
 }
 
+export type WorkflowFanOut = {
+  source?: string | null
+  path: string
+  name_template: string
+  max_items: number
+  empty_policy?: "fail" | "succeed"
+}
+
 export type WorkflowNodeInfo = {
   id: string
-  type: "agent" | "human_gate"
+  type: "agent" | "sub_agent" | "human_gate"
   name: string
   role: string
   skill?: string | null
@@ -230,10 +238,14 @@ export type WorkflowNodeInfo = {
   approved_after: boolean
   position: Record<string, number>
   timeout_seconds?: number | null
+  retry?: { max_attempts: number; backoff_seconds: number; on: string[] } | null
   attempt?: number
   usage?: NodeUsage | null
   failure_policy?: "halt" | "skip_descendants" | "continue"
   concurrency_class?: string
+  fanout?: WorkflowFanOut | null
+  fanout_parent_id?: string | null
+  fanout_item?: unknown
   team_id?: string | null
   team_instance_id?: string | null
   team_role_id?: string | null
@@ -246,6 +258,7 @@ export type WorkflowEdgeInfo = {
 }
 
 export type WorkflowGraph = {
+  schema_version?: number
   nodes: WorkflowNodeInfo[]
   edges: WorkflowEdgeInfo[]
   max_concurrency?: number | null
@@ -288,6 +301,12 @@ export type GenerateWorkflowPayload = {
   workspace: string
   goal: string
   title?: string
+}
+
+export type RefineWorkflowPayload = {
+  instructions: string
+  title?: string | null
+  graph_json?: WorkflowGraph
 }
 
 export type ExpandTeamPayload = {

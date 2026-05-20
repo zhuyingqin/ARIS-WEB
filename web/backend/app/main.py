@@ -19,7 +19,7 @@ from .artifacts import (
 )
 from .agent_configs import delete_agent_config, list_agent_configs, save_agent_config, update_agent_config
 from .config import FRONTEND_DIST, RENDER_HTML, REPO_ROOT, SKILLS_DIR, TOOLS_DIR, WEB_HOME
-from .global_settings import get_global_settings, update_global_settings
+from .global_settings import build_runtime_env, get_global_settings, update_global_settings
 from .models import (
     AddWorkspaceRequest,
     AgentConfig,
@@ -33,6 +33,7 @@ from .models import (
     HealthItem,
     HealthResponse,
     NodeActionRequest,
+    RefineWorkflowRequest,
     RenderHtmlRequest,
     RunRecord,
     RunOutput,
@@ -46,7 +47,7 @@ from .models import (
     WorkflowRecord,
     WorkspaceInfo,
 )
-from .runner import RunManager
+from .runner import RunManager, resolve_aris_binary
 from .skills import get_skill, scan_skills
 from .storage import WorkspaceStore, get_run, last_message_path, list_runs, node_output_path, utc_now, update_run
 from .team_configs import delete_team_config, list_team_configs, save_team_config, update_team_config
@@ -92,11 +93,14 @@ def _validate_team_config_skills(request: TeamConfigRequest | UpdateTeamConfigRe
 @app.get("/api/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     global_settings = get_global_settings(settings_home)
+    runtime_env = build_runtime_env()
+    python3_bin = shutil.which("python3", path=runtime_env.get("PATH"))
+    node_bin = shutil.which("node", path=runtime_env.get("PATH"))
     checks = [
-        HealthItem(name="aris", available=shutil.which("aris") is not None, value=shutil.which("aris")),
+        HealthItem(name="aris", available=resolve_aris_binary() is not None, value=resolve_aris_binary()),
         HealthItem(name="cargo", available=shutil.which("cargo") is not None, value=shutil.which("cargo")),
-        HealthItem(name="python3", available=shutil.which("python3") is not None, value=shutil.which("python3")),
-        HealthItem(name="node", available=shutil.which("node") is not None, value=shutil.which("node")),
+        HealthItem(name="python3", available=python3_bin is not None, value=python3_bin),
+        HealthItem(name="node", available=node_bin is not None, value=node_bin),
         HealthItem(name="aris_repo", available=REPO_ROOT.exists(), value=str(REPO_ROOT)),
         HealthItem(name="bundled_skills", available=SKILLS_DIR.exists(), value=str(SKILLS_DIR)),
         HealthItem(name="bundled_tools", available=TOOLS_DIR.exists(), value=str(TOOLS_DIR)),
@@ -320,6 +324,27 @@ async def generate_workflow(request: GenerateWorkflowRequest) -> WorkflowRecord:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/workflows/{workflow_id}/refine", response_model=WorkflowRecord)
+async def refine_workflow(
+    workflow_id: str,
+    request: RefineWorkflowRequest,
+    workspace: str = Query(...),
+) -> WorkflowRecord:
+    workspace_path = _workspace_or_404(workspace)
+    try:
+        return await workflow_manager.refine(
+            workspace_path,
+            workflow_id,
+            request.instructions,
+            title=request.title,
+            graph=request.graph_json,
+        )
+    except ValueError as exc:
+        if str(exc) == "Workflow not found":
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/workflows", response_model=list[WorkflowRecord])
 async def workflows(workspace: str | None = Query(None)) -> list[WorkflowRecord]:
     if workspace:
@@ -446,6 +471,15 @@ async def approve_workflow_node(workflow_id: str, node_id: str, workspace: str =
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/workflows/{workflow_id}/approve-batch", response_model=WorkflowRecord)
+async def approve_workflow_batch(workflow_id: str, workspace: str = Query(...)) -> WorkflowRecord:
+    workspace_path = _workspace_or_404(workspace)
+    try:
+        return await workflow_manager.approve_batch(workspace_path, workflow_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/workflows/{workflow_id}/nodes/{node_id}/skip", response_model=WorkflowRecord)
 async def skip_workflow_node(workflow_id: str, node_id: str, workspace: str = Query(...)) -> WorkflowRecord:
     workspace_path = _workspace_or_404(workspace)
@@ -468,7 +502,7 @@ async def rerun_workflow_node(
             workspace_path,
             workflow_id,
             node_id,
-            reset_downstream=request.reset_downstream,
+            reset_downstream=request.reset_downstream or request.reset_descendants,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

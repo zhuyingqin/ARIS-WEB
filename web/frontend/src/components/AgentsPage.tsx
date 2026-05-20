@@ -320,7 +320,7 @@ export function AgentsPage({ workspace }: { workspace: string }) {
 
   function handleDelete() {
     if (!selected) return
-    if (!globalThis.confirm(`Delete agent "${selected.name}"? This cannot be undone.`)) return
+    if (!globalThis.confirm(`Delete SubAgent profile "${selected.name}"? This cannot be undone.`)) return
     deleteMut.mutate(selected)
   }
 
@@ -374,7 +374,7 @@ export function AgentsPage({ workspace }: { workspace: string }) {
   if (!workspace) {
     return (
       <div className="empty-state">
-        <p className="muted">Pick a workspace from the sidebar to manage agents.</p>
+        <p className="muted">Pick a workspace from the sidebar to manage SubAgent profiles.</p>
       </div>
     )
   }
@@ -407,10 +407,10 @@ export function AgentsPage({ workspace }: { workspace: string }) {
               </Button>
             </div>
           </div>
-          <div className="mode-switch" aria-label="Agent manager mode">
+          <div className="mode-switch" aria-label="SubAgent profile manager mode">
             <Button variant="secondary" onClick={() => setMode("agents")} type="button">
               <Bot size={14} />
-              Agents
+              Profiles
             </Button>
             <Button onClick={() => setMode("teams")} type="button">
               <UsersRound size={14} />
@@ -510,7 +510,7 @@ export function AgentsPage({ workspace }: { workspace: string }) {
                 spellCheck={false}
               />
               <small className="inline-hint">
-                Each role expands into an ordinary Sub-Agent node with its own prompt, skill, model, gate, outputs, and position_offset.
+                Each role expands into an ordinary SubAgent node with its own prompt, skill, model, gate, outputs, and position_offset.
               </small>
             </div>
             <div>
@@ -536,11 +536,11 @@ export function AgentsPage({ workspace }: { workspace: string }) {
       <aside className="orchestrator-left panel">
         <div className="panel-head compact-head">
           <div>
-            <h2>Agents</h2>
-            <p>{items.length} reusable role configs</p>
+            <h2>SubAgent Profiles</h2>
+            <p>{items.length} reusable executor profiles</p>
           </div>
           <div className="console-actions">
-            <Button variant="secondary" onClick={() => configs.refetch()} type="button" aria-label="Refresh agents" title="Refresh agents">
+            <Button variant="secondary" onClick={() => configs.refetch()} type="button" aria-label="Refresh profiles" title="Refresh profiles">
               <RefreshCcw size={14} />
             </Button>
             <Button onClick={startNew} type="button">
@@ -549,10 +549,10 @@ export function AgentsPage({ workspace }: { workspace: string }) {
             </Button>
           </div>
         </div>
-        <div className="mode-switch" aria-label="Agent manager mode">
+        <div className="mode-switch" aria-label="SubAgent profile manager mode">
           <Button onClick={() => setMode("agents")} type="button">
             <Bot size={14} />
-            Agents
+            Profiles
           </Button>
           <Button variant="secondary" onClick={() => setMode("teams")} type="button">
             <UsersRound size={14} />
@@ -579,7 +579,7 @@ export function AgentsPage({ workspace }: { workspace: string }) {
           {configs.data?.length === 0 && (
             <div className="list-empty">
               <Bot size={18} />
-              <span>No agents yet</span>
+              <span>No profiles yet</span>
             </div>
           )}
         </div>
@@ -591,11 +591,11 @@ export function AgentsPage({ workspace }: { workspace: string }) {
             <div className="flow-title-row">
               <Badge>
                 <Bot size={13} />
-                Agent
+                SubAgent Profile
               </Badge>
               {!isNew && selected && <span>{selected.id}</span>}
             </div>
-            <h1>{isNew ? "New agent" : displayedName}</h1>
+            <h1>{isNew ? "New SubAgent profile" : displayedName}</h1>
             <p>{displayedRole || "Untitled role"}</p>
           </div>
           <div className="console-actions">

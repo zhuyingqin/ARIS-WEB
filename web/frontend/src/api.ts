@@ -6,6 +6,7 @@ import type {
   CreateWorkflowPayload,
   ExpandTeamPayload,
   GenerateWorkflowPayload,
+  RefineWorkflowPayload,
   GlobalSettings,
   HealthResponse,
   RunOutput,
@@ -140,6 +141,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
+  refineWorkflow: (workflow: WorkflowRecord, payload: RefineWorkflowPayload) =>
+    request<WorkflowRecord>(`/api/workflows/${workflow.id}/refine?workspace=${encodeURIComponent(workflow.workspace)}`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
   updateWorkflow: (workflow: WorkflowRecord) =>
     request<WorkflowRecord>(`/api/workflows/${workflow.id}?workspace=${encodeURIComponent(workflow.workspace)}`, {
       method: "PATCH",
@@ -172,6 +178,11 @@ export const api = {
   approveWorkflowNode: (workflow: WorkflowRecord, nodeId: string) =>
     request<WorkflowRecord>(
       `/api/workflows/${workflow.id}/nodes/${nodeId}/approve?workspace=${encodeURIComponent(workflow.workspace)}`,
+      { method: "POST" },
+    ),
+  approveWorkflowBatch: (workflow: WorkflowRecord) =>
+    request<WorkflowRecord>(
+      `/api/workflows/${workflow.id}/approve-batch?workspace=${encodeURIComponent(workflow.workspace)}`,
       { method: "POST" },
     ),
   skipWorkflowNode: (workflow: WorkflowRecord, nodeId: string) =>

@@ -46,6 +46,7 @@ from app.models import (  # noqa: E402
     UpdateTeamConfigRequest,
     WorkflowGraph,
     WorkflowNode,
+    WorkflowRecord,
 )
 from app.runner import RunManager, build_aris_command, build_aris_prompt, summarize_codex_event  # noqa: E402
 from app.skills import parse_skill_frontmatter, scan_skills  # noqa: E402
@@ -63,6 +64,7 @@ from app.workflows import (  # noqa: E402
     NodeRunResult,
     WorkflowManager,
     build_workflow_generation_prompt,
+    build_workflow_refinement_prompt,
     missing_concrete_outputs,
     normalize_workflow_graph,
     paper_introduction_template_graph,
@@ -278,7 +280,7 @@ def test_global_settings_mask_and_runtime_env(tmp_path: Path) -> None:
         home=tmp_path,
     )
 
-    assert env["PATH"] == "/bin"
+    assert env["PATH"].split(";")[-1] == "/bin" or env["PATH"].split(":")[-1] == "/bin"
     assert env["EXECUTOR_PROVIDER"] == "openai"
     assert env["EXECUTOR_API_KEY"] == "sk-test-123456"
     assert env["OPENAI_API_KEY"] == "sk-test-123456"
@@ -298,20 +300,21 @@ def test_global_settings_mask_and_runtime_env(tmp_path: Path) -> None:
 
     update_global_settings(UpdateGlobalSettingsRequest(provider="minimax", api_key="sk-minimax-123"), tmp_path)
     minimax_env = build_runtime_env(base_env={"ARIS_REVIEWER_MODEL": "claude-opus-4-7"}, home=tmp_path)
-    assert minimax_env["EXECUTOR_BASE_URL"] == "https://api.minimax.chat/v1"
+    assert minimax_env["EXECUTOR_PROVIDER"] == "anthropic"
+    assert minimax_env["ANTHROPIC_API_KEY"] == "sk-minimax-123"
+    assert "ANTHROPIC_AUTH_TOKEN" not in minimax_env
+    assert minimax_env["ANTHROPIC_BASE_URL"] == "https://api.minimaxi.com/anthropic"
     assert minimax_env["MINIMAX_API_KEY"] == "sk-minimax-123"
+    assert minimax_env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] == "1"
     assert minimax_env["ARIS_REVIEWER_MODEL"] == "MiniMax-M2.7"
     assert effective_model_override(tmp_path) == "MiniMax-M2.7"
-    direct_settings = openai_compatible_settings(tmp_path)
-    assert direct_settings is not None
-    assert direct_settings["base_url"] == "https://api.minimax.chat/v1"
-    assert direct_settings["model"] == "MiniMax-M2.7"
+    assert openai_compatible_settings(tmp_path) is None
 
 
 def test_build_aris_command_uses_exec_args_not_shell(tmp_path: Path) -> None:
     command = build_aris_command(tmp_path, "hello", model="claude-opus")
 
-    assert command[0] in {"aris", "cargo"} or command[0].endswith("/aris")
+    assert Path(command[0]).name in {"aris", "aris.exe", "cargo"}
     assert "--permission-mode=workspace-write" in command
     assert "--allowedTools" in command
     assert "bash" not in command[command.index("--allowedTools") + 1].lower()
@@ -379,7 +382,7 @@ def test_health_endpoint_smoke() -> None:
 
     assert response.status_code == 200
     body = response.json()
-    assert body["repo_root"].endswith("aris code")
+    assert Path(body["repo_root"]).resolve() == REPO_ROOT.resolve()
     assert {item["name"] for item in body["checks"]} >= {
         "aris",
         "cargo",
@@ -516,11 +519,18 @@ def test_team_config_api_create_expand_and_execute(tmp_path: Path) -> None:
 
     execute_response = client.post(f"/api/workflows/{workflow['id']}/execute?workspace={workspace}")
     assert execute_response.status_code == 200
-    for _ in range(40):
+    for _ in range(8):
+        for _ in range(40):
+            current = get_workflow(workspace, workflow["id"])
+            if current and current.status in {"paused", "succeeded"}:
+                break
+            time.sleep(0.05)
         current = get_workflow(workspace, workflow["id"])
-        if current and current.status == "succeeded":
+        assert current is not None
+        if current.status == "succeeded":
             break
-        time.sleep(0.05)
+        approve_batch = client.post(f"/api/workflows/{workflow['id']}/approve-batch?workspace={workspace}")
+        assert approve_batch.status_code == 200
     current = get_workflow(workspace, workflow["id"])
     assert current is not None
     assert current.status == "succeeded"
@@ -577,6 +587,25 @@ def test_workflow_validation_rejects_cycles_and_unknown_skills() -> None:
         normalize_workflow_graph(graph)
 
 
+def test_workflow_graph_legacy_agent_nodes_upgrade_to_sub_agents() -> None:
+    legacy = WorkflowGraph(
+        **{
+            "nodes": [{"id": "legacy", "name": "Legacy", "type": "agent"}],
+            "edges": [],
+        }
+    )
+    modern = WorkflowGraph(
+        schema_version=2,
+        nodes=[WorkflowNode(id="planner", name="Planner", type="agent")],
+        edges=[],
+    )
+
+    assert legacy.schema_version == 2
+    assert legacy.nodes[0].type == "sub_agent"
+    assert modern.schema_version == 2
+    assert modern.nodes[0].type == "agent"
+
+
 def test_parse_generated_workflow_text_reads_aris_json_message() -> None:
     text = json.dumps(
         {
@@ -595,7 +624,9 @@ def test_parse_generated_workflow_text_reads_aris_json_message() -> None:
 
     assert title == "Generated"
     assert goal == "Goal"
+    assert graph.schema_version == 2
     assert graph.nodes[0].id == "a"
+    assert graph.nodes[0].type == "sub_agent"
 
 
 def test_workflow_generation_prompt_keeps_agent_overrides_hidden() -> None:
@@ -615,17 +646,80 @@ def test_workflow_generation_prompt_keeps_agent_overrides_hidden() -> None:
 
     schema = prompt.split("The DAG must be acyclic.", 1)[0]
 
-    assert '"type": "agent"' in prompt
+    assert '"schema_version": 2' in prompt
+    assert '"type": "agent|sub_agent|human_gate"' in prompt
+    assert "type=\"agent\"" in prompt
+    assert "type=\"sub_agent\"" in prompt
     assert "type=\"human_gate\"" in prompt
+    assert '"fanout"' in prompt
+    assert "{{item.keywords}}" in prompt
     assert '"model"' not in schema
     assert '"effort"' not in schema
     assert '"config_file"' not in schema
 
 
+def test_workflow_refinement_prompt_includes_current_graph_without_runtime() -> None:
+    workflow = WorkflowRecord(
+        id="wf",
+        workspace=".",
+        title="Existing",
+        goal="Original goal",
+        status="paused",
+        graph_json=WorkflowGraph(
+            nodes=[
+                WorkflowNode(
+                    id="a",
+                    name="A",
+                    status="waiting_approval",
+                    run_id="run-a",
+                    error="old error",
+                    approved_after=True,
+                )
+            ],
+            edges=[],
+        ),
+        created_at=utc_now(),
+        updated_at=utc_now(),
+    )
+
+    prompt = build_workflow_refinement_prompt(
+        workflow,
+        workflow.graph_json,
+        "Add a final human review gate",
+        [
+            SkillInfo(
+                id="research-review",
+                name="research-review",
+                description="Review research outputs",
+                argument_hint="",
+                source_path="SKILL.md",
+                package="skills",
+            )
+        ],
+    )
+
+    assert "Add a final human review gate" in prompt
+    assert '"id": "a"' in prompt
+    assert "research-review" in prompt
+    assert "run-a" not in prompt
+    assert "waiting_approval" not in prompt
+    assert "old error" not in prompt
+    assert "Return the complete updated workflow, not a patch" in prompt
+    assert '"fanout"' in prompt
+    assert "{{item.keywords}}" in prompt
+
+
 def test_research_template_graph_has_human_gates() -> None:
     graph = research_template_graph("test goal", {"research-refine", "research-lit", "experiment-plan"})
+    nodes = {node.id: node for node in graph.nodes}
 
     assert [node.id for node in graph.nodes if node.type == "human_gate"] == ["approve-implementation", "approve-review"]
+    assert nodes["planner"].type == "agent"
+    assert nodes["experiment-plan"].type == "agent"
+    assert nodes["literature"].type == "sub_agent"
+    assert nodes["implementation"].type == "sub_agent"
+    assert nodes["review"].type == "sub_agent"
+    assert nodes["report"].type == "sub_agent"
     assert {edge.target for edge in graph.edges} >= {"literature", "experiment-plan", "approve-implementation"}
 
 
@@ -645,6 +739,10 @@ def test_paper_introduction_template_graph_targets_intro_writing() -> None:
         "approve-introduction",
     ]
     assert graph.nodes[-1].type == "human_gate"
+    assert graph.nodes[0].type == "agent"
+    assert graph.nodes[1].type == "sub_agent"
+    assert graph.nodes[2].type == "agent"
+    assert graph.nodes[3].type == "sub_agent"
     assert graph.nodes[-1].depends_on == ["revise-introduction"]
     assert {edge.target for edge in graph.edges} >= {"draft-introduction", "review-introduction", "approve-introduction"}
 
@@ -661,6 +759,57 @@ def test_workflow_storage_roundtrip(tmp_path: Path) -> None:
         await manager.delete(tmp_path, workflow.id)
         assert get_workflow(tmp_path, workflow.id) is None
         assert not workflow_path(tmp_path, workflow.id).exists()
+
+    asyncio.run(run())
+
+
+def test_workflow_manager_refines_existing_workflow_and_resets_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app import workflows as workflow_module
+
+    async def fake_refine(workspace: Path, workflow: WorkflowRecord, current_graph: WorkflowGraph, instructions: str):
+        assert workspace == tmp_path
+        assert workflow.title == "Original"
+        assert current_graph.nodes[0].id == "a"
+        assert instructions == "add a reviewer"
+        return (
+            "Generated title",
+            "Updated goal",
+            WorkflowGraph(
+                nodes=[
+                    WorkflowNode(id="a", name="A updated", status="succeeded", run_id="old-run"),
+                    WorkflowNode(id="b", name="Reviewer", type="human_gate", depends_on=["a"]),
+                ],
+                edges=[],
+            ),
+        )
+
+    monkeypatch.setattr(workflow_module, "refine_workflow_graph_with_aris", fake_refine)
+    manager = WorkflowManager(type("R", (), {})())
+
+    async def run() -> None:
+        workflow = await manager.create(
+            tmp_path,
+            "Original",
+            "Original goal",
+            WorkflowGraph(nodes=[WorkflowNode(id="a", name="A")]),
+        )
+        refined = await manager.refine(tmp_path, workflow.id, "add a reviewer", title="Keep title")
+
+        assert refined.id == workflow.id
+        assert refined.title == "Keep title"
+        assert refined.goal == "Updated goal"
+        assert refined.status == "draft"
+        nodes = {node.id: node for node in refined.graph_json.nodes}
+        assert nodes["a"].name == "A updated"
+        assert nodes["a"].status == "queued"
+        assert nodes["a"].run_id is None
+        assert nodes["b"].type == "human_gate"
+        assert nodes["b"].status == "queued"
+        assert refined.graph_json.edges[0].source == "a"
+        assert refined.graph_json.edges[0].target == "b"
 
     asyncio.run(run())
 
@@ -709,6 +858,7 @@ def test_workflow_expand_team_creates_nodes_edges_and_guards_collisions(tmp_path
 
         nodes = {node.id: node for node in expanded.graph_json.nodes}
         assert {"alpha-planner", "alpha-executor", "alpha-reviewer"} <= set(nodes)
+        assert {nodes["alpha-planner"].type, nodes["alpha-executor"].type, nodes["alpha-reviewer"].type} == {"sub_agent"}
         assert nodes["alpha-planner"].depends_on == ["upstream"]
         assert nodes["alpha-executor"].depends_on == ["alpha-planner"]
         assert nodes["alpha-reviewer"].depends_on == ["alpha-executor"]
@@ -843,7 +993,7 @@ def test_run_manager_handles_large_stdout_lines(tmp_path: Path) -> None:
     )
 
     async def run() -> None:
-        command = ["python3", "-c", "print('x' * 70000)"]
+        command = [sys.executable, "-c", "print('x' * 70000)"]
         await manager._run_process(run_id, tmp_path, command)
         record = get_run(tmp_path, run_id)
         events = await manager.replay_events(tmp_path, run_id)
@@ -936,6 +1086,71 @@ def test_workflow_node_prompt_includes_agent_config(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
+def test_sub_agent_runs_use_isolated_attempt_directories(tmp_path: Path) -> None:
+    class FakeBus:
+        async def subscribe(self, run_id: str) -> asyncio.Queue[RunEvent]:
+            return asyncio.Queue()
+
+        async def unsubscribe(self, run_id: str, queue: asyncio.Queue[RunEvent]) -> None:
+            return None
+
+    class FakeRunManager:
+        def __init__(self) -> None:
+            self.bus = FakeBus()
+            self.requests: list[CreateRunRequest] = []
+
+        async def create_run(self, request: CreateRunRequest, skill: SkillInfo, workspace: Path) -> RunRecord:
+            self.requests.append(request)
+            run_id = f"run-{len(self.requests)}"
+            record = RunRecord(
+                id=run_id,
+                workspace=str(workspace),
+                skill=request.skill,
+                status="succeeded",
+                created_at=utc_now(),
+                updated_at=utc_now(),
+                command=[],
+            )
+            insert_run(record)
+            return record
+
+        async def replay_events(self, workspace: Path, run_id: str) -> list[RunEvent]:
+            return []
+
+    manager = WorkflowManager(FakeRunManager())
+
+    async def run() -> None:
+        workflow = await manager.create(
+            tmp_path,
+            "Isolation",
+            "Goal",
+            WorkflowGraph(
+                schema_version=2,
+                nodes=[
+                    WorkflowNode(id="a", name="A", type="sub_agent"),
+                    WorkflowNode(id="b", name="B", type="sub_agent"),
+                ],
+            ),
+        )
+        result_a = await manager._run_node_with_aris(tmp_path, workflow, workflow.graph_json.nodes[0])
+        result_b = await manager._run_node_with_aris(tmp_path, workflow, workflow.graph_json.nodes[1])
+
+        assert result_a.succeeded
+        assert result_b.succeeded
+        requests = manager.run_manager.requests
+        dir_a = Path(requests[0].env_overrides["ARIS_SUBAGENT_DIR"])
+        dir_b = Path(requests[1].env_overrides["ARIS_SUBAGENT_DIR"])
+        assert dir_a != dir_b
+        assert dir_a.name == "attempt-1"
+        assert dir_b.name == "attempt-1"
+        assert dir_a.exists()
+        assert dir_b.exists()
+        assert requests[0].env_overrides["ARIS_NODE_ID"] == "a"
+        assert requests[1].env_overrides["ARIS_NODE_ID"] == "b"
+
+    asyncio.run(run())
+
+
 def test_workflow_manager_gates_and_approval(tmp_path: Path) -> None:
     calls: list[str] = []
 
@@ -958,20 +1173,40 @@ def test_workflow_manager_gates_and_approval(tmp_path: Path) -> None:
         assert paused.graph_json.nodes[0].status == "waiting_approval"
 
         await manager.approve_node(tmp_path, workflow.id, "a")
-        for _ in range(20):
+        for _ in range(40):
             current = get_workflow(tmp_path, workflow.id)
-            if current and current.status == "succeeded":
+            if current and current.status == "paused" and current.graph_json.nodes[0].status == "waiting_approval" and current.graph_json.nodes[0].run_id:
                 break
             await asyncio.sleep(0.05)
         current = get_workflow(tmp_path, workflow.id)
         assert current is not None
-        assert current.status == "succeeded"
+        assert current.status == "paused"
+        assert current.graph_json.nodes[0].status == "waiting_approval"
+        assert current.graph_json.nodes[1].status == "queued"
+        assert calls == ["a"]
+
+        await manager.approve_batch(tmp_path, workflow.id)
+        for _ in range(40):
+            current = get_workflow(tmp_path, workflow.id)
+            if current and current.status == "paused" and current.graph_json.nodes[1].status == "waiting_approval":
+                break
+            await asyncio.sleep(0.05)
+        current = get_workflow(tmp_path, workflow.id)
+        assert current is not None
+        assert current.status == "paused"
+        assert current.graph_json.nodes[0].status == "succeeded"
+        assert current.graph_json.nodes[1].status == "waiting_approval"
+        assert calls == ["a", "b"]
+
+        finished = await manager.approve_batch(tmp_path, workflow.id)
+        assert finished.status == "succeeded"
+        assert all(node.status == "succeeded" for node in finished.graph_json.nodes)
         assert calls == ["a", "b"]
 
     asyncio.run(run())
 
 
-def test_workflow_manager_limits_concurrency(tmp_path: Path) -> None:
+def test_workflow_manager_runs_ready_nodes_as_approval_batch(tmp_path: Path) -> None:
     running = 0
     max_running = 0
 
@@ -998,12 +1233,215 @@ def test_workflow_manager_limits_concurrency(tmp_path: Path) -> None:
         await manager.execute(tmp_path, workflow.id)
         for _ in range(40):
             current = get_workflow(tmp_path, workflow.id)
-            if current and current.status == "succeeded":
+            if current and current.status == "paused":
                 break
             await asyncio.sleep(0.05)
-        assert max_running == 2
+        current = get_workflow(tmp_path, workflow.id)
+        assert current is not None
+        nodes = {node.id: node for node in current.graph_json.nodes}
+        assert current.status == "paused"
+        assert {nodes["a"].status, nodes["b"].status, nodes["c"].status} == {"waiting_approval"}
+        assert nodes["d"].status == "queued"
+        assert max_running == 3
+
+        await manager.approve_batch(tmp_path, workflow.id)
+        for _ in range(40):
+            current = get_workflow(tmp_path, workflow.id)
+            if current and current.status == "paused" and current.graph_json.nodes[-1].status == "waiting_approval":
+                break
+            await asyncio.sleep(0.05)
+        current = get_workflow(tmp_path, workflow.id)
+        assert current is not None
+        assert current.graph_json.nodes[-1].status == "waiting_approval"
+        finished = await manager.approve_batch(tmp_path, workflow.id)
+        assert finished.status == "succeeded"
 
     asyncio.run(run())
+
+
+def test_workflow_manager_expands_fanout_sub_agents_from_json_output(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    async def fake_runner(workspace: Path, record, node) -> NodeRunResult:
+        calls.append(node.id)
+        run_id = f"run-{node.id}"
+        output_path = node_output_path(workspace, run_id)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if node.id == "keywords":
+            output_path.write_text(
+                json.dumps(
+                    {
+                        "text": "",
+                        "json": {
+                            "keyword_groups": [
+                                {"name": "large", "keywords": ["foundation models", "research agents"]},
+                                {"name": "medium", "keywords": ["workflow orchestration", "human approval"]},
+                                {"name": "small", "keywords": ["Scopus query", "paper abstract"]},
+                            ]
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        return NodeRunResult(run_id=run_id, succeeded=True, message="ok")
+
+    manager = WorkflowManager(type("R", (), {})(), node_runner=fake_runner)
+    graph = WorkflowGraph(
+        schema_version=2,
+        nodes=[
+            WorkflowNode(
+                id="keywords",
+                type="agent",
+                name="Keyword planner",
+                role="planner",
+                prompt="Return keyword_groups JSON with large, medium, and small groups.",
+            ),
+            WorkflowNode(
+                id="literature-template",
+                type="sub_agent",
+                name="Literature search template",
+                role="literature scout",
+                prompt="Search and summarize papers for {{item.name}} keywords: {{item.keywords}}",
+                depends_on=["keywords"],
+                fanout={
+                    "source": "keywords",
+                    "path": "keyword_groups",
+                    "name_template": "Literature search: {{item.name}}",
+                    "max_items": 12,
+                },
+            ),
+            WorkflowNode(
+                id="synthesis",
+                type="agent",
+                name="Synthesize results",
+                role="planner",
+                prompt="Merge the literature summaries.",
+                depends_on=["literature-template"],
+            ),
+        ],
+    )
+
+    async def run() -> None:
+        workflow = await manager.create(tmp_path, "Fanout", "Search three keyword groups", graph)
+        await manager.execute(tmp_path, workflow.id)
+        for _ in range(40):
+            current = get_workflow(tmp_path, workflow.id)
+            if current and current.status == "paused" and current.graph_json.nodes[0].status == "waiting_approval":
+                break
+            await asyncio.sleep(0.05)
+
+        assert calls == ["keywords"]
+        await manager.approve_batch(tmp_path, workflow.id)
+        for _ in range(80):
+            current = get_workflow(tmp_path, workflow.id)
+            generated = [node for node in current.graph_json.nodes if node.fanout_parent_id == "literature-template"] if current else []
+            if current and current.status == "paused" and len(generated) == 3 and all(node.status == "waiting_approval" for node in generated):
+                break
+            await asyncio.sleep(0.05)
+
+        current = get_workflow(tmp_path, workflow.id)
+        assert current is not None
+        nodes = {node.id: node for node in current.graph_json.nodes}
+        generated = [node for node in current.graph_json.nodes if node.fanout_parent_id == "literature-template"]
+        generated_ids = {node.id for node in generated}
+
+        assert nodes["literature-template"].status == "succeeded"
+        assert generated_ids == {
+            "literature-template-large",
+            "literature-template-medium",
+            "literature-template-small",
+        }
+        assert nodes["synthesis"].depends_on == sorted(generated_ids)
+        assert all(node.depends_on == ["keywords"] for node in generated)
+        assert all(node.status == "waiting_approval" for node in generated)
+        assert any("large keywords" in node.prompt for node in generated)
+        assert {"keywords", *generated_ids} <= set(calls)
+        assert "synthesis" not in calls
+
+        prompt = manager._build_node_prompt(tmp_path, current, nodes["literature-template-large"])
+        assert "Dynamic fan-out assignment:" in prompt
+        assert "foundation models" in prompt
+
+        await manager.approve_batch(tmp_path, workflow.id)
+        for _ in range(40):
+            current = get_workflow(tmp_path, workflow.id)
+            if current and current.status == "paused":
+                nodes_now = {node.id: node for node in current.graph_json.nodes}
+                if nodes_now["synthesis"].status == "waiting_approval":
+                    break
+            await asyncio.sleep(0.05)
+
+        current = get_workflow(tmp_path, workflow.id)
+        assert current is not None
+        nodes = {node.id: node for node in current.graph_json.nodes}
+        assert nodes["synthesis"].status == "waiting_approval"
+
+    asyncio.run(run())
+
+
+def test_workflow_api_rerun_accepts_reset_descendants_alias(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    from app import main
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    async def fake_runner(workspace: Path, record, node) -> NodeRunResult:
+        return NodeRunResult(run_id=f"run-{node.id}", succeeded=True)
+
+    main.workspace_store = WorkspaceStore(home=tmp_path / "home", default_workspace=workspace)
+    main.run_manager = RunManager()
+    main.workflow_manager = WorkflowManager(main.run_manager, node_runner=fake_runner)
+    client = TestClient(main.app)
+
+    create_response = client.post(
+        "/api/workflows",
+        json={
+            "workspace": str(workspace),
+            "title": "Rerun alias",
+            "goal": "Goal",
+            "graph_json": {
+                "schema_version": 2,
+                "nodes": [
+                    {"id": "a", "name": "A", "type": "sub_agent", "status": "failed", "run_id": "old-a"},
+                    {
+                        "id": "b",
+                        "name": "B",
+                        "type": "sub_agent",
+                        "status": "skipped",
+                        "depends_on": ["a"],
+                        "error": "Blocked by upstream failure",
+                    },
+                ],
+                "edges": [{"id": "a->b", "source": "a", "target": "b"}],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    workflow = create_response.json()
+
+    rerun_response = client.post(
+        f"/api/workflows/{workflow['id']}/nodes/a/rerun?workspace={workspace}",
+        json={"reset_descendants": True},
+    )
+    assert rerun_response.status_code == 200
+
+    for _ in range(20):
+        current_response = client.get(f"/api/workflows/{workflow['id']}?workspace={workspace}")
+        assert current_response.status_code == 200
+        current = current_response.json()
+        if current["status"] == "paused" and current["graph_json"]["nodes"][0]["status"] == "waiting_approval":
+            break
+        time.sleep(0.05)
+
+    current_response = client.get(f"/api/workflows/{workflow['id']}?workspace={workspace}")
+    current = current_response.json()
+    nodes = {node["id"]: node for node in current["graph_json"]["nodes"]}
+    assert nodes["a"]["status"] == "waiting_approval"
+    assert nodes["b"]["status"] == "queued"
+    assert nodes["b"]["error"] is None
 
 
 def test_workflow_api_create_execute_and_stream(tmp_path: Path) -> None:
@@ -1051,6 +1489,17 @@ def test_workflow_api_create_execute_and_stream(tmp_path: Path) -> None:
 
     approve_response = client.post(f"/api/workflows/{workflow['id']}/nodes/a/approve?workspace={workspace}")
     assert approve_response.status_code == 200
+
+    for _ in range(20):
+        current_response = client.get(f"/api/workflows/{workflow['id']}?workspace={workspace}")
+        assert current_response.status_code == 200
+        current_workflow = current_response.json()
+        if current_workflow["status"] == "paused" and current_workflow["graph_json"]["nodes"][0]["run_id"]:
+            break
+        time.sleep(0.05)
+    approve_batch_response = client.post(f"/api/workflows/{workflow['id']}/approve-batch?workspace={workspace}")
+    assert approve_batch_response.status_code == 200
+    assert approve_batch_response.json()["status"] == "succeeded"
 
     delete_response = client.delete(f"/api/workflows/{template_response.json()['id']}?workspace={workspace}")
     assert delete_response.status_code == 200

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import uuid
 from pathlib import Path
@@ -23,6 +24,7 @@ from .storage import (
 
 
 SUBPROCESS_STREAM_LIMIT = 16 * 1024 * 1024
+LOCAL_BIN_DIR = REPO_ROOT / ".aris-bin"
 SAFE_WORKSPACE_TOOLS = [
     "read",
     "write",
@@ -41,6 +43,31 @@ SAFE_WORKSPACE_TOOLS = [
     "Config",
     "StructuredOutput",
 ]
+
+
+def _local_executable(name: str) -> Path | None:
+    candidates = [name]
+    if os.name == "nt":
+        candidates.extend([f"{name}.exe", f"{name}.cmd", f"{name}.bat"])
+    for candidate in candidates:
+        path = LOCAL_BIN_DIR / candidate
+        if path.exists():
+            return path
+    return None
+
+
+def resolve_aris_binary() -> str | None:
+    local = _local_executable("aris")
+    if local:
+        return str(local)
+    return shutil.which("aris")
+
+
+def _command_available(command: str, env: dict[str, str]) -> bool:
+    command_path = Path(command)
+    if command_path.is_absolute() and command_path.exists():
+        return True
+    return shutil.which(command, path=env.get("PATH")) is not None
 
 
 def build_aris_prompt(skill: SkillInfo, request: CreateRunRequest) -> str:
@@ -86,7 +113,7 @@ def build_aris_command(
     prompt: str,
     model: str | None = None,
 ) -> list[str]:
-    aris_bin = shutil.which("aris")
+    aris_bin = resolve_aris_binary()
     if aris_bin:
         command = [aris_bin]
     elif shutil.which("cargo") and (REPO_ROOT / "Cargo.toml").exists():
@@ -229,7 +256,10 @@ class RunManager:
         env_overrides: dict[str, str] | None = None,
     ) -> None:
         self._workspace_by_run[run_id] = workspace
-        if command[0] == "aris" and shutil.which("aris") is None:
+        env = build_runtime_env()
+        if env_overrides:
+            env.update({key: value for key, value in env_overrides.items() if value is not None})
+        if Path(command[0]).name.lower() in {"aris", "aris.exe"} and not _command_available(command[0], env):
             message = "Neither aris nor cargo was found; install ARIS-Code or Rust/Cargo first"
             update_run(workspace, run_id, status="failed", finished_at=utc_now(), error=message)
             await self._append_event(
@@ -244,9 +274,6 @@ class RunManager:
             RunEvent(run_id=run_id, timestamp=utc_now(), stream="system", message="Run started"),
         )
         try:
-            env = build_runtime_env()
-            if env_overrides:
-                env.update({key: value for key, value in env_overrides.items() if value is not None})
             process = await asyncio.create_subprocess_exec(
                 *command,
                 cwd=str(workspace),
@@ -301,7 +328,7 @@ class RunManager:
             line = await stream.readline()
             if not line:
                 break
-            text = line.decode("utf-8", errors="replace").rstrip("\n")
+            text = line.decode("utf-8", errors="replace").rstrip("\r\n")
             payload: dict[str, Any] | None = None
             event_stream = name
             message = text

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 GlobalApiProvider = Literal["anthropic", "openai", "gemini", "glm", "minimax", "kimi", "custom"]
@@ -18,10 +18,11 @@ WorkflowNodeStatus = Literal[
     "skipped",
     "cancelled",
 ]
-WorkflowNodeType = Literal["agent", "human_gate"]
+WorkflowNodeType = Literal["agent", "sub_agent", "human_gate"]
 WorkflowGate = Literal["none", "before", "after", "both"]
 WorkflowTemplate = Literal["research", "paper_introduction"]
 WorkflowFailurePolicy = Literal["halt", "skip_descendants", "continue"]
+FanOutEmptyPolicy = Literal["fail", "succeed"]
 
 
 class HealthItem(BaseModel):
@@ -249,9 +250,19 @@ class RetryPolicy(BaseModel):
     on: list[str] = Field(default_factory=list)
 
 
+class FanOutSpec(BaseModel):
+    """Expand a template SubAgent into one SubAgent per upstream JSON item."""
+
+    source: str | None = None
+    path: str = ""
+    name_template: str = "{{item.name}}"
+    max_items: int = 12
+    empty_policy: FanOutEmptyPolicy = "fail"
+
+
 class WorkflowNode(BaseModel):
     id: str
-    type: WorkflowNodeType = "agent"
+    type: WorkflowNodeType = "sub_agent"
     name: str
     role: str = ""
     skill: str | None = None
@@ -275,6 +286,9 @@ class WorkflowNode(BaseModel):
     usage: NodeUsage | None = None
     failure_policy: WorkflowFailurePolicy = "halt"
     concurrency_class: str = "default"
+    fanout: FanOutSpec | None = None
+    fanout_parent_id: str | None = None
+    fanout_item: Any | None = None
     team_id: str | None = None
     team_instance_id: str | None = None
     team_role_id: str | None = None
@@ -348,6 +362,7 @@ class UpdateTeamConfigRequest(BaseModel):
 
 
 class WorkflowGraph(BaseModel):
+    schema_version: int = 2
     nodes: list[WorkflowNode] = Field(default_factory=list)
     edges: list[WorkflowEdge] = Field(default_factory=list)
     # ``max_concurrency`` overrides the WorkflowManager default for this
@@ -357,6 +372,32 @@ class WorkflowGraph(BaseModel):
     # out IO-bound nodes.
     max_concurrency: int | None = None
     class_limits: dict[str, int] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _upgrade_legacy_agent_nodes(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        schema_version = value.get("schema_version")
+        try:
+            legacy_schema = schema_version is None or int(schema_version) < 2
+        except (TypeError, ValueError):
+            legacy_schema = True
+        if not legacy_schema:
+            return value
+        upgraded = dict(value)
+        nodes = []
+        for node in value.get("nodes") or []:
+            if isinstance(node, dict):
+                item = dict(node)
+                if item.get("type", "agent") == "agent":
+                    item["type"] = "sub_agent"
+                nodes.append(item)
+            else:
+                nodes.append(node)
+        upgraded["nodes"] = nodes
+        upgraded["schema_version"] = 2
+        return upgraded
 
 
 class WorkflowRecord(BaseModel):
@@ -389,6 +430,12 @@ class GenerateWorkflowRequest(BaseModel):
     title: str | None = None
 
 
+class RefineWorkflowRequest(BaseModel):
+    instructions: str
+    title: str | None = None
+    graph_json: WorkflowGraph | None = None
+
+
 class CreateWorkflowRequest(BaseModel):
     workspace: str
     title: str
@@ -406,6 +453,7 @@ class UpdateWorkflowRequest(BaseModel):
 
 class NodeActionRequest(BaseModel):
     reset_downstream: bool = False
+    reset_descendants: bool = False
 
 
 class ExpandTeamRequest(BaseModel):

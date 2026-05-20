@@ -26,3 +26,7 @@ __pycache__/
 # Web console local build/dependency artifacts
 web/frontend/node_modules/
 web/frontend/dist/
+.venv/
+.aris-bin/
+.aris-web-uvicorn.log
+.aris-web-uvicorn.*.log

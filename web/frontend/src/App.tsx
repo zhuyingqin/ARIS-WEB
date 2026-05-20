@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   applyNodeChanges,
@@ -63,7 +63,7 @@ import { AgentsPage } from "./components/AgentsPage"
 
 const navItems = [
   { value: "orchestrator", label: "Orchestrator", icon: <GitBranch size={16} /> },
-  { value: "agents", label: "Agents", icon: <Bot size={16} /> },
+  { value: "agents", label: "SubAgents", icon: <Bot size={16} /> },
   { value: "skills", label: "Skills", icon: <BookOpen size={16} /> },
   { value: "runs", label: "Runs", icon: <Terminal size={16} /> },
   { value: "artifacts", label: "Artifacts", icon: <FileText size={16} /> },
@@ -88,6 +88,16 @@ function formatBytes(size: number) {
   if (size < 1024) return `${size} B`
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
   return `${(size / 1024 / 1024).toFixed(1)} MB`
+}
+
+function useAutoScrollToEnd<T extends HTMLElement>(dependencies: unknown[]) {
+  const ref = useRef<T | null>(null)
+  useEffect(() => {
+    const element = ref.current
+    if (!element) return
+    element.scrollTop = element.scrollHeight
+  }, dependencies)
+  return ref
 }
 
 function useDefaultWorkspace(workspaces: WorkspaceInfo[] | undefined) {
@@ -254,15 +264,22 @@ function uniqueTeamPrefix(teamId: string, nodes: WorkflowNodeInfo[]) {
 function workflowCounts(workflow: WorkflowRecord) {
   const nodes = workflow.graph_json.nodes
   const agents = nodes.filter((node) => node.type === "agent").length
-  const checkpoints = nodes.filter((node) => node.type === "human_gate").length
+  const subAgents = nodes.filter((node) => node.type === "sub_agent").length
+  const gates = nodes.filter((node) => node.type === "human_gate").length
   const specialists = new Set(
-    nodes.filter((node) => node.type === "agent" && node.config_file).map((node) => node.config_file as string),
+    nodes.filter((node) => node.type === "sub_agent" && node.config_file).map((node) => node.config_file as string),
   ).size
-  return { agents, checkpoints, specialists }
+  return { agents, subAgents, gates, specialists }
 }
 
 function nodeKindLabel(node: WorkflowNodeInfo) {
-  return node.type === "human_gate" ? "Checkpoint" : "Sub-Agent"
+  if (node.type === "human_gate") return "Gate"
+  if (node.type === "sub_agent") return "SubAgent"
+  return "Agent"
+}
+
+function isExecutableNode(node: WorkflowNodeInfo) {
+  return node.type === "agent" || node.type === "sub_agent"
 }
 
 const ROLE_PALETTE = ["#7c3aed", "#0ea5e9", "#16a34a", "#f59e0b", "#dc2626", "#0891b2", "#9333ea", "#0d9488"]
@@ -288,42 +305,21 @@ function truncate(value: string, max: number) {
   return `${value.slice(0, max - 1).trimEnd()}…`
 }
 
-type GenerationLogLine = {
-  id: string
-  timestamp: string
-  scope: string
-  message: string
-  tone?: "system" | "ok" | "error"
-}
-
-function generationLogLine(scope: string, message: string, tone: GenerationLogLine["tone"] = "system"): GenerationLogLine {
-  return {
-    id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-    timestamp: new Date().toTimeString().slice(0, 8),
-    scope,
-    message,
-    tone,
+function jsonPreview(value: unknown, max = 420) {
+  if (value === null || value === undefined) return ""
+  let text = ""
+  try {
+    text = JSON.stringify(value, null, 2)
+  } catch {
+    text = String(value)
   }
-}
-
-function GenerationConsole({ lines }: { lines: GenerationLogLine[] }) {
-  if (!lines.length) return null
-  return (
-    <div className="generation-console" aria-live="polite">
-      {lines.map((line) => (
-        <div className={`term-line generation-line generation-${line.tone ?? "system"}`} key={line.id}>
-          <span>{line.timestamp}</span>
-          <b>{line.scope}</b>
-          <p>{line.message}</p>
-        </div>
-      ))}
-    </div>
-  )
+  return truncate(text, max)
 }
 
 function NodeResultPanel({ workflow, node }: { workflow: WorkflowRecord; node: WorkflowNodeInfo }) {
   const queryClient = useQueryClient()
   const [nodeEvents, setNodeEvents] = useState<WorkflowEvent[]>([])
+  const nodeEventLogRef = useAutoScrollToEnd<HTMLDivElement>([nodeEvents.length, node.id])
   const runId = node.run_id ?? ""
   const outputQuery = useQuery({
     queryKey: ["run-output", workflow.workspace, runId],
@@ -404,12 +400,12 @@ function NodeResultPanel({ workflow, node }: { workflow: WorkflowRecord; node: W
       ) : (
         <p className="node-empty-result">
           {node.type === "human_gate"
-            ? "This Checkpoint records approval state and does not launch a separate run."
-            : "This Sub-Agent has not run yet."}
+            ? "This Gate records approval state and does not launch a separate run."
+            : `This ${nodeKindLabel(node)} has not run yet.`}
         </p>
       )}
       {nodeEvents.length > 0 && (
-        <div className="node-event-log">
+        <div className="node-event-log" ref={nodeEventLogRef}>
           {nodeEvents.slice(-60).map((event, index) => (
             <div className={`term-line term-${event.event_type}`} key={`${event.timestamp}-${index}`}>
               <span>{event.timestamp.slice(11, 19)}</span>
@@ -438,8 +434,8 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
   const [selectedTeamId, setSelectedTeamId] = useState("")
   const [teamPrefix, setTeamPrefix] = useState("")
   const [events, setEvents] = useState<WorkflowEvent[]>([])
+  const workflowLogRef = useAutoScrollToEnd<HTMLDivElement>([events.length, selectedId])
   const [canvasNodes, setCanvasNodes] = useState<Node[]>([])
-  const [generationLog, setGenerationLog] = useState<GenerationLogLine[]>([])
   const workflows = useQuery({
     queryKey: ["workflows", workspace],
     queryFn: () => api.workflows(workspace),
@@ -494,54 +490,35 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
 
   const createWorkflow = useMutation({
     mutationFn: api.createWorkflow,
-    onMutate: (payload) => {
-      const label = workflowTemplateOptions.find((item) => item.value === payload.template)?.label ?? "Research validation"
-      setGenerationLog([
-        generationLogLine("template", `Creating a local ${label} Flow from the built-in template.`),
-        generationLogLine("storage", "Writing workflow metadata and default Sub-Agent DAG."),
-      ])
-    },
     onSuccess: (workflow) => {
       queryClient.invalidateQueries({ queryKey: ["workflows", workspace] })
       setSelectedId(workflow.id)
       setDraft(cloneWorkflow(workflow))
       setDirty(false)
-      setGenerationLog((current) => [
-        ...current,
-        generationLogLine("done", `Flow created: ${workflow.title} (${workflow.graph_json.nodes.length} nodes).`, "ok"),
-      ])
-    },
-    onError: (error) => {
-      setGenerationLog((current) => [
-        ...current,
-        generationLogLine("error", error.message || "Template creation failed.", "error"),
-      ])
     },
   })
   const generateWorkflow = useMutation({
     mutationFn: api.generateWorkflow,
-    onMutate: () => {
-      setGenerationLog([
-        generationLogLine("generate", "Submitting goal to the workflow generator."),
-        generationLogLine("model", "Calling the global API provider to draft a DAG JSON."),
-        generationLogLine("validate", "Waiting for model response, then backend will validate nodes, skills, and dependencies."),
-      ])
-    },
     onSuccess: (workflow) => {
       queryClient.invalidateQueries({ queryKey: ["workflows", workspace] })
       setSelectedId(workflow.id)
       setDraft(cloneWorkflow(workflow))
       setDirty(false)
-      setGenerationLog((current) => [
-        ...current,
-        generationLogLine("done", `Flow generated: ${workflow.title} (${workflow.graph_json.nodes.length} nodes).`, "ok"),
-      ])
     },
-    onError: (error) => {
-      setGenerationLog((current) => [
-        ...current,
-        generationLogLine("error", error.message || "Flow generation failed.", "error"),
-      ])
+  })
+  const refineWorkflow = useMutation({
+    mutationFn: ({ workflow, instructions, title }: { workflow: WorkflowRecord; instructions: string; title?: string }) =>
+      api.refineWorkflow(workflow, {
+        instructions,
+        title: title || null,
+        graph_json: workflow.graph_json,
+      }),
+    onSuccess: (workflow) => {
+      queryClient.invalidateQueries({ queryKey: ["workflows", workspace] })
+      setSelectedId(workflow.id)
+      setDraft(cloneWorkflow(workflow))
+      setSelectedNodeId(workflow.graph_json.nodes[0]?.id ?? "")
+      setDirty(false)
     },
   })
   const saveWorkflow = useMutation({
@@ -599,6 +576,13 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
   const approveNode = useMutation({
     mutationFn: ({ workflow, nodeId }: { workflow: WorkflowRecord; nodeId: string }) =>
       api.approveWorkflowNode(workflow, nodeId),
+    onSuccess: (workflow) => {
+      queryClient.invalidateQueries({ queryKey: ["workflows", workspace] })
+      setDraft(cloneWorkflow(workflow))
+    },
+  })
+  const approveBatch = useMutation({
+    mutationFn: api.approveWorkflowBatch,
     onSuccess: (workflow) => {
       queryClient.invalidateQueries({ queryKey: ["workflows", workspace] })
       setDraft(cloneWorkflow(workflow))
@@ -681,15 +665,15 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
   function addNode(type: WorkflowNodeInfo["type"]) {
     updateDraft((workflow) => {
       const index = workflow.graph_json.nodes.length + 1
-      const id = slug(`${type === "human_gate" ? "checkpoint" : "agent"}-${index}`)
+      const id = slug(`${type === "human_gate" ? "gate" : type === "sub_agent" ? "sub-agent" : "agent"}-${index}`)
       workflow.graph_json.nodes.push({
         id,
         type,
-        name: type === "human_gate" ? `Checkpoint ${index}` : `Sub-Agent ${index}`,
-        role: type === "human_gate" ? "human approval" : "agent",
+        name: type === "human_gate" ? `Gate ${index}` : type === "sub_agent" ? `SubAgent ${index}` : `Agent ${index}`,
+        role: type === "human_gate" ? "human approval" : type === "sub_agent" ? "executor" : "planner",
         skill: null,
         config_file: null,
-        prompt: type === "human_gate" ? "Review the upstream output and approve when it is ready for downstream agents." : "",
+        prompt: type === "human_gate" ? "Review the upstream output and approve when it is ready for downstream work." : "",
         model: null,
         effort: null,
         gate: "none",
@@ -701,7 +685,14 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
         error: null,
         approved_before: false,
         approved_after: false,
-        position: { x: 120 + workflow.graph_json.nodes.length * 220, y: type === "human_gate" ? 90 : 260 },
+        position: { x: 120 + workflow.graph_json.nodes.length * 220, y: type === "human_gate" ? 90 : type === "agent" ? 170 : 260 },
+        timeout_seconds: null,
+        retry: null,
+        failure_policy: "halt",
+        concurrency_class: "default",
+        fanout: null,
+        fanout_parent_id: null,
+        fanout_item: null,
       })
       setSelectedNodeId(id)
       setSelectedEdgeId("")
@@ -722,21 +713,26 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
 
   const selectedNode = draft?.graph_json.nodes.find((node) => node.id === selectedNodeId) ?? null
   const selectedEdge = draft?.graph_json.edges.find((edge) => edge.id === selectedEdgeId) ?? null
-  const selectedNodeConfig = findAgentConfig(agentConfigs.data, selectedNode?.config_file)
+  const selectedNodeConfig =
+    selectedNode?.type === "sub_agent" ? findAgentConfig(agentConfigs.data, selectedNode?.config_file) : null
   const selectedTeam = (teamConfigs.data ?? []).find((team) => team.id === selectedTeamId) ?? teamConfigs.data?.[0] ?? null
   const draftCounts = draft
     ? workflowCounts(draft)
-    : { agents: 0, checkpoints: 0, specialists: 0 }
+    : { agents: 0, subAgents: 0, gates: 0, specialists: 0 }
+  const waitingBatchCount =
+    draft?.graph_json.nodes.filter(
+      (node) => isExecutableNode(node) && node.status === "waiting_approval" && Boolean(node.run_id) && !node.approved_after,
+    ).length ?? 0
   const draftFlowNodes: Node[] = useMemo(
     () =>
       (draft?.graph_json.nodes ?? []).map((node) => {
         const agentConfig = findAgentConfig(agentConfigs.data, node.config_file)
         const inheritedSkill = node.skill ?? agentConfig?.skill ?? null
         const skillLabel =
-          node.type === "agent" ? (inheritedSkill ? `/${inheritedSkill}` : "ad-hoc") : null
+          node.type === "sub_agent" ? (inheritedSkill ? `/${inheritedSkill}` : "ad-hoc") : null
         const roleLabel = agentConfig
           ? agentConfig.name
-          : node.role || (node.type === "human_gate" ? "human approval" : "agent")
+          : node.role || (node.type === "human_gate" ? "human approval" : node.type === "sub_agent" ? "executor" : "planner")
         const roleAccent = agentConfig ? roleColor(agentConfig.id) : null
         const teamAccent = node.team_instance_id ? roleColor(node.team_instance_id) : null
         const accent = roleAccent ?? teamAccent
@@ -751,13 +747,13 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
               <div className="flow-node-label">
                 <div className="flow-node-topline">
                   <span className={`node-kind node-kind-${node.type}`}>
-                    {node.type === "human_gate" ? <ClipboardCheck size={13} /> : <Bot size={13} />}
+                    {node.type === "human_gate" ? <ClipboardCheck size={13} /> : node.type === "sub_agent" ? <Bot size={13} /> : <Cpu size={13} />}
                     {nodeKindLabel(node)}
                   </span>
                   <em className={statusClass(node.status)}>{node.status}</em>
                 </div>
                 <strong>{node.name}</strong>
-                {agentConfig ? (
+                {node.type === "sub_agent" && agentConfig ? (
                   <span
                     className="role-chip"
                     style={{
@@ -867,6 +863,17 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
     })
   }
 
+  function handleRefine() {
+    if (!draft) return
+    const instructions = goal.trim()
+    if (!instructions) return
+    refineWorkflow.mutate({
+      workflow: draft,
+      instructions,
+      title: title || undefined,
+    })
+  }
+
   function handleDeleteWorkflow() {
     if (!draft) return
     if (!globalThis.confirm(`Delete Flow "${draft.title}"? This cannot be undone.`)) return
@@ -893,7 +900,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
         <div className="panel-head compact-head">
           <div>
             <h2>Flows</h2>
-            <p>{(workflows.data ?? []).length} local agent flows</p>
+            <p>{(workflows.data ?? []).length} local workflows</p>
           </div>
           <Button variant="secondary" onClick={() => workflows.refetch()} type="button" aria-label="Refresh flows" title="Refresh flows">
             <RefreshCcw size={15} />
@@ -917,7 +924,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                   <Badge>Flow</Badge>
                 </div>
                 <span>
-                  {counts.agents} Sub-Agents · {counts.specialists} Specialists · {counts.checkpoints} Checkpoints
+                  {counts.agents} Agents · {counts.subAgents} SubAgents · {counts.gates} Gates
                 </span>
                 <em className={statusClass(workflow.status)}>{workflow.status}</em>
               </button>
@@ -933,14 +940,14 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
         <div className="generator-box">
           <div className="form-section-title">
             <Sparkles size={14} />
-            Create Flow
+            Create / Update Flow
           </div>
           <label>Flow goal</label>
           <Textarea
             rows={5}
             value={goal}
             onChange={(event) => setGoal(event.target.value)}
-            placeholder="Describe the research objective, constraints, and desired output..."
+            placeholder="Describe a new flow, or changes to apply to the selected flow..."
           />
           <label>Title</label>
           <Input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Optional title" />
@@ -955,25 +962,36 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
               </option>
             ))}
           </Select>
-          <div className="two-col">
+          <div className="generator-actions">
             <Button
               variant="secondary"
               onClick={handleCreateTemplate}
-              disabled={!workspace || createWorkflow.isPending}
+              disabled={!workspace || createWorkflow.isPending || refineWorkflow.isPending}
               type="button"
             >
               <GitBranch size={15} />
               Use Template
             </Button>
-            <Button onClick={handleGenerate} disabled={!workspace || generateWorkflow.isPending} type="button">
+            <Button
+              onClick={handleGenerate}
+              disabled={!workspace || generateWorkflow.isPending || refineWorkflow.isPending}
+              type="button"
+            >
               <Wand2 size={15} />
-              Generate Flow
+              Generate New
+            </Button>
+            <Button
+              onClick={handleRefine}
+              disabled={!workspace || !draft || draft.status === "running" || !goal.trim() || refineWorkflow.isPending}
+              type="button"
+            >
+              <Wand2 size={15} />
+              Update Flow
             </Button>
           </div>
-          {(createWorkflow.error || generateWorkflow.error) && (
-            <p className="error-text">{(createWorkflow.error || generateWorkflow.error)?.message}</p>
+          {(createWorkflow.error || generateWorkflow.error || refineWorkflow.error) && (
+            <p className="error-text">{(createWorkflow.error || generateWorkflow.error || refineWorkflow.error)?.message}</p>
           )}
-          <GenerationConsole lines={generationLog} />
         </div>
       </aside>
 
@@ -987,9 +1005,10 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                     <GitBranch size={13} />
                     Flow
                   </Badge>
-                  <span>{draftCounts.agents} Sub-Agents</span>
+                  <span>{draftCounts.agents} Agents</span>
+                  <span>{draftCounts.subAgents} SubAgents</span>
                   <span>{draftCounts.specialists} Specialists</span>
-                  <span>{draftCounts.checkpoints} Checkpoints</span>
+                  <span>{draftCounts.gates} Gates</span>
                   {dirty && <Badge>unsaved</Badge>}
                   <span className={statusClass(draft.status)}>{draft.status}</span>
                 </div>
@@ -1002,8 +1021,12 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
               <div className="flow-canvas-toolbar" aria-label="Flow canvas actions">
                 <div className="canvas-actions-group">
                   <Button variant="secondary" onClick={() => addNode("agent")} type="button">
-                    <Plus size={15} />
+                    <Cpu size={15} />
                     Agent
+                  </Button>
+                  <Button variant="secondary" onClick={() => addNode("sub_agent")} type="button">
+                    <Plus size={15} />
+                    SubAgent
                   </Button>
                   <Button variant="secondary" onClick={() => addNode("human_gate")} type="button">
                     <ClipboardCheck size={15} />
@@ -1014,7 +1037,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                     onClick={openTeamDialog}
                     disabled={!teamConfigs.data?.length}
                     type="button"
-                    title={teamConfigs.data?.length ? "Insert Team" : "Create a Team on the Agents page first"}
+                    title={teamConfigs.data?.length ? "Insert Team" : "Create a Team on the SubAgents page first"}
                   >
                     <UsersRound size={15} />
                     Team
@@ -1059,6 +1082,16 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                   >
                     {draft.status === "paused" ? <Play size={15} /> : <Pause size={15} />}
                     {draft.status === "paused" ? "Resume" : "Pause"}
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    onClick={() => approveBatch.mutate(draft)}
+                    disabled={!waitingBatchCount || approveBatch.isPending}
+                    type="button"
+                    title={waitingBatchCount ? "Approve completed execution batch" : "No completed batch is waiting"}
+                  >
+                    <ClipboardCheck size={15} />
+                    Approve Batch
                   </Button>
                   <Button
                     variant="destructive"
@@ -1107,7 +1140,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                 <Controls />
               </ReactFlow>
             </div>
-            <div className="workflow-log">
+            <div className="workflow-log" ref={workflowLogRef}>
               {events.map((event, index) => (
                 <div className={`term-line term-${event.event_type}`} key={`${event.timestamp}-${index}`}>
                   <span>{event.timestamp.slice(11, 19)}</span>
@@ -1122,7 +1155,6 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
             <GitBranch size={28} />
             <h1>Create or generate a research workflow</h1>
             <p>Start from a template or ask ARIS to generate a DAG from the research goal.</p>
-            <GenerationConsole lines={generationLog} />
           </div>
         )}
       </section>
@@ -1170,7 +1202,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                     <small>{selectedTeam.roles.length} roles</small>
                     <small>{selectedTeam.default_edges.length} edges</small>
                   </div>
-                  <p>{selectedTeam.description || "This Team will expand into editable Sub-Agent nodes."}</p>
+                  <p>{selectedTeam.description || "This Team will expand into editable SubAgent nodes."}</p>
                 </div>
               )}
               <p className="muted">
@@ -1192,7 +1224,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
           ) : (
             <div className="empty-state compact-empty-state">
               <UsersRound size={24} />
-              <p className="muted">Create a Team on the Agents page first, then insert it into this Flow.</p>
+              <p className="muted">Create a Team on the SubAgents page first, then insert it into this Flow.</p>
             </div>
           )}
         </div>
@@ -1215,7 +1247,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
               </span>
             </div>
             <p className="muted">
-              This edge means the target Sub-Agent or Checkpoint waits for the source node to finish.
+              This edge means the target Agent, SubAgent, or Gate waits for the source node to finish.
             </p>
             <Button variant="destructive" onClick={() => removeEdges([selectedEdge.id])} type="button">
               <XCircle size={15} />
@@ -1227,7 +1259,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
             <div className="selected-skill">
               <div className="node-editor-title">
                 <span className={`node-kind node-kind-${selectedNode.type}`}>
-                  {selectedNode.type === "human_gate" ? <ClipboardCheck size={13} /> : <Bot size={13} />}
+                  {selectedNode.type === "human_gate" ? <ClipboardCheck size={13} /> : selectedNode.type === "sub_agent" ? <Bot size={13} /> : <Cpu size={13} />}
                   {nodeKindLabel(selectedNode)}
                 </span>
                 <strong>{selectedNode.id}</strong>
@@ -1255,24 +1287,38 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                     node.model = null
                     node.effort = null
                     node.gate = "none"
-                  } else if (node.role === "human approval") {
-                    node.role = "agent"
+                    node.timeout_seconds = null
+                    node.retry = null
+                    node.failure_policy = "halt"
+                    node.fanout = null
+                  } else if (nextType === "agent") {
+                    node.role = node.role === "human approval" || node.role === "executor" ? "planner" : node.role
+                    node.skill = null
+                    node.config_file = null
+                    node.gate = "none"
+                    node.timeout_seconds = null
+                    node.retry = null
+                    node.failure_policy = "halt"
+                    node.fanout = null
+                  } else if (node.role === "human approval" || node.role === "planner") {
+                    node.role = "executor"
                   }
                 })
               }
             >
-              <option value="agent">Sub-Agent</option>
-              <option value="human_gate">Checkpoint</option>
+              <option value="agent">Agent</option>
+              <option value="sub_agent">SubAgent</option>
+              <option value="human_gate">Gate</option>
             </Select>
             <label>Name</label>
             <Input value={selectedNode.name} onChange={(event) => updateNode(selectedNode.id, (node) => (node.name = event.target.value))} />
             <label>Role</label>
             <Input value={selectedNode.role} onChange={(event) => updateNode(selectedNode.id, (node) => (node.role = event.target.value))} />
-            {selectedNode.type === "agent" && (
+            {selectedNode.type === "sub_agent" && (
               <>
                 <label>
-                  Agent
-                  <small className="inline-hint"> · specialty profile</small>
+                  SubAgent Profile
+                  <small className="inline-hint"> independent executor profile</small>
                 </label>
                 <Select
                   value={selectedNode.config_file ?? ""}
@@ -1282,11 +1328,11 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                     })
                   }
                 >
-                  <option value="">Generic Sub-Agent (no role)</option>
+                  <option value="">Generic SubAgent (no profile)</option>
                   {(agentConfigs.data ?? []).map((config) => (
                     <option key={config.id} value={config.path}>
                       {config.name}
-                      {config.role ? ` — ${config.role}` : ""}
+                      {config.role ? ` - ${config.role}` : ""}
                     </option>
                   ))}
                 </Select>
@@ -1317,7 +1363,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                 <label>
                   Skill
                   {selectedNodeConfig?.skill && !selectedNode.skill && (
-                    <small className="inline-hint"> · using role default /{selectedNodeConfig.skill}</small>
+                    <small className="inline-hint"> profile default /{selectedNodeConfig.skill}</small>
                   )}
                 </label>
                 <Select
@@ -1330,8 +1376,8 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                 >
                   <option value="">
                     {selectedNodeConfig?.skill
-                      ? `Use role default (/${selectedNodeConfig.skill})`
-                      : "Ad-hoc Sub-Agent"}
+                      ? `Use profile default (/${selectedNodeConfig.skill})`
+                      : "Ad-hoc SubAgent"}
                   </option>
                   {(skills.data ?? []).map((skill) => (
                     <option key={skill.id} value={skill.id}>
@@ -1341,13 +1387,13 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                 </Select>
               </>
             )}
-            <label>{selectedNode.type === "human_gate" ? "Checkpoint instructions" : "Prompt"}</label>
+            <label>{selectedNode.type === "human_gate" ? "Gate instructions" : "Prompt"}</label>
             <Textarea
               rows={selectedNode.type === "human_gate" ? 5 : 8}
               value={selectedNode.prompt}
               onChange={(event) => updateNode(selectedNode.id, (node) => (node.prompt = event.target.value))}
             />
-            {selectedNode.type === "agent" && (
+            {selectedNode.type === "sub_agent" && (
               <>
                 <label>Gate</label>
                 <Select
@@ -1367,11 +1413,11 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
               onChange={(event) => updateNode(selectedNode.id, (node) => (node.depends_on = splitList(event.target.value)))}
               placeholder="planner, literature"
             />
-            {selectedNode.type === "agent" && (
+            {isExecutableNode(selectedNode) && (
               <details className="advanced-node-settings">
                 <summary>
                   <SlidersHorizontal size={14} />
-                  Advanced ARIS overrides
+                  Advanced node settings
                 </summary>
                 <div className="two-col">
                   <div>
@@ -1384,7 +1430,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                         })
                       }
                       placeholder={
-                        selectedNodeConfig?.model ? `Role default: ${selectedNodeConfig.model}` : "Default"
+                        selectedNodeConfig?.model ? `Profile default: ${selectedNodeConfig.model}` : "Default"
                       }
                     />
                   </div>
@@ -1398,11 +1444,215 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                         })
                       }
                       placeholder={
-                        selectedNodeConfig?.effort ? `Role default: ${selectedNodeConfig.effort}` : "Default"
+                        selectedNodeConfig?.effort ? `Profile default: ${selectedNodeConfig.effort}` : "Default"
                       }
                     />
                   </div>
                 </div>
+                {selectedNode.type === "sub_agent" && (
+                  <>
+                    <div className="two-col">
+                      <div>
+                        <label>Timeout seconds</label>
+                        <Input
+                          value={selectedNode.timeout_seconds ?? ""}
+                          onChange={(event) =>
+                            updateNode(selectedNode.id, (node) => {
+                              const value = event.target.value.trim()
+                              node.timeout_seconds = value ? Number(value) : null
+                            })
+                          }
+                          placeholder={selectedNodeConfig?.timeout_seconds ? `Profile default: ${selectedNodeConfig.timeout_seconds}` : "Default"}
+                        />
+                      </div>
+                      <div>
+                        <label>Failure policy</label>
+                        <Select
+                          value={selectedNode.failure_policy ?? "halt"}
+                          onChange={(event) =>
+                            updateNode(selectedNode.id, (node) => {
+                              node.failure_policy = event.target.value as WorkflowNodeInfo["failure_policy"]
+                            })
+                          }
+                        >
+                          <option value="halt">halt</option>
+                          <option value="skip_descendants">skip descendants</option>
+                          <option value="continue">continue</option>
+                        </Select>
+                      </div>
+                    </div>
+                    <div className="two-col">
+                      <div>
+                        <label>Retry attempts</label>
+                        <Input
+                          value={selectedNode.retry?.max_attempts ?? ""}
+                          onChange={(event) =>
+                            updateNode(selectedNode.id, (node) => {
+                              const value = event.target.value.trim()
+                              node.retry = value
+                                ? {
+                                    max_attempts: Number(value),
+                                    backoff_seconds: node.retry?.backoff_seconds ?? 0,
+                                    on: node.retry?.on ?? [],
+                                  }
+                                : null
+                            })
+                          }
+                          placeholder="1"
+                        />
+                      </div>
+                      <div>
+                        <label>Retry backoff seconds</label>
+                        <Input
+                          value={selectedNode.retry?.backoff_seconds ?? ""}
+                          onChange={(event) =>
+                            updateNode(selectedNode.id, (node) => {
+                              const value = event.target.value.trim()
+                              node.retry = {
+                                max_attempts: node.retry?.max_attempts ?? 2,
+                                backoff_seconds: value ? Number(value) : 0,
+                                on: node.retry?.on ?? [],
+                              }
+                            })
+                          }
+                          placeholder="0"
+                        />
+                      </div>
+                    </div>
+                    <label>Retry on</label>
+                    <Input
+                      value={joinList(selectedNode.retry?.on ?? [])}
+                      onChange={(event) =>
+                        updateNode(selectedNode.id, (node) => {
+                          const on = splitList(event.target.value)
+                          node.retry = on.length || node.retry
+                            ? {
+                                max_attempts: node.retry?.max_attempts ?? 2,
+                                backoff_seconds: node.retry?.backoff_seconds ?? 0,
+                                on,
+                              }
+                            : null
+                        })
+                      }
+                      placeholder="timeout, rate limit"
+                    />
+                    <div className="fanout-config">
+                      <label>Dynamic fan-out</label>
+                      <Select
+                        value={selectedNode.fanout ? "on" : "off"}
+                        onChange={(event) =>
+                          updateNode(selectedNode.id, (node) => {
+                            node.fanout =
+                              event.target.value === "on"
+                                ? {
+                                    source: node.fanout?.source ?? node.depends_on[0] ?? null,
+                                    path: node.fanout?.path ?? "keyword_groups",
+                                    name_template: node.fanout?.name_template ?? "Literature search: {{item.name}}",
+                                    max_items: node.fanout?.max_items ?? 12,
+                                    empty_policy: node.fanout?.empty_policy ?? "fail",
+                                  }
+                                : null
+                          })
+                        }
+                      >
+                        <option value="off">off</option>
+                        <option value="on">expand from upstream JSON</option>
+                      </Select>
+                      {selectedNode.fanout && (
+                        <>
+                          <div className="two-col">
+                            <div>
+                              <label>Source node</label>
+                              <Select
+                                value={selectedNode.fanout.source ?? ""}
+                                onChange={(event) =>
+                                  updateNode(selectedNode.id, (node) => {
+                                    if (!node.fanout) return
+                                    node.fanout.source = event.target.value || null
+                                  })
+                                }
+                              >
+                                <option value="">First dependency</option>
+                                {draft.graph_json.nodes
+                                  .filter((node) => node.id !== selectedNode.id)
+                                  .map((node) => (
+                                    <option key={node.id} value={node.id}>
+                                      {node.id}
+                                    </option>
+                                  ))}
+                              </Select>
+                            </div>
+                            <div>
+                              <label>JSON path</label>
+                              <Input
+                                value={selectedNode.fanout.path}
+                                onChange={(event) =>
+                                  updateNode(selectedNode.id, (node) => {
+                                    if (!node.fanout) return
+                                    node.fanout.path = event.target.value
+                                  })
+                                }
+                                placeholder="keyword_groups"
+                              />
+                            </div>
+                          </div>
+                          <label>Name template</label>
+                          <Input
+                            value={selectedNode.fanout.name_template}
+                            onChange={(event) =>
+                              updateNode(selectedNode.id, (node) => {
+                                if (!node.fanout) return
+                                node.fanout.name_template = event.target.value
+                              })
+                            }
+                            placeholder="Literature search: {{item.name}}"
+                          />
+                          <div className="two-col">
+                            <div>
+                              <label>Max items</label>
+                              <Input
+                                value={selectedNode.fanout.max_items}
+                                onChange={(event) =>
+                                  updateNode(selectedNode.id, (node) => {
+                                    if (!node.fanout) return
+                                    const value = Number(event.target.value)
+                                    node.fanout.max_items = Number.isFinite(value) ? value : 12
+                                  })
+                                }
+                                type="number"
+                                min={1}
+                              />
+                            </div>
+                            <div>
+                              <label>Empty result</label>
+                              <Select
+                                value={selectedNode.fanout.empty_policy ?? "fail"}
+                                onChange={(event) =>
+                                  updateNode(selectedNode.id, (node) => {
+                                    if (!node.fanout) return
+                                    node.fanout.empty_policy = event.target.value as "fail" | "succeed"
+                                  })
+                                }
+                              >
+                                <option value="fail">fail node</option>
+                                <option value="succeed">succeed with none</option>
+                              </Select>
+                            </div>
+                          </div>
+                          <p className="muted small">
+                            Prompt placeholders: {"{{item.name}}"}, {"{{item.keywords}}"}, {"{{item}}"}, {"{{number}}"}.
+                          </p>
+                        </>
+                      )}
+                      {selectedNode.fanout_parent_id && (
+                        <div className="fanout-preview">
+                          <strong>Generated from {selectedNode.fanout_parent_id}</strong>
+                          <pre>{jsonPreview(selectedNode.fanout_item)}</pre>
+                        </div>
+                      )}
+                    </div>
+                  </>
+                )}
                 <label>Inputs</label>
                 <Input
                   value={joinList(selectedNode.inputs)}
@@ -1646,6 +1896,7 @@ function RunsPage({ workspace }: { workspace: string }) {
 function RunConsole({ run }: { run: RunRecord }) {
   const queryClient = useQueryClient()
   const [events, setEvents] = useState<RunEvent[]>([])
+  const terminalRef = useAutoScrollToEnd<HTMLDivElement>([events.length, run.id])
   const cancelRun = useMutation({
     mutationFn: api.cancelRun,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["runs"] }),
@@ -1684,7 +1935,7 @@ function RunConsole({ run }: { run: RunRecord }) {
           </Button>
         </div>
       </div>
-      <div className="terminal">
+      <div className="terminal" ref={terminalRef}>
         {events.map((event, index) => (
           <div className={`term-line term-${event.stream}`} key={`${event.timestamp}-${index}`}>
             <span>{event.timestamp.slice(11, 19)}</span>
@@ -1783,7 +2034,7 @@ const providerOptions: { value: GlobalApiProvider; label: string; hint: string }
   { value: "openai", label: "OpenAI", hint: "EXECUTOR_API_KEY + OPENAI_API_KEY" },
   { value: "gemini", label: "Gemini", hint: "Gemini OpenAI-compatible endpoint" },
   { value: "glm", label: "GLM", hint: "GLM OpenAI-compatible endpoint" },
-  { value: "minimax", label: "MiniMax", hint: "MiniMax OpenAI-compatible endpoint" },
+  { value: "minimax", label: "MiniMax", hint: "MiniMax China Anthropic-compatible endpoint" },
   { value: "kimi", label: "Kimi", hint: "Kimi OpenAI-compatible endpoint" },
   { value: "custom", label: "Custom", hint: "EXECUTOR_API_KEY with optional base URL" },
 ]
