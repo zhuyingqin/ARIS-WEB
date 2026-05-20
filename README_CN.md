@@ -24,6 +24,14 @@
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
 
+## 🧭 当前缺口 / 下一步
+
+- **模拟沙箱**：为 SubAgent 增加执行沙箱，倾向基于 CubeSandbox，让高风险代码、依赖安装、浏览器动作和文件写入先在隔离环境中模拟或验证，再触达真实 workspace。
+- **SessionStore**：持久化 Agent/SubAgent 的运行状态，使任意 workflow run、失败 attempt、暂停节点或已完成分支都能重新调回成一个可交互的 Agent session。
+- **ArtifactStore + provenance graph**：让每个声明产物都具备版本、类型、diff、来源追踪能力，能追溯到生成它的节点、prompt、模型、上游产物和人工批准记录。
+- **文献连接器层**：补齐 Scopus/OpenAlex/Semantic Scholar/Zotero 等一等公民连接器，支持去重、元数据归一化和 citation-aware 的综述/写作节点交接。
+
+
 ## 📰 最新动态
 
 > **2026-05-20 — Web Orchestrator 更新。** Web 控制台现在把工作流明确建模为负责规划编排的 `Agent`、独立执行的 `SubAgent` 和人工检查的 `Gate`。执行默认按同层批次推进：当前所有 ready 的 Agent/SubAgent 并行运行，整批完成后暂停，等待一次人工批量批准，再进入下游节点。

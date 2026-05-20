@@ -24,6 +24,14 @@
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
 
+## 🧭 Missing Pieces / Near-Term Roadmap
+
+- **Simulated sandbox**: add an execution sandbox for SubAgents, likely based on CubeSandbox, so risky code, package installs, browser actions, and file writes can be simulated or isolated before touching the real workspace.
+- **SessionStore**: persist Agent/SubAgent state so any workflow run, failed attempt, paused node, or completed branch can be reopened and resumed as an interactive Agent session.
+- **ArtifactStore + provenance graph**: make every declared output versioned, typed, diffable, and traceable back to the node, prompt, model, upstream artifacts, and approval that produced it.
+- **Literature connector layer**: add first-class Scopus/OpenAlex/Semantic Scholar/Zotero-style connectors with deduplication, metadata normalization, and citation-aware handoff into review/writing nodes.
+
+
 ## 📰 What's New
 
 > **2026-05-20 — Web Orchestrator refresh.** The web console now models workflows as `Agent` planning nodes, isolated `SubAgent` execution nodes, and explicit `Gate` human checkpoints. Execution advances one approved batch at a time: all currently ready same-layer Agent/SubAgent nodes run in parallel, then the workflow pauses for one human batch approval before downstream nodes start.
