@@ -891,6 +891,29 @@ label {
 
 .flow-node-topline { justify-content: space-between; }
 
+.flow-node-kind-row {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  gap: 6px;
+}
+
+.flow-node-order {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 20px;
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--surface-3);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  font-weight: 700;
+  line-height: 1;
+}
+
 .node-kind {
   display: inline-flex;
   align-items: center;

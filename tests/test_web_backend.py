@@ -44,6 +44,7 @@ from app.models import (  # noqa: E402
     UpdateGlobalSettingsRequest,
     UpdateAgentConfigRequest,
     UpdateTeamConfigRequest,
+    WorkflowEdge,
     WorkflowGraph,
     WorkflowNode,
     WorkflowRecord,
@@ -674,9 +675,25 @@ def test_workflow_refinement_prompt_includes_current_graph_without_runtime() -> 
                     run_id="run-a",
                     error="old error",
                     approved_after=True,
+                    fanout={"source": "source", "path": "items"},
+                ),
+                WorkflowNode(
+                    id="a-child",
+                    name="A child",
+                    depends_on=["source"],
+                    status="succeeded",
+                    run_id="run-child",
+                    fanout_parent_id="a",
+                    fanout_item={"name": "child"},
+                ),
+                WorkflowNode(
+                    id="review",
+                    name="Review",
+                    type="human_gate",
+                    depends_on=["a-child"],
                 )
             ],
-            edges=[],
+            edges=[WorkflowEdge(id="a-child->review", source="a-child", target="review")],
         ),
         created_at=utc_now(),
         updated_at=utc_now(),
@@ -700,8 +717,11 @@ def test_workflow_refinement_prompt_includes_current_graph_without_runtime() -> 
 
     assert "Add a final human review gate" in prompt
     assert '"id": "a"' in prompt
+    assert '"id": "a-child"' not in prompt
+    assert '"depends_on": [\n        "a"\n      ]' in prompt
     assert "research-review" in prompt
     assert "run-a" not in prompt
+    assert "run-child" not in prompt
     assert "waiting_approval" not in prompt
     assert "old error" not in prompt
     assert "Return the complete updated workflow, not a patch" in prompt
@@ -763,7 +783,7 @@ def test_workflow_storage_roundtrip(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
-def test_workflow_manager_refines_existing_workflow_and_resets_runtime(
+def test_workflow_manager_refines_existing_workflow_and_preserves_unchanged_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -779,8 +799,9 @@ def test_workflow_manager_refines_existing_workflow_and_resets_runtime(
             "Updated goal",
             WorkflowGraph(
                 nodes=[
-                    WorkflowNode(id="a", name="A updated", status="succeeded", run_id="old-run"),
+                    WorkflowNode(id="a", name="A renamed", prompt="Do A."),
                     WorkflowNode(id="b", name="Reviewer", type="human_gate", depends_on=["a"]),
+                    WorkflowNode(id="c", name="Changed", prompt="Do C differently."),
                 ],
                 edges=[],
             ),
@@ -794,7 +815,12 @@ def test_workflow_manager_refines_existing_workflow_and_resets_runtime(
             tmp_path,
             "Original",
             "Original goal",
-            WorkflowGraph(nodes=[WorkflowNode(id="a", name="A")]),
+            WorkflowGraph(
+                nodes=[
+                    WorkflowNode(id="a", name="A", prompt="Do A.", status="succeeded", run_id="run-a", approved_after=True),
+                    WorkflowNode(id="c", name="Changed", prompt="Do C.", status="waiting_approval", run_id="run-c"),
+                ]
+            ),
         )
         refined = await manager.refine(tmp_path, workflow.id, "add a reviewer", title="Keep title")
 
@@ -803,11 +829,14 @@ def test_workflow_manager_refines_existing_workflow_and_resets_runtime(
         assert refined.goal == "Updated goal"
         assert refined.status == "draft"
         nodes = {node.id: node for node in refined.graph_json.nodes}
-        assert nodes["a"].name == "A updated"
-        assert nodes["a"].status == "queued"
-        assert nodes["a"].run_id is None
+        assert nodes["a"].name == "A renamed"
+        assert nodes["a"].status == "succeeded"
+        assert nodes["a"].run_id == "run-a"
+        assert nodes["a"].approved_after is True
         assert nodes["b"].type == "human_gate"
         assert nodes["b"].status == "queued"
+        assert nodes["c"].status == "queued"
+        assert nodes["c"].run_id is None
         assert refined.graph_json.edges[0].source == "a"
         assert refined.graph_json.edges[0].target == "b"
 
@@ -1376,6 +1405,162 @@ def test_workflow_manager_expands_fanout_sub_agents_from_json_output(tmp_path: P
         assert current is not None
         nodes = {node.id: node for node in current.graph_json.nodes}
         assert nodes["synthesis"].status == "waiting_approval"
+
+    asyncio.run(run())
+
+
+def test_workflow_manager_expands_fanout_from_node_artifact_json(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    async def fake_runner(workspace: Path, record, node) -> NodeRunResult:
+        calls.append(node.id)
+        run_id = f"run-{node.id}"
+        if node.id == "keywords":
+            artifact_dir = workspace / ".aris" / "web" / "workflows" / record.id / "nodes" / node.id / "attempt-1"
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            (artifact_dir / "keyword_groups.json").write_text(
+                json.dumps(
+                    {
+                        "keyword_groups": [
+                            {"name": "bayes", "keywords": ["Bayesian point estimation"]},
+                            {"name": "bootstrap", "keywords": ["Bayesian bootstrap"]},
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            last_message_path(workspace, run_id).parent.mkdir(parents=True, exist_ok=True)
+            last_message_path(workspace, run_id).write_text(
+                "Wrote `.aris/web/workflows/.../nodes/keywords/attempt-1/keyword_groups.json`.",
+                encoding="utf-8",
+            )
+            node_output_path(workspace, run_id).write_text(
+                json.dumps({"text": "see artifact", "json": None}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        return NodeRunResult(run_id=run_id, succeeded=True, message="ok")
+
+    manager = WorkflowManager(type("R", (), {})(), node_runner=fake_runner)
+    graph = WorkflowGraph(
+        schema_version=2,
+        nodes=[
+            WorkflowNode(id="keywords", type="agent", name="Keyword planner", role="planner", prompt="Write keyword_groups.json."),
+            WorkflowNode(
+                id="literature-template",
+                type="sub_agent",
+                name="Literature search template",
+                role="literature scout",
+                prompt="Search for {{item.name}}: {{item.keywords}}",
+                depends_on=["keywords"],
+                fanout={"source": "keywords", "path": "keyword_groups", "name_template": "Search: {{item.name}}"},
+            ),
+        ],
+    )
+
+    async def run() -> None:
+        workflow = await manager.create(tmp_path, "Fanout artifacts", "Search keyword group artifacts", graph)
+        await manager.execute(tmp_path, workflow.id)
+        for _ in range(40):
+            current = get_workflow(tmp_path, workflow.id)
+            if current and current.status == "paused" and current.graph_json.nodes[0].status == "waiting_approval":
+                break
+            await asyncio.sleep(0.05)
+
+        await manager.approve_batch(tmp_path, workflow.id)
+        for _ in range(80):
+            current = get_workflow(tmp_path, workflow.id)
+            generated = [node for node in current.graph_json.nodes if node.fanout_parent_id == "literature-template"] if current else []
+            if current and current.status == "paused" and len(generated) == 2 and all(node.status == "waiting_approval" for node in generated):
+                break
+            await asyncio.sleep(0.05)
+
+        current = get_workflow(tmp_path, workflow.id)
+        assert current is not None
+        generated = [node for node in current.graph_json.nodes if node.fanout_parent_id == "literature-template"]
+        assert {node.id for node in generated} == {"literature-template-bayes", "literature-template-bootstrap"}
+        assert all(node.status == "waiting_approval" for node in generated)
+        assert any("Bayesian point estimation" in node.prompt for node in generated)
+        assert {"keywords", "literature-template-bayes", "literature-template-bootstrap"} <= set(calls)
+
+    asyncio.run(run())
+
+
+def test_workflow_manager_reruns_fanout_rewires_downstream_dependencies(tmp_path: Path) -> None:
+    async def fake_runner(workspace: Path, record, node) -> NodeRunResult:
+        run_id = f"run-{node.id}"
+        output_path = node_output_path(workspace, run_id)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if node.id == "keywords":
+            output_path.write_text(
+                json.dumps(
+                    {
+                        "text": "",
+                        "json": {
+                            "keyword_groups": [
+                                {"name": "alpha", "keywords": ["alpha"]},
+                                {"name": "beta", "keywords": ["beta"]},
+                            ]
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        return NodeRunResult(run_id=run_id, succeeded=True, message="ok")
+
+    manager = WorkflowManager(type("R", (), {})(), node_runner=fake_runner)
+    graph = WorkflowGraph(
+        schema_version=2,
+        nodes=[
+            WorkflowNode(id="keywords", type="agent", name="Keyword planner", role="planner", prompt="Return groups."),
+            WorkflowNode(
+                id="literature-template",
+                type="sub_agent",
+                name="Literature search template",
+                role="literature scout",
+                prompt="Search {{item.name}}",
+                depends_on=["keywords"],
+                fanout={"source": "keywords", "path": "keyword_groups", "name_template": "Search: {{item.name}}"},
+            ),
+            WorkflowNode(id="synthesis", type="agent", name="Synthesis", role="writer", prompt="Merge.", depends_on=["literature-template"]),
+        ],
+    )
+
+    async def run() -> None:
+        workflow = await manager.create(tmp_path, "Fanout rerun", "Search groups", graph)
+        await manager.execute(tmp_path, workflow.id)
+        for _ in range(40):
+            current = get_workflow(tmp_path, workflow.id)
+            if current and current.graph_json.nodes[0].status == "waiting_approval":
+                break
+            await asyncio.sleep(0.05)
+
+        await manager.approve_batch(tmp_path, workflow.id)
+        for _ in range(80):
+            current = get_workflow(tmp_path, workflow.id)
+            generated = [node for node in current.graph_json.nodes if node.fanout_parent_id == "literature-template"] if current else []
+            if current and len(generated) == 2 and all(node.status == "waiting_approval" for node in generated):
+                break
+            await asyncio.sleep(0.05)
+
+        await manager.rerun_node(tmp_path, workflow.id, "literature-template", reset_downstream=True)
+        for _ in range(80):
+            current = get_workflow(tmp_path, workflow.id)
+            generated = [node for node in current.graph_json.nodes if node.fanout_parent_id == "literature-template"] if current else []
+            if current and len(generated) == 2:
+                nodes = {node.id: node for node in current.graph_json.nodes}
+                if nodes["synthesis"].depends_on == sorted(node.id for node in generated):
+                    break
+            await asyncio.sleep(0.05)
+
+        current = get_workflow(tmp_path, workflow.id)
+        assert current is not None
+        generated = [node for node in current.graph_json.nodes if node.fanout_parent_id == "literature-template"]
+        generated_ids = {node.id for node in generated}
+        nodes = {node.id: node for node in current.graph_json.nodes}
+        assert generated_ids == {"literature-template-alpha", "literature-template-beta"}
+        assert nodes["synthesis"].depends_on == sorted(generated_ids)
 
     asyncio.run(run())
 

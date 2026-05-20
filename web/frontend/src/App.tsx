@@ -272,6 +272,94 @@ function workflowCounts(workflow: WorkflowRecord) {
   return { agents, subAgents, gates, specialists }
 }
 
+function workflowNodeOrder(workflow: WorkflowRecord | null): string[] {
+  const nodes = workflow?.graph_json.nodes ?? []
+  const nodeIds = new Set(nodes.map((node) => node.id))
+  const incoming = new Map(nodes.map((node) => [node.id, new Set<string>()]))
+  const outgoing = new Map(nodes.map((node) => [node.id, new Set<string>()]))
+  const originalIndex = new Map(nodes.map((node, index) => [node.id, index]))
+
+  function addDependency(source: string | undefined, target: string | undefined) {
+    if (!source || !target || source === target || !nodeIds.has(source) || !nodeIds.has(target)) return
+    incoming.get(target)?.add(source)
+    outgoing.get(source)?.add(target)
+  }
+
+  for (const node of nodes) {
+    for (const dep of node.depends_on) addDependency(dep, node.id)
+  }
+  for (const edge of workflow?.graph_json.edges ?? []) addDependency(edge.source, edge.target)
+
+  const ready = nodes
+    .filter((node) => (incoming.get(node.id)?.size ?? 0) === 0)
+    .map((node) => node.id)
+  const order: string[] = []
+  const visited = new Set<string>()
+
+  while (ready.length) {
+    ready.sort((a, b) => (originalIndex.get(a) ?? 0) - (originalIndex.get(b) ?? 0))
+    const id = ready.shift() as string
+    if (visited.has(id)) continue
+    visited.add(id)
+    order.push(id)
+
+    for (const target of outgoing.get(id) ?? []) {
+      const sourceSet = incoming.get(target)
+      sourceSet?.delete(id)
+      if (!visited.has(target) && (sourceSet?.size ?? 0) === 0) ready.push(target)
+    }
+  }
+
+  for (const node of nodes) {
+    if (!visited.has(node.id)) order.push(node.id)
+  }
+  return order
+}
+
+function workflowNodeSequence(workflow: WorkflowRecord | null): Map<string, number> {
+  return new Map(workflowNodeOrder(workflow).map((id, index) => [id, index + 1]))
+}
+
+function organizeWorkflowPositions(workflow: WorkflowRecord) {
+  const order = workflowNodeOrder(workflow)
+  const orderIndex = new Map(order.map((id, index) => [id, index]))
+  const nodeMap = new Map(workflow.graph_json.nodes.map((node) => [node.id, node]))
+  const layerById = new Map<string, number>()
+
+  for (const id of order) {
+    const node = nodeMap.get(id)
+    if (!node) continue
+    const deps = [
+      ...node.depends_on,
+      ...workflow.graph_json.edges.filter((edge) => edge.target === id).map((edge) => edge.source),
+    ].filter((dep) => nodeMap.has(dep))
+    const layer = deps.reduce((max, dep) => Math.max(max, (layerById.get(dep) ?? 0) + 1), 0)
+    layerById.set(id, layer)
+  }
+
+  const rowsByLayer = new Map<number, string[]>()
+  for (const id of order) {
+    const layer = layerById.get(id) ?? 0
+    rowsByLayer.set(layer, [...(rowsByLayer.get(layer) ?? []), id])
+  }
+
+  for (const ids of rowsByLayer.values()) {
+    ids.sort((a, b) => (orderIndex.get(a) ?? 0) - (orderIndex.get(b) ?? 0))
+  }
+
+  workflow.graph_json.nodes = workflow.graph_json.nodes.map((node) => {
+    const layer = layerById.get(node.id) ?? 0
+    const row = rowsByLayer.get(layer)?.indexOf(node.id) ?? 0
+    return {
+      ...node,
+      position: {
+        x: 80 + layer * 300,
+        y: 92 + row * 148,
+      },
+    }
+  })
+}
+
 function nodeKindLabel(node: WorkflowNodeInfo) {
   if (node.type === "human_gate") return "Gate"
   if (node.type === "sub_agent") return "SubAgent"
@@ -711,6 +799,12 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
     })
   }
 
+  function organizeWorkflow() {
+    updateDraft((workflow) => {
+      organizeWorkflowPositions(workflow)
+    })
+  }
+
   const selectedNode = draft?.graph_json.nodes.find((node) => node.id === selectedNodeId) ?? null
   const selectedEdge = draft?.graph_json.edges.find((edge) => edge.id === selectedEdgeId) ?? null
   const selectedNodeConfig =
@@ -723,6 +817,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
     draft?.graph_json.nodes.filter(
       (node) => isExecutableNode(node) && node.status === "waiting_approval" && Boolean(node.run_id) && !node.approved_after,
     ).length ?? 0
+  const nodeSequence = useMemo(() => workflowNodeSequence(draft), [draft])
   const draftFlowNodes: Node[] = useMemo(
     () =>
       (draft?.graph_json.nodes ?? []).map((node) => {
@@ -739,6 +834,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
         const style: React.CSSProperties | undefined = accent
           ? { borderLeft: `4px solid ${accent}` }
           : undefined
+        const sequence = nodeSequence.get(node.id) ?? 0
         return {
           id: node.id,
           position: { x: node.position?.x ?? 0, y: node.position?.y ?? 0 },
@@ -746,9 +842,12 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
             label: (
               <div className="flow-node-label">
                 <div className="flow-node-topline">
-                  <span className={`node-kind node-kind-${node.type}`}>
-                    {node.type === "human_gate" ? <ClipboardCheck size={13} /> : node.type === "sub_agent" ? <Bot size={13} /> : <Cpu size={13} />}
-                    {nodeKindLabel(node)}
+                  <span className="flow-node-kind-row">
+                    <span className="flow-node-order">{String(sequence).padStart(2, "0")}</span>
+                    <span className={`node-kind node-kind-${node.type}`}>
+                      {node.type === "human_gate" ? <ClipboardCheck size={13} /> : node.type === "sub_agent" ? <Bot size={13} /> : <Cpu size={13} />}
+                      {nodeKindLabel(node)}
+                    </span>
                   </span>
                   <em className={statusClass(node.status)}>{node.status}</em>
                 </div>
@@ -786,7 +885,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
           style,
         }
       }),
-    [draft, agentConfigs.data],
+    [draft, agentConfigs.data, nodeSequence],
   )
   useEffect(() => {
     if (!isDraggingNode) {
@@ -1048,6 +1147,17 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                       Edge
                     </Button>
                   )}
+                  <Button
+                    variant="secondary"
+                    onClick={organizeWorkflow}
+                    disabled={!draft.graph_json.nodes.length}
+                    type="button"
+                    aria-label="Organize flow"
+                    title="Organize flow"
+                  >
+                    <SlidersHorizontal size={15} />
+                    Organize
+                  </Button>
                 </div>
                 <div className="canvas-actions-group">
                   <Button

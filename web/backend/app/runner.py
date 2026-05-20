@@ -60,6 +60,9 @@ def resolve_aris_binary() -> str | None:
     local = _local_executable("aris")
     if local:
         return str(local)
+    built = REPO_ROOT / "target" / "debug" / ("aris.exe" if os.name == "nt" else "aris")
+    if built.exists():
+        return str(built)
     return shutil.which("aris")
 
 
@@ -83,18 +86,23 @@ def build_aris_prompt(skill: SkillInfo, request: CreateRunRequest) -> str:
         "User arguments:",
         request.arguments.strip() or "(none)",
         "",
-        "Execution policy:",
-        "- Execute the requested ARIS skill/workflow end to end inside this workspace.",
-        "- The subprocess current working directory is already the workspace.",
-        "- Do not use Bash, shell scripts, PowerShell, REPL tools, or sub-agent spawning from the web runner.",
-        "- Use the available workspace-safe tools directly: read/write/edit/glob/grep/WebSearch/WebFetch/Skill/LlmReview.",
-        "- If a skill suggests a helper script that requires Bash, perform the equivalent search, reading, or writing with the safe tools instead.",
-        "- Use relative paths such as `.` and `paper/...` for file operations; do not use absolute workspace paths in commands or tool inputs.",
-        "- Use the SKILL.md source as the contract for the workflow.",
-        "- Run fully automatically where possible inside workspace-write permissions.",
-        "- Keep all outputs and logs in the workspace, preferably under .aris/ or the skill's standard artifact paths.",
-        "- Do not store API keys or credentials in files.",
     ]
+    if skill.id != "workflow-agent":
+        parts.extend(
+            [
+                "Execution policy:",
+                "- Execute the requested ARIS skill/workflow end to end inside this workspace.",
+                "- The subprocess current working directory is already the workspace.",
+                "- Do not use Bash, shell scripts, PowerShell, REPL tools, or sub-agent spawning from the web runner.",
+                "- Use the available workspace-safe tools directly: read/write/edit/glob/grep/WebFetch/WebSearch/TodoWrite/LlmReview/Skill.",
+                "- If a skill suggests a helper script that requires Bash, perform the equivalent search, reading, or writing with the safe tools instead.",
+                "- Use relative paths such as `.` and `paper/...` for file operations; do not use absolute workspace paths in commands or tool inputs.",
+                "- Use the SKILL.md source as the contract for the workflow.",
+                "- Run fully automatically where possible inside workspace-write permissions.",
+                "- Keep all outputs and logs in the workspace, preferably under .aris/ or the skill's standard artifact paths.",
+                "- Do not store API keys or credentials in files.",
+            ]
+        )
     if request.effort:
         parts.append(f"- Effort: {request.effort}")
     if request.assurance:

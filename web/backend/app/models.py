@@ -298,6 +298,13 @@ class WorkflowNode(BaseModel):
     def _normalize_port_lists(cls, value: Any) -> Any:
         return _coerce_port_list(value)
 
+    @field_validator("role", "prompt", mode="before")
+    @classmethod
+    def _normalize_optional_text(cls, value: Any) -> Any:
+        if value is None:
+            return ""
+        return value
+
 
 class WorkflowEdge(BaseModel):
     id: str
@@ -331,6 +338,13 @@ class TeamRoleSpec(BaseModel):
     @classmethod
     def _normalize_port_lists(cls, value: Any) -> Any:
         return _coerce_port_list(value)
+
+    @field_validator("role", "prompt", mode="before")
+    @classmethod
+    def _normalize_optional_text(cls, value: Any) -> Any:
+        if value is None:
+            return ""
+        return value
 
 
 class TeamConfig(BaseModel):

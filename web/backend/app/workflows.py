@@ -533,14 +533,70 @@ WORKFLOW_PROMPT_RUNTIME_FIELDS = {
     "fanout_item",
 }
 
+WORKFLOW_NODE_EXECUTION_FIELDS = [
+    "id",
+    "type",
+    "role",
+    "skill",
+    "config_file",
+    "prompt",
+    "model",
+    "effort",
+    "gate",
+    "depends_on",
+    "inputs",
+    "outputs",
+    "timeout_seconds",
+    "retry",
+    "failure_policy",
+    "concurrency_class",
+    "fanout",
+    "team_id",
+    "team_instance_id",
+    "team_role_id",
+]
+
+WORKFLOW_NODE_PRESERVED_RUNTIME_FIELDS = [
+    "status",
+    "run_id",
+    "error",
+    "approved_before",
+    "approved_after",
+    "attempt",
+    "usage",
+    "fanout_parent_id",
+    "fanout_item",
+]
+
 
 def workflow_graph_prompt_payload(graph: WorkflowGraph) -> dict:
     data = model_dict(graph)
+    generated_parent_by_id = {
+        node.id: node.fanout_parent_id
+        for node in graph.nodes
+        if node.fanout_parent_id
+    }
+    nodes = []
     for node in data.get("nodes", []):
         if not isinstance(node, dict):
             continue
+        if node.get("id") in generated_parent_by_id:
+            continue
+        depends_on: list[str] = []
+        for dep in node.get("depends_on") or []:
+            next_dep = generated_parent_by_id.get(dep, dep)
+            if next_dep not in depends_on:
+                depends_on.append(next_dep)
+        node["depends_on"] = depends_on
         for field in WORKFLOW_PROMPT_RUNTIME_FIELDS:
             node.pop(field, None)
+        nodes.append(node)
+    data["nodes"] = nodes
+    data["edges"] = [
+        {"id": f"{dep}->{node['id']}", "source": dep, "target": node["id"]}
+        for node in nodes
+        for dep in node.get("depends_on", [])
+    ]
     return data
 
 
@@ -562,6 +618,38 @@ def reset_workflow_execution_state(graph: WorkflowGraph) -> WorkflowGraph:
         if not hasattr(graph, "model_copy")
         else graph.model_copy(update={"nodes": nodes})
     )
+
+
+def _node_execution_signature(node: WorkflowNode) -> str:
+    data = model_dict(node)
+    payload = {field: data.get(field) for field in WORKFLOW_NODE_EXECUTION_FIELDS}
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def merge_workflow_execution_state(previous: WorkflowGraph, updated: WorkflowGraph) -> tuple[WorkflowGraph, int, int]:
+    previous_by_id = {node.id: node for node in previous.nodes}
+    nodes: list[WorkflowNode] = []
+    preserved = 0
+    reset = 0
+    for node in updated.nodes:
+        old = previous_by_id.get(node.id)
+        if old is not None and _node_execution_signature(old) == _node_execution_signature(node):
+            update = {field: getattr(old, field) for field in WORKFLOW_NODE_PRESERVED_RUNTIME_FIELDS}
+            preserved += 1
+        else:
+            update = {
+                "status": "queued",
+                "run_id": None,
+                "error": None,
+                "approved_before": False,
+                "approved_after": False,
+                "attempt": 0,
+                "usage": None,
+            }
+            reset += 1
+        nodes.append(node.copy(update=update) if not hasattr(node, "model_copy") else node.model_copy(update=update))
+    graph = updated.copy(update={"nodes": nodes}) if not hasattr(updated, "model_copy") else updated.model_copy(update={"nodes": nodes})
+    return graph, preserved, reset
 
 
 def build_workflow_refinement_prompt(
@@ -813,7 +901,20 @@ def _try_extract_json_value(text: str) -> Any | None:
         return None
 
 
-def _load_node_output_value(workspace: Path, source_node: WorkflowNode, path: str) -> Any:
+def _json_file_candidates(workspace: Path, workflow_id: str, source_node: WorkflowNode) -> list[tuple[Path, Any]]:
+    node_dir = workspace / ".aris" / "web" / "workflows" / workflow_id / "nodes" / source_node.id
+    if not node_dir.exists():
+        return []
+    candidates: list[tuple[Path, Any]] = []
+    for json_path in sorted(node_dir.glob("attempt-*/*.json")):
+        try:
+            candidates.append((json_path, json.loads(json_path.read_text(encoding="utf-8"))))
+        except (json.JSONDecodeError, OSError):
+            continue
+    return candidates
+
+
+def _load_node_output_value(workspace: Path, workflow_id: str, source_node: WorkflowNode, path: str) -> Any:
     if not source_node.run_id:
         return _MISSING
     raw: Any = None
@@ -847,6 +948,13 @@ def _load_node_output_value(workspace: Path, source_node: WorkflowNode, path: st
         value = _json_path_get(root, path)
         if value is not _MISSING:
             return value
+
+    for json_path, root in _json_file_candidates(workspace, workflow_id, source_node):
+        value = _json_path_get(root, path)
+        if value is not _MISSING:
+            return value
+        if json_path.stem == path:
+            return root
     return _MISSING
 
 
@@ -1019,13 +1127,17 @@ class WorkflowManager:
             current_graph,
             instructions,
         )
-        normalized = reset_workflow_execution_state(normalize_workflow_graph(generated_graph, skills))
+        normalized, preserved_nodes, reset_nodes = merge_workflow_execution_state(
+            record.graph_json,
+            normalize_workflow_graph(generated_graph, skills),
+        )
+        next_status = record.status if record.status in {"draft", "paused"} else "draft"
         update_workflow(
             workspace,
             workflow_id,
             title=title or record.title or generated_title,
             goal=generated_goal or record.goal,
-            status="draft",
+            status=next_status,
             graph_json=normalized,
             clear_error=True,
         )
@@ -1037,7 +1149,7 @@ class WorkflowManager:
                 timestamp=utc_now(),
                 event_type="workflow",
                 message="Workflow updated from AI instructions",
-                payload={"node_count": len(updated.graph_json.nodes)},
+                payload={"node_count": len(updated.graph_json.nodes), "preserved_nodes": preserved_nodes, "reset_nodes": reset_nodes},
             ),
         )
         return updated
@@ -1390,7 +1502,7 @@ class WorkflowManager:
             )
             return True
 
-        value = _load_node_output_value(workspace, source_node, node.fanout.path.strip())
+        value = _load_node_output_value(workspace, workflow_id, source_node, node.fanout.path.strip())
         items = [] if value is _MISSING else _coerce_fanout_items(value)
         max_items = max(0, int(node.fanout.max_items or 0))
         if max_items:
@@ -1415,14 +1527,20 @@ class WorkflowManager:
             return True
 
         existing_children = {item.id for item in graph.nodes if item.fanout_parent_id == node.id}
+        downstream_nodes = [
+            item
+            for item in graph.nodes
+            if item.id != node.id and (node.id in item.depends_on or any(dep in existing_children for dep in item.depends_on))
+        ]
         if existing_children:
             graph.nodes = [item for item in graph.nodes if item.id not in existing_children]
+            downstream_ids = {item.id for item in downstream_nodes}
             for item in graph.nodes:
-                item.depends_on = [dep for dep in item.depends_on if dep not in existing_children]
+                if item.id not in downstream_ids:
+                    item.depends_on = [dep for dep in item.depends_on if dep not in existing_children]
 
         existing_ids = {item.id for item in graph.nodes}
         generated_ids: list[str] = []
-        downstream_nodes = [item for item in graph.nodes if item.id != node.id and node.id in item.depends_on]
         base_x = float(node.position.get("x", 0))
         base_y = float(node.position.get("y", 0))
         for index, item in enumerate(items):
@@ -1467,11 +1585,15 @@ class WorkflowManager:
 
         for item in downstream_nodes:
             next_deps: list[str] = []
+            inserted_generated = False
             for dep in item.depends_on:
-                if dep == node.id:
+                if dep == node.id or dep in existing_children:
+                    if inserted_generated:
+                        continue
                     for child_id in generated_ids:
                         if child_id not in next_deps:
                             next_deps.append(child_id)
+                    inserted_generated = True
                 elif dep not in next_deps:
                     next_deps.append(dep)
             item.depends_on = next_deps
@@ -1927,13 +2049,20 @@ class WorkflowManager:
             raise ValueError(f"Agent config not found: {node.config_file}")
         upstream = []
         nodes_by_id = {item.id: item for item in record.graph_json.nodes}
+        fanout_source_id = None
+        if node.fanout_parent_id:
+            template_node = nodes_by_id.get(node.fanout_parent_id)
+            if template_node and template_node.fanout:
+                fanout_source_id = template_node.fanout.source or (template_node.depends_on[0] if template_node.depends_on else None)
         for dep in node.depends_on:
             parent = nodes_by_id.get(dep)
             if not parent:
                 continue
             summary = ""
             structured_blob = ""
-            if parent.run_id:
+            if node.fanout_item is not None and fanout_source_id == parent.id:
+                summary = "Fan-out source completed. Use the Dynamic fan-out assignment above for this child node."
+            elif parent.run_id:
                 # Prefer the structured node_output.json when an upstream agent
                 # produced a parseable JSON payload — gives the downstream node
                 # a typed view rather than re-parsing tail text.
