@@ -5,7 +5,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-GlobalApiProvider = Literal["anthropic", "openai", "gemini", "glm", "minimax", "kimi", "custom"]
+GlobalApiProvider = Literal["anthropic", "openai", "gemini", "glm", "minimax", "kimi", "deepseek", "custom"]
 RunStatus = Literal["queued", "running", "succeeded", "failed", "cancelled"]
 WorkflowStatus = Literal["draft", "running", "paused", "succeeded", "failed", "cancelled"]
 WorkflowNodeStatus = Literal[

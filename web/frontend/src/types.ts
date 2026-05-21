@@ -155,7 +155,7 @@ export type TeamConfigPayload = {
   default_edges?: TeamEdgeInfo[]
 }
 
-export type GlobalApiProvider = "anthropic" | "openai" | "gemini" | "glm" | "minimax" | "kimi" | "custom"
+export type GlobalApiProvider = "anthropic" | "openai" | "gemini" | "glm" | "minimax" | "kimi" | "deepseek" | "custom"
 
 export type GlobalProviderSettings = {
   provider: GlobalApiProvider
