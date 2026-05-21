@@ -19,6 +19,7 @@ import type {
   TeamConfig,
   TeamConfigPayload,
   UpdateGlobalSettingsPayload,
+  ValidateSettingsResponse,
   WorkflowDeltaRecord,
   WorkflowRecord,
   WorkflowRuntimeResponse,
@@ -67,6 +68,11 @@ export const api = {
   updateSettings: (payload: UpdateGlobalSettingsPayload) =>
     request<GlobalSettings>("/api/settings", {
       method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  validateSettings: (payload: UpdateGlobalSettingsPayload) =>
+    request<ValidateSettingsResponse>("/api/settings/validate", {
+      method: "POST",
       body: JSON.stringify(payload),
     }),
   skills: () => request<SkillInfo[]>("/api/skills"),

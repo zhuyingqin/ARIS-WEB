@@ -240,7 +240,39 @@ where
                 system_prompt: self.system_prompt.clone(),
                 messages: self.session.messages.clone(),
             };
-            let events = self.api_client.stream(request)?;
+            let request_message_count = request.messages.len();
+            self.event_sink.emit(&RuntimeEvent {
+                timestamp: now_iso8601(),
+                session_id: String::new(),
+                event_type: EventType::LlmCallStart {
+                    iteration: iterations,
+                    message_count: request_message_count,
+                },
+            });
+            let events = match self.api_client.stream(request) {
+                Ok(events) => {
+                    self.event_sink.emit(&RuntimeEvent {
+                        timestamp: now_iso8601(),
+                        session_id: String::new(),
+                        event_type: EventType::LlmCallEnd {
+                            iteration: iterations,
+                            event_count: events.len(),
+                        },
+                    });
+                    events
+                }
+                Err(error) => {
+                    self.event_sink.emit(&RuntimeEvent {
+                        timestamp: now_iso8601(),
+                        session_id: String::new(),
+                        event_type: EventType::LlmCallError {
+                            iteration: iterations,
+                            message: error.to_string(),
+                        },
+                    });
+                    return Err(error);
+                }
+            };
             let (assistant_message, usage) = build_assistant_message(events)?;
             if let Some(usage) = usage {
                 self.usage_tracker.record(usage);

@@ -120,6 +120,19 @@ class RenderHtmlRequest(BaseModel):
     offline: bool = False
 
 
+class GlobalProviderSettings(BaseModel):
+    provider: GlobalApiProvider
+    active: bool = False
+    api_key_set: bool = False
+    api_key_masked: str | None = None
+    base_url: str | None = None
+    model: str | None = None
+    models: list[str] = Field(default_factory=list)
+    effort: str | None = None
+    updated_at: str | None = None
+    applies_to: list[str] = Field(default_factory=list)
+
+
 class GlobalSettings(BaseModel):
     provider: GlobalApiProvider = "anthropic"
     api_key_set: bool = False
@@ -131,6 +144,7 @@ class GlobalSettings(BaseModel):
     updated_at: str | None = None
     config_path: str
     applies_to: list[str] = Field(default_factory=list)
+    providers: list[GlobalProviderSettings] = Field(default_factory=list)
 
 
 class UpdateGlobalSettingsRequest(BaseModel):
@@ -141,6 +155,17 @@ class UpdateGlobalSettingsRequest(BaseModel):
     model: str | None = None
     models: list[str] | None = None
     effort: str | None = None
+
+
+class ValidateGlobalSettingsResponse(BaseModel):
+    ok: bool
+    provider: GlobalApiProvider
+    endpoint: str | None = None
+    model: str | None = None
+    message: str
+    status_code: int | None = None
+    models: list[str] = Field(default_factory=list)
+    model_count: int = 0
 
 
 class AgentConfig(BaseModel):

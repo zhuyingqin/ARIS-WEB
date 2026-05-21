@@ -19,7 +19,7 @@ from .artifacts import (
 )
 from .agent_configs import delete_agent_config, list_agent_configs, save_agent_config, update_agent_config
 from .config import FRONTEND_DIST, RENDER_HTML, REPO_ROOT, SKILLS_DIR, TOOLS_DIR, WEB_HOME
-from .global_settings import build_runtime_env, get_global_settings, update_global_settings
+from .global_settings import build_runtime_env, get_global_settings, update_global_settings, validate_global_settings
 from .models import (
     AddWorkspaceRequest,
     AgentConfig,
@@ -48,6 +48,7 @@ from .models import (
     UpdateWorkflowRequest,
     UpdateAgentConfigRequest,
     UpdateTeamConfigRequest,
+    ValidateGlobalSettingsResponse,
     WorkflowDeltaRecord,
     WorkflowRecord,
     WorkflowRuntimeResponse,
@@ -146,6 +147,11 @@ async def global_settings_endpoint() -> GlobalSettings:
 @app.patch("/api/settings", response_model=GlobalSettings)
 async def update_global_settings_endpoint(request: UpdateGlobalSettingsRequest) -> GlobalSettings:
     return update_global_settings(request, settings_home)
+
+
+@app.post("/api/settings/validate", response_model=ValidateGlobalSettingsResponse)
+async def validate_global_settings_endpoint(request: UpdateGlobalSettingsRequest) -> ValidateGlobalSettingsResponse:
+    return await asyncio.to_thread(validate_global_settings, request, settings_home)
 
 
 @app.post("/api/runs", response_model=RunRecord)

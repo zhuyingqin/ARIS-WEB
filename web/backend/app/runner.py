@@ -196,6 +196,8 @@ class RunManager:
         self.bus = EventBus()
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._workspace_by_run: dict[str, Path] = {}
+        self._runtime_event_offsets: dict[str, int] = {}
+        self._runtime_event_keys: dict[str, set[str]] = {}
 
     async def create_run(self, request: CreateRunRequest, skill: SkillInfo, workspace: Path) -> RunRecord:
         run_id = uuid.uuid4().hex[:12]
@@ -204,9 +206,9 @@ class RunManager:
         output_file = last_message_path(workspace, run_id)
         if not request.effort:
             if hasattr(request, "model_copy"):
-                request = request.model_copy(update={"effort": effective_effort_override()})
+                request = request.model_copy(update={"effort": effective_effort_override(model=request.model)})
             else:  # Pydantic v1 compatibility
-                request = request.copy(update={"effort": effective_effort_override()})
+                request = request.copy(update={"effort": effective_effort_override(model=request.model)})
         prompt = build_aris_prompt(skill, request)
         effective_model = request.model or effective_model_override()
         model_label = effective_model or "runtime default"
@@ -286,13 +288,17 @@ class RunManager:
         env_overrides: dict[str, str] | None = None,
     ) -> None:
         self._workspace_by_run[run_id] = workspace
-        env = build_runtime_env()
+        run_record = get_run(workspace, run_id)
+        env = build_runtime_env(model=run_record.model if run_record else None)
         if env_overrides:
             env.update({key: value for key, value in env_overrides.items() if value is not None})
-        run_record = get_run(workspace, run_id)
         run_model = (run_record.model if run_record else None) or "runtime default"
         run_skill = run_record.skill if run_record else None
         run_effort = run_record.effort if run_record else None
+        runtime_events_path = run_path(workspace, run_id) / "runtime_events.jsonl"
+        env["ARIS_META_LOGGING"] = "content"
+        env["ARIS_SESSION_ID"] = run_id
+        env["ARIS_META_LOG_PATH"] = str(runtime_events_path)
         if Path(command[0]).name.lower() in {"aris", "aris.exe"} and not _command_available(command[0], env):
             message = "Neither aris nor cargo was found; install ARIS-Code or Rust/Cargo first"
             update_run(workspace, run_id, status="failed", finished_at=utc_now(), error=message)
@@ -319,6 +325,9 @@ class RunManager:
                 payload={"model": run_model, "skill": run_skill, "effort": run_effort},
             ),
         )
+        runtime_tail_task = asyncio.create_task(
+            self._tail_runtime_events(workspace, run_id, runtime_events_path)
+        )
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -344,6 +353,16 @@ class RunManager:
             return
         finally:
             self._processes.pop(run_id, None)
+            runtime_tail_task.cancel()
+            try:
+                await runtime_tail_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            await self._drain_runtime_event_file(workspace, run_id, runtime_events_path)
+            self._runtime_event_offsets.pop(run_id, None)
+            self._runtime_event_keys.pop(run_id, None)
 
         status = "succeeded" if exit_code == 0 else "failed"
         if exit_code < 0:
@@ -360,6 +379,44 @@ class RunManager:
             ),
         )
         await self._write_last_message_from_events(workspace, run_id)
+
+    async def _tail_runtime_events(self, workspace: Path, run_id: str, path: Path) -> None:
+        while True:
+            try:
+                await self._drain_runtime_event_file(workspace, run_id, path)
+            except Exception:
+                pass
+            await asyncio.sleep(0.25)
+
+    async def _drain_runtime_event_file(self, workspace: Path, run_id: str, path: Path) -> None:
+        if not path.exists():
+            return
+        offset = self._runtime_event_offsets.get(run_id, 0)
+        try:
+            current_size = path.stat().st_size
+        except OSError:
+            return
+        if current_size < offset:
+            offset = 0
+        seen = self._runtime_event_keys.setdefault(run_id, set())
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                fh.seek(offset)
+                for line in fh:
+                    raw = line.strip()
+                    if not raw or raw in seen:
+                        continue
+                    seen.add(raw)
+                    try:
+                        record = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    event = runtime_meta_event_to_run_event(run_id, record)
+                    if event is not None:
+                        await self._append_event(workspace, event)
+                self._runtime_event_offsets[run_id] = fh.tell()
+        except OSError:
+            return
 
     async def _read_stream(
         self,
@@ -379,13 +436,11 @@ class RunManager:
             event_stream = name
             message = text
             if name == "stdout":
-                try:
-                    payload = json.loads(text)
+                payload = parse_stdout_json_payload(text)
+                if payload is not None:
                     for event in expand_codex_payload_events(run_id, payload):
                         await self._append_event(workspace, event)
                     continue
-                except json.JSONDecodeError:
-                    payload = None
             elif name == "stderr":
                 text = clean_terminal_text(text)
                 message = text
@@ -490,6 +545,97 @@ ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 def clean_terminal_text(text: str) -> str:
     return ANSI_ESCAPE_RE.sub("", text).strip()
+
+
+def parse_stdout_json_payload(text: str) -> dict[str, Any] | None:
+    for candidate in (text, clean_terminal_text(text)):
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    cleaned = clean_terminal_text(text)
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end > start:
+        try:
+            parsed = json.loads(cleaned[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def runtime_meta_event_to_run_event(run_id: str, record: dict[str, Any]) -> RunEvent | None:
+    session_id = str(record.get("session") or "")
+    if session_id and session_id != run_id:
+        return None
+    event_name = str(record.get("event") or "")
+    timestamp = str(record.get("ts") or utc_now())
+    payload = {"kind": "runtime_event", **record}
+
+    if event_name == "llm_call_start":
+        iteration = record.get("iteration")
+        messages = record.get("messages")
+        return RunEvent(
+            run_id=run_id,
+            timestamp=timestamp,
+            stream="thinking",
+            message=f"LLM call {iteration} started ({messages} messages)",
+            payload=payload,
+        )
+    if event_name == "llm_call_end":
+        iteration = record.get("iteration")
+        assistant_events = record.get("assistant_events")
+        return RunEvent(
+            run_id=run_id,
+            timestamp=timestamp,
+            stream="thinking",
+            message=f"LLM call {iteration} completed ({assistant_events} assistant events)",
+            payload=payload,
+        )
+    if event_name == "llm_call_error":
+        iteration = record.get("iteration")
+        message = str(record.get("message") or "request failed")
+        return RunEvent(
+            run_id=run_id,
+            timestamp=timestamp,
+            stream="stderr",
+            message=f"LLM call {iteration} failed: {message}",
+            payload=payload,
+        )
+    if event_name in {"tool_call", "tool_failure"}:
+        tool_name = str(record.get("tool") or "tool")
+        summary = str(record.get("input_summary") or "").strip()
+        label = "Tool failed" if event_name == "tool_failure" else "Tool call"
+        return RunEvent(
+            run_id=run_id,
+            timestamp=timestamp,
+            stream="stderr" if event_name == "tool_failure" else "tool",
+            message=f"{label}: {tool_name}{(': ' + summary) if summary else ''}",
+            payload=payload,
+        )
+    if event_name == "skill_invoke":
+        skill_name = str(record.get("skill") or "skill")
+        args = str(record.get("args") or "").strip()
+        return RunEvent(
+            run_id=run_id,
+            timestamp=timestamp,
+            stream="tool",
+            message=f"Skill invoke: {skill_name}{(': ' + args) if args else ''}",
+            payload=payload,
+        )
+    if event_name in {"session_start", "session_end", "slash_command"}:
+        return RunEvent(
+            run_id=run_id,
+            timestamp=timestamp,
+            stream="system",
+            message=f"Runtime event: {event_name}",
+            payload=payload,
+        )
+    return None
 
 
 def is_nonfatal_diagnostic(text: str) -> bool:

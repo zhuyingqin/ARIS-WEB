@@ -20,6 +20,18 @@ pub struct RuntimeEvent {
 
 #[derive(Debug, Clone)]
 pub enum EventType {
+    LlmCallStart {
+        iteration: usize,
+        message_count: usize,
+    },
+    LlmCallEnd {
+        iteration: usize,
+        event_count: usize,
+    },
+    LlmCallError {
+        iteration: usize,
+        message: String,
+    },
     ToolCall {
         tool_name: String,
         /// Truncated summary of input (never full content)
@@ -44,6 +56,9 @@ pub enum EventType {
 impl fmt::Display for EventType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::LlmCallStart { iteration, .. } => write!(f, "llm_call_start:{iteration}"),
+            Self::LlmCallEnd { iteration, .. } => write!(f, "llm_call_end:{iteration}"),
+            Self::LlmCallError { iteration, .. } => write!(f, "llm_call_error:{iteration}"),
             Self::ToolCall { tool_name, .. } => write!(f, "tool_call:{tool_name}"),
             Self::SkillInvoke { skill_name, .. } => write!(f, "skill_invoke:{skill_name}"),
             Self::UserPrompt { .. } => write!(f, "user_prompt"),
@@ -123,6 +138,44 @@ impl EventSink for JsonlEventSink {
         }
 
         let record = match &event.event_type {
+            EventType::LlmCallStart {
+                iteration,
+                message_count,
+            } => {
+                format!(
+                    r#"{{"ts":"{}","session":"{}","event":"llm_call_start","iteration":{},"messages":{}}}"#,
+                    event.timestamp,
+                    escape_json(&sanitize_field(&self.session_id, 60)),
+                    iteration,
+                    message_count,
+                )
+            }
+            EventType::LlmCallEnd {
+                iteration,
+                event_count,
+            } => {
+                format!(
+                    r#"{{"ts":"{}","session":"{}","event":"llm_call_end","iteration":{},"assistant_events":{}}}"#,
+                    event.timestamp,
+                    escape_json(&sanitize_field(&self.session_id, 60)),
+                    iteration,
+                    event_count,
+                )
+            }
+            EventType::LlmCallError { iteration, message } => {
+                let summary = if self.level == MetaLoggingLevel::Content {
+                    sanitize_field(message, 200)
+                } else {
+                    String::new()
+                };
+                format!(
+                    r#"{{"ts":"{}","session":"{}","event":"llm_call_error","iteration":{},"message":"{}"}}"#,
+                    event.timestamp,
+                    escape_json(&sanitize_field(&self.session_id, 60)),
+                    iteration,
+                    escape_json(&summary),
+                )
+            }
             EventType::ToolCall {
                 tool_name,
                 input_summary,

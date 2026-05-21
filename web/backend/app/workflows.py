@@ -35,6 +35,7 @@ from .models import (
     PolicyResult,
     RuntimePolicy,
     RuntimeSummary,
+    RunEvent,
     SessionRuntimeView,
     WorkflowHandoff,
     WorkflowEdge,
@@ -3864,12 +3865,76 @@ class WorkflowManager:
         deadline = loop.time() + effective_timeout if effective_timeout else None
 
         queue = await self.run_manager.bus.subscribe(run.id)
-        try:
+        forwarded_event_keys: set[tuple[str, str, str, str]] = set()
+        started_at = loop.time()
+        heartbeat_interval = 15.0
+        next_heartbeat_at = started_at + heartbeat_interval
+
+        def event_key(event: RunEvent) -> tuple[str, str, str, str]:
+            payload_key = ""
+            if event.payload is not None:
+                payload_key = json.dumps(event.payload, ensure_ascii=False, sort_keys=True, default=str)
+            return (event.timestamp, event.stream, event.message, payload_key)
+
+        async def forward_once(event: RunEvent) -> None:
+            key = event_key(event)
+            if key in forwarded_event_keys:
+                return
+            forwarded_event_keys.add(key)
+            await self._forward_run_event(workspace, record.id, node.id, event)
+
+        async def flush_run_events() -> None:
             for event in await self.run_manager.replay_events(workspace, run.id):
-                await self._forward_run_event(workspace, record.id, node.id, event)
+                await forward_once(event)
+            while True:
+                try:
+                    event = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                await forward_once(event)
+
+        async def append_heartbeat() -> None:
+            elapsed = int(loop.time() - started_at)
+            await self._append_event(
+                workspace,
+                WorkflowEvent(
+                    workflow_id=record.id,
+                    timestamp=utc_now(),
+                    event_type="run",
+                    node_id=node.id,
+                    run_id=run.id,
+                    message=f"Run still active: {node.name} ({elapsed}s elapsed, model: {run_model})",
+                    payload={
+                        "kind": "heartbeat",
+                        "elapsed_seconds": elapsed,
+                        "model": run_model,
+                        "skill": skill.id,
+                        "effort": effective_effort,
+                    },
+                ),
+            )
+
+        try:
+            await flush_run_events()
             while True:
                 current = get_run(workspace, run.id)
                 if current and current.status in {"succeeded", "failed", "cancelled"}:
+                    await flush_run_events()
+                    # ``RunManager`` updates the run status immediately before
+                    # appending its final system event. Give the event bus a
+                    # short grace window so workflow terminals do not miss the
+                    # tail of a completed run.
+                    grace_until = loop.time() + 0.35
+                    while loop.time() < grace_until:
+                        try:
+                            event = await asyncio.wait_for(
+                                queue.get(),
+                                timeout=max(0.01, min(0.1, grace_until - loop.time())),
+                            )
+                        except asyncio.TimeoutError:
+                            break
+                        await forward_once(event)
+                    await flush_run_events()
                     run_error = current.error
                     if current.status != "succeeded" and not run_error:
                         run_error = await self._latest_run_error(workspace, run.id)
@@ -3913,8 +3978,12 @@ class WorkflowManager:
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=wait_for)
                 except asyncio.TimeoutError:
+                    now = loop.time()
+                    if now >= next_heartbeat_at:
+                        await append_heartbeat()
+                        next_heartbeat_at = now + heartbeat_interval
                     continue
-                await self._forward_run_event(workspace, record.id, node.id, event)
+                await forward_once(event)
         finally:
             await self.run_manager.bus.unsubscribe(run.id, queue)
 

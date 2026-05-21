@@ -1838,14 +1838,15 @@ label {
 }
 
 .workflow-terminal-head {
-  display: flex;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  gap: 8px 12px;
   border-bottom: 1px solid rgba(219, 229, 255, 0.08);
   padding: 10px 12px;
   background: rgba(15, 24, 21, 0.92);
   color: var(--terminal-fg);
+  overflow: hidden;
 }
 
 .workflow-terminal-title,
@@ -1886,10 +1887,11 @@ label {
 
 .workflow-terminal-filters {
   flex: 1 1 auto;
+  flex-wrap: wrap;
   justify-content: center;
   gap: 5px;
-  overflow-x: auto;
   padding: 0 4px;
+  overflow: visible;
 }
 
 .terminal-filter {
@@ -1907,6 +1909,26 @@ label {
   font-size: 11px;
   transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
   white-space: nowrap;
+}
+
+@media (max-width: 1320px) {
+  .workflow-terminal-head {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .workflow-terminal-title {
+    min-width: 0;
+  }
+
+  .workflow-terminal-filters {
+    grid-column: 1 / -1;
+    justify-content: flex-start;
+    padding: 2px 0 0;
+  }
+
+  .workflow-terminal-meta {
+    min-width: 0;
+  }
 }
 
 .terminal-filter:hover {
@@ -3013,10 +3035,13 @@ label {
   gap: 14px;
   min-width: 0;
   min-height: calc(100vh - 114px);
+  max-width: 1280px;
 }
 
 .settings-hero,
+.settings-provider-panel,
 .settings-section,
+.settings-validation,
 .settings-summary,
 .settings-footer {
   border: 1px solid var(--border);
@@ -3109,9 +3134,161 @@ label {
   color: var(--warning);
 }
 
+.settings-provider-panel {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+
+.settings-provider-panel-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.settings-provider-panel-head h2 {
+  color: var(--text-strong);
+  font-size: var(--fs-lg);
+}
+
+.settings-provider-panel-head p {
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+}
+
+.settings-add-provider {
+  display: grid;
+  flex: 0 1 360px;
+  gap: 6px;
+  min-width: min(100%, 280px);
+}
+
+.settings-add-provider label {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.settings-provider-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr));
+  gap: 10px;
+  min-width: 0;
+}
+
+.settings-provider-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
+  gap: 8px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+  background: var(--surface);
+  box-shadow: var(--shadow-xs);
+}
+
+.settings-provider-card.selected {
+  border-color: var(--brand);
+  background: var(--brand-soft);
+  box-shadow: 0 0 0 3px var(--brand-ring);
+}
+
+.settings-provider-main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  gap: 6px;
+  min-width: 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.settings-provider-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.settings-provider-main strong,
+.settings-provider-main span,
+.settings-provider-main small {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-provider-main strong {
+  color: var(--text-strong);
+  font-size: var(--fs-base);
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.settings-provider-main span,
+.settings-provider-main small {
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+}
+
+.settings-provider-badges,
+.settings-provider-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.settings-provider-actions {
+  align-self: end;
+  flex-direction: column;
+}
+
+.settings-provider-actions span {
+  font-size: var(--fs-xs);
+  font-weight: 700;
+}
+
+.settings-provider-empty {
+  display: grid;
+  gap: 4px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  padding: 14px;
+  background: var(--surface-2);
+  color: var(--text-muted);
+}
+
+.settings-provider-empty strong {
+  color: var(--text-strong);
+}
+
+.provider-ok {
+  background: var(--success-soft);
+  color: var(--success-text);
+}
+
+.provider-missing {
+  background: var(--neutral-soft);
+  color: var(--neutral-text);
+}
+
 .settings-form {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 360px;
+  grid-template-columns: minmax(0, 1fr);
   gap: 14px;
   align-items: start;
   min-width: 0;
@@ -3125,6 +3302,7 @@ label {
 }
 
 .settings-section,
+.settings-validation,
 .settings-summary {
   display: grid;
   gap: 14px;
@@ -3167,6 +3345,50 @@ label {
   grid-column: 1 / -1;
 }
 
+.settings-key-state {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  border: 1px solid var(--divider);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+}
+
+.settings-key-state svg {
+  flex: 0 0 auto;
+}
+
+.settings-key-state span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-key-state.is-ok {
+  border-color: rgba(21, 128, 61, 0.2);
+  background: #f1fcf5;
+  color: var(--success);
+}
+
+.settings-key-state.is-missing {
+  border-color: rgba(180, 83, 9, 0.2);
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.settings-inline-hint {
+  border-radius: var(--radius-sm);
+  padding: 9px 10px;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+}
+
 .settings-note {
   display: flex;
   align-items: center;
@@ -3192,11 +3414,31 @@ label {
   white-space: nowrap;
 }
 
-.model-catalog-textarea {
-  min-height: 128px;
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  font-size: var(--fs-sm);
-  line-height: 1.5;
+.settings-validation {
+  border-style: dashed;
+  background: var(--surface-2);
+}
+
+.settings-validation.is-ok {
+  border-color: rgba(21, 128, 61, 0.26);
+  background: #f1fcf5;
+}
+
+.settings-validation.is-bad {
+  border-color: rgba(185, 28, 28, 0.28);
+  background: #fff7f7;
+}
+
+.settings-validation > p {
+  color: var(--text-muted);
+  font-size: var(--fs-base);
+}
+
+.settings-validation-models {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
 }
 
 .settings-summary-grid {
@@ -3267,6 +3509,11 @@ label {
   min-width: 0;
   color: var(--text-muted);
   font-size: var(--fs-sm);
+}
+
+.settings-footer .console-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .health-card {

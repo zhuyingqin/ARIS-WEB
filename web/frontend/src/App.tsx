@@ -58,6 +58,7 @@ import type {
   AgentConfig,
   ArtifactInfo,
   GlobalApiProvider,
+  GlobalProviderSettings,
   RunEvent,
   RunOutput,
   RunRecord,
@@ -1508,11 +1509,29 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
   )
   const selectedNodeConfig =
     selectedNode?.type === "sub_agent" ? findAgentConfig(agentConfigs.data, selectedNode?.config_file) : null
+  const configuredProviderModels = useMemo(
+    () =>
+      (settings.data?.providers ?? [])
+        .filter((profile) => profile.api_key_set)
+        .flatMap((profile) => [profile.model, ...(profile.models ?? [])].filter((item): item is string => Boolean(item))),
+    [settings.data?.providers],
+  )
+  const modelProviderLabels = useMemo(() => {
+    const labels = new Map<string, string>()
+    for (const profile of settings.data?.providers ?? []) {
+      if (!profile.api_key_set) continue
+      const label = providerOptions.find((item) => item.value === profile.provider)?.label ?? profile.provider
+      for (const modelOption of uniqueModelOptions(profile.model, profile.models ?? [])) {
+        if (!labels.has(modelOption)) labels.set(modelOption, label)
+      }
+    }
+    return labels
+  }, [settings.data?.providers])
   const nodeModelOptions = uniqueModelOptions(
     selectedNode?.model,
     selectedNodeConfig?.model,
     settings.data?.model,
-    settings.data?.models ?? [],
+    configuredProviderModels,
   )
   const nodeModelDefaultLabel = selectedNodeConfig?.model
     ? `Use profile default (${selectedNodeConfig.model})`
@@ -2490,7 +2509,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                     <option value="">{nodeModelDefaultLabel}</option>
                     {nodeModelOptions.map((modelOption) => (
                       <option key={modelOption} value={modelOption}>
-                        {modelOption}
+                        {modelProviderLabels.get(modelOption) ? `${modelOption} · ${modelProviderLabels.get(modelOption)}` : modelOption}
                       </option>
                     ))}
                   </Select>
@@ -3256,49 +3275,14 @@ function ArtifactPreview({ artifact }: { artifact: ArtifactInfo }) {
 }
 
 const providerOptions: { value: GlobalApiProvider; label: string; hint: string }[] = [
-  { value: "anthropic", label: "Anthropic", hint: "ANTHROPIC_API_KEY" },
-  { value: "openai", label: "OpenAI", hint: "EXECUTOR_API_KEY + OPENAI_API_KEY" },
-  { value: "gemini", label: "Gemini", hint: "Gemini OpenAI-compatible endpoint" },
-  { value: "glm", label: "GLM", hint: "GLM OpenAI-compatible endpoint" },
-  { value: "minimax", label: "MiniMax", hint: "MiniMax China Anthropic-compatible endpoint" },
-  { value: "kimi", label: "Kimi", hint: "Kimi OpenAI-compatible endpoint" },
-  { value: "custom", label: "Custom", hint: "EXECUTOR_API_KEY with optional base URL" },
+  { value: "openai", label: "GPT / OpenAI-compatible", hint: "Works with OpenAI and most proxy endpoints." },
+  { value: "anthropic", label: "Anthropic-compatible", hint: "Uses x-api-key and Anthropic message/model endpoints." },
+  { value: "gemini", label: "Gemini OpenAI-compatible", hint: "Google Gemini via its OpenAI-compatible endpoint." },
+  { value: "glm", label: "GLM OpenAI-compatible", hint: "Zhipu/GLM via OpenAI-compatible endpoint." },
+  { value: "kimi", label: "Kimi OpenAI-compatible", hint: "Moonshot/Kimi via OpenAI-compatible endpoint." },
+  { value: "minimax", label: "MiniMax Anthropic-compatible", hint: "MiniMax through the Anthropic-compatible API." },
+  { value: "custom", label: "Custom OpenAI-compatible", hint: "Any endpoint that accepts OpenAI-style requests." },
 ]
-
-const apiPresets = [
-  {
-    id: "manual",
-    label: "Manual",
-    hint: "Configure provider, endpoint, model, and effort manually.",
-  },
-  {
-    id: "yybb-openai",
-    label: "YYBB / OpenAI",
-    hint: "OpenAI-compatible proxy preset: https://yybb.codes, gpt-5.4, xhigh.",
-    provider: "openai" as GlobalApiProvider,
-    baseUrl: "https://yybb.codes",
-    model: "gpt-5.4",
-    effort: "xhigh",
-  },
-] as const
-
-function detectApiPreset(
-  provider: GlobalApiProvider,
-  baseUrl: string,
-  model: string,
-  effort: string,
-): (typeof apiPresets)[number]["id"] {
-  const normalizedBase = baseUrl.trim().replace(/\/+$/, "")
-  const match = apiPresets.find(
-    (item) =>
-      item.id !== "manual" &&
-      item.provider === provider &&
-      item.baseUrl === normalizedBase &&
-      item.model === model.trim() &&
-      item.effort === effort.trim(),
-  )
-  return match?.id ?? "manual"
-}
 
 function uniqueModelOptions(...groups: Array<string | null | undefined | readonly string[]>): string[] {
   const seen = new Set<string>()
@@ -3323,16 +3307,29 @@ function joinModelCatalog(models?: readonly string[]) {
   return (models ?? []).join("\n")
 }
 
+function baseUrlFromValidationEndpoint(endpoint?: string | null) {
+  const value = endpoint?.trim()
+  if (!value) return ""
+  for (const suffix of ["/models", "/chat/completions"]) {
+    if (value.endsWith(suffix)) return value.slice(0, -suffix.length)
+  }
+  return ""
+}
+
 function SettingsPage() {
   const queryClient = useQueryClient()
   const settings = useQuery({ queryKey: ["settings"], queryFn: api.settings })
-  const [apiPreset, setApiPreset] = useState<(typeof apiPresets)[number]["id"]>("manual")
-  const [provider, setProvider] = useState<GlobalApiProvider>("anthropic")
+  const [expandedProvider, setExpandedProvider] = useState<GlobalApiProvider>("openai")
   const [apiKey, setApiKey] = useState("")
   const [baseUrl, setBaseUrl] = useState("")
   const [model, setModel] = useState("")
   const [modelsText, setModelsText] = useState("")
   const [effort, setEffort] = useState("")
+  const providerProfiles = useMemo(() => {
+    const next = new Map<GlobalApiProvider, GlobalProviderSettings>()
+    for (const profile of settings.data?.providers ?? []) next.set(profile.provider, profile)
+    return next
+  }, [settings.data?.providers])
   const updateSettings = useMutation({
     mutationFn: api.updateSettings,
     onSuccess: (item) => {
@@ -3341,57 +3338,76 @@ function SettingsPage() {
       setApiKey("")
     },
   })
+  const validateSettings = useMutation({
+    mutationFn: api.validateSettings,
+    onSuccess: (result) => {
+      const inferredBaseUrl = baseUrlFromValidationEndpoint(result.endpoint)
+      if (result.ok && result.provider === expandedProvider && inferredBaseUrl) {
+        setBaseUrl(inferredBaseUrl)
+      }
+      if (result.provider === expandedProvider && result.models.length > 0 && splitModelCatalog(modelsText).length === 0) {
+        setModelsText(joinModelCatalog(result.models))
+      }
+    },
+  })
 
   useEffect(() => {
     if (!settings.data) return
-    setProvider(settings.data.provider)
-    setBaseUrl(settings.data.base_url ?? "")
-    setModel(settings.data.model ?? "")
-    setModelsText(joinModelCatalog(settings.data.models))
-    setEffort(settings.data.effort ?? "")
-    setApiPreset(
-      detectApiPreset(
-        settings.data.provider,
-        settings.data.base_url ?? "",
-        settings.data.model ?? "",
-        settings.data.effort ?? "",
-      ),
-    )
+    setExpandedProvider(settings.data.providers.find((item) => item.active)?.provider ?? settings.data.provider)
   }, [settings.data])
 
-  function applyApiPreset(presetId: (typeof apiPresets)[number]["id"]) {
-    setApiPreset(presetId)
-    const preset = apiPresets.find((item) => item.id === presetId)
-    if (!preset || preset.id === "manual") return
-    setProvider(preset.provider)
-    setBaseUrl(preset.baseUrl)
-    setModel(preset.model)
-    setModelsText((current) => joinModelCatalog(uniqueModelOptions(splitModelCatalog(current), preset.model)))
-    setEffort(preset.effort)
+  const selectedProfile = providerProfiles.get(expandedProvider)
+  const selectedProvider = providerOptions.find((item) => item.value === expandedProvider)
+  const configuredCount = (settings.data?.providers ?? []).filter((item) => item.api_key_set).length
+  const selectedKeySet = Boolean(selectedProfile?.api_key_set)
+
+  useEffect(() => {
+    if (!settings.data) return
+    const profile = providerProfiles.get(expandedProvider)
+    setApiKey("")
+    setBaseUrl(profile?.base_url ?? "")
+    setModel(profile?.model ?? "")
+    setModelsText(joinModelCatalog(profile?.models))
+    setEffort(profile?.effort ?? "")
+  }, [expandedProvider, providerProfiles, settings.data])
+
+  function settingsPayload(clearApiKey = false, targetProvider: GlobalApiProvider = expandedProvider) {
+    const profile = providerProfiles.get(targetProvider)
+    const isExpanded = targetProvider === expandedProvider
+    return {
+      provider: targetProvider,
+      api_key: isExpanded ? apiKey || null : null,
+      clear_api_key: clearApiKey,
+      base_url: isExpanded ? baseUrl || null : profile?.base_url ?? null,
+      model: isExpanded ? model || null : profile?.model ?? null,
+      models: isExpanded ? splitModelCatalog(modelsText) : profile?.models ?? [],
+      effort: isExpanded ? effort || null : profile?.effort ?? null,
+    }
   }
 
   function save(clearApiKey = false) {
-    updateSettings.mutate({
-      provider,
-      api_key: apiKey || null,
-      clear_api_key: clearApiKey,
-      base_url: baseUrl || null,
-      model: model || null,
-      models: splitModelCatalog(modelsText),
-      effort: effort || null,
-    })
+    updateSettings.mutate(settingsPayload(clearApiKey))
   }
 
-  const selectedProvider = providerOptions.find((item) => item.value === provider)
-  const selectedPreset = apiPresets.find((item) => item.id === apiPreset)
-  const settingsModelOptions = uniqueModelOptions(model, splitModelCatalog(modelsText))
-  const modelCatalog = splitModelCatalog(modelsText)
-  const keyStatusLabel = settings.data?.api_key_set
-    ? `${settings.data.provider} ${settings.data.api_key_masked ?? ""}`.trim()
-    : "Not configured"
-  const endpointLabel = baseUrl.trim() || "Provider default"
-  const modelLabel = model.trim() || "Provider default"
-  const effortLabel = effort.trim() || "Default"
+  function validateConnection() {
+    validateSettings.mutate(settingsPayload(false))
+  }
+
+  function validateProvider(targetProvider: GlobalApiProvider) {
+    validateSettings.mutate(settingsPayload(false, targetProvider))
+  }
+
+  const validationResult = validateSettings.data
+  const validation = validationResult?.provider === expandedProvider ? validationResult : null
+  const validationModels = validation?.models ?? []
+  const configuredProviderOptions = providerOptions.filter((option) => providerProfiles.get(option.value)?.api_key_set)
+  const addableProviderOptions = providerOptions.filter((option) => !providerProfiles.get(option.value)?.api_key_set)
+
+  function selectProvider(value: string) {
+    if (!value) return
+    setExpandedProvider(value as GlobalApiProvider)
+    validateSettings.reset()
+  }
 
   return (
     <section className="settings-page">
@@ -3402,17 +3418,90 @@ function SettingsPage() {
           </div>
           <div>
             <h1>API Configuration</h1>
-            <p>Provider credentials and defaults for Web-launched ARIS runs.</p>
+            <p>Configured providers stay visible. Add new ones only when you need them.</p>
           </div>
         </div>
-        <div className={`settings-status-pill ${settings.data?.api_key_set ? "is-ok" : "is-missing"}`}>
-          {settings.data?.api_key_set ? <CheckCircle2 size={18} /> : <XCircle size={18} />}
+        <div className={`settings-status-pill ${configuredCount > 0 ? "is-ok" : "is-missing"}`}>
+          {configuredCount > 0 ? <CheckCircle2 size={18} /> : <XCircle size={18} />}
           <div>
-            <span>API key</span>
-            <strong>{keyStatusLabel}</strong>
+            <span>Configured APIs</span>
+            <strong>{configuredCount === 1 ? "1 provider" : `${configuredCount} providers`}</strong>
           </div>
         </div>
       </div>
+
+      <section className="settings-provider-panel">
+        <div className="settings-provider-panel-head">
+          <div>
+            <h2>Configured Providers</h2>
+            <p>Only providers with saved API keys are shown here.</p>
+          </div>
+          <div className="settings-add-provider">
+            <label htmlFor="settings-add-provider">Add provider</label>
+            <Select
+              id="settings-add-provider"
+              value={selectedKeySet ? "" : expandedProvider}
+              onChange={(event) => selectProvider(event.target.value)}
+            >
+              <option value="">{addableProviderOptions.length ? "Choose provider to configure" : "All providers configured"}</option>
+              {addableProviderOptions.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </Select>
+          </div>
+        </div>
+
+        {configuredProviderOptions.length > 0 ? (
+          <div className="settings-provider-grid">
+            {configuredProviderOptions.map((option) => {
+              const profile = providerProfiles.get(option.value)
+              const active = Boolean(profile?.active)
+              const lastValidation = validationResult?.provider === option.value ? validationResult : null
+              return (
+                <section
+                  className={`settings-provider-card ${expandedProvider === option.value ? "selected" : ""}`}
+                  key={option.value}
+                >
+                  <button className="settings-provider-main" onClick={() => selectProvider(option.value)} type="button">
+                    <div className="settings-provider-top">
+                      <strong>{option.label}</strong>
+                      <div className="settings-provider-badges">
+                        {active && <Badge>active</Badge>}
+                        <Badge className="provider-ok">configured</Badge>
+                      </div>
+                    </div>
+                    <span>{profile?.api_key_masked ? `Key ${profile.api_key_masked}` : "Key saved"}</span>
+                    <small>{profile?.model ?? "default model"}</small>
+                    <small title={profile?.base_url ?? ""}>{profile?.base_url ?? "provider default endpoint"}</small>
+                  </button>
+                  <div className="settings-provider-actions">
+                    {lastValidation && (
+                      <span className={lastValidation.ok ? "ok" : "bad"}>
+                        {lastValidation.ok ? "verified" : "failed"}
+                      </span>
+                    )}
+                    <Button
+                      disabled={validateSettings.isPending && validateSettings.variables?.provider === option.value}
+                      onClick={() => validateProvider(option.value)}
+                      type="button"
+                      variant="secondary"
+                    >
+                      {validateSettings.isPending && validateSettings.variables?.provider === option.value ? "Testing..." : "Test"}
+                    </Button>
+                  </div>
+                </section>
+              )
+            })}
+          </div>
+        ) : (
+          <div className="settings-provider-empty">
+            <strong>No providers configured yet.</strong>
+            <span>Choose a provider above, add its key and endpoint, then save it.</span>
+          </div>
+        )}
+      </section>
 
       <form
         className="settings-form"
@@ -3425,54 +3514,10 @@ function SettingsPage() {
           <section className="settings-section">
             <div className="settings-section-head">
               <div>
-                <h2>Provider</h2>
-                <p>{selectedPreset?.hint}</p>
+                <h2>{selectedProvider?.label ?? expandedProvider}</h2>
+                <p>{selectedKeySet ? "Edit this provider connection, then save or test it." : "Add this provider by entering its key and connection settings."}</p>
               </div>
-              <Badge>{apiPreset === "manual" ? "Manual" : "Preset"}</Badge>
-            </div>
-            <div className="settings-field-grid">
-              <div className="settings-field">
-                <label>Preset</label>
-                <Select
-                  value={apiPreset}
-                  onChange={(event) => applyApiPreset(event.target.value as (typeof apiPresets)[number]["id"])}
-                >
-                  {apiPresets.map((item) => (
-                    <option key={item.id} value={item.id}>
-                      {item.label}
-                    </option>
-                  ))}
-                </Select>
-              </div>
-              <div className="settings-field">
-                <label>Provider</label>
-                <Select
-                  value={provider}
-                  onChange={(event) => {
-                    setApiPreset("manual")
-                    setProvider(event.target.value as GlobalApiProvider)
-                  }}
-                >
-                  {providerOptions.map((item) => (
-                    <option key={item.value} value={item.value}>
-                      {item.label}
-                    </option>
-                  ))}
-                </Select>
-              </div>
-            </div>
-            <div className="settings-note">
-              <SlidersHorizontal size={15} />
-              <span>{selectedProvider?.hint}</span>
-            </div>
-          </section>
-
-          <section className="settings-section">
-            <div className="settings-section-head">
-              <div>
-                <h2>Connection</h2>
-                <p>Key, endpoint, and default model used by the runner.</p>
-              </div>
+              <Badge>{selectedKeySet ? "configured" : "new provider"}</Badge>
             </div>
             <div className="settings-field-grid">
               <div className="settings-field settings-field-full">
@@ -3481,46 +3526,36 @@ function SettingsPage() {
                   type="password"
                   value={apiKey}
                   onChange={(event) => setApiKey(event.target.value)}
-                  placeholder={settings.data?.api_key_set ? "Leave blank to keep existing key" : "Paste API key"}
+                  placeholder={selectedKeySet ? "Leave blank to keep existing key" : "Paste API key"}
                 />
+                <div className={`settings-key-state ${selectedKeySet ? "is-ok" : "is-missing"}`}>
+                  {selectedKeySet ? <CheckCircle2 size={14} /> : <XCircle size={14} />}
+                  <span>
+                    {selectedKeySet
+                      ? `Saved key: ${selectedProfile?.api_key_masked ?? "configured"}. Leave this field blank to keep it.`
+                      : "No API key saved yet."}
+                  </span>
+                </div>
               </div>
               <div className="settings-field settings-field-full">
                 <label>Base URL</label>
                 <Input
                   value={baseUrl}
-                  onChange={(event) => {
-                    setApiPreset("manual")
-                    setBaseUrl(event.target.value)
-                  }}
+                  onChange={(event) => setBaseUrl(event.target.value)}
                   placeholder="Optional, e.g. https://api.openai.com/v1"
                 />
               </div>
               <div className="settings-field">
-                <label>Default reviewer model</label>
-                <Select
+                <label>Default model</label>
+                <Input
                   value={model}
-                  onChange={(event) => {
-                    setApiPreset("manual")
-                    setModel(event.target.value)
-                  }}
-                >
-                  <option value="">Provider default</option>
-                  {settingsModelOptions.map((modelOption) => (
-                    <option key={modelOption} value={modelOption}>
-                      {modelOption}
-                    </option>
-                  ))}
-                </Select>
+                  onChange={(event) => setModel(event.target.value)}
+                  placeholder="e.g. gpt-5.4"
+                />
               </div>
               <div className="settings-field">
                 <label>Reasoning effort</label>
-                <Select
-                  value={effort}
-                  onChange={(event) => {
-                    setApiPreset("manual")
-                    setEffort(event.target.value)
-                  }}
-                >
+                <Select value={effort} onChange={(event) => setEffort(event.target.value)}>
                   <option value="">Default</option>
                   <option value="none">none</option>
                   <option value="minimal">minimal</option>
@@ -3531,81 +3566,62 @@ function SettingsPage() {
                 </Select>
               </div>
             </div>
+            <p className="settings-inline-hint">{selectedProvider?.hint}</p>
           </section>
 
-          <section className="settings-section">
-            <div className="settings-section-head">
-              <div>
-                <h2>Model Catalog</h2>
-                <p>Models shown in node-level model selectors.</p>
+          {(validateSettings.isPending || validateSettings.error || validation) && (
+            <section className={`settings-validation ${validation?.ok ? "is-ok" : validation ? "is-bad" : ""}`}>
+              <div className="settings-section-head">
+                <div>
+                  <h2>Validation</h2>
+                  <p>Endpoint check result for this provider.</p>
+                </div>
+                {validateSettings.isPending ? <Badge>checking</Badge> : validation?.ok ? <CheckCircle2 size={18} /> : <XCircle size={18} />}
               </div>
-              <Badge>{modelCatalog.length} models</Badge>
-            </div>
-            <Textarea
-              className="model-catalog-textarea"
-              rows={6}
-              value={modelsText}
-              onChange={(event) => {
-                setApiPreset("manual")
-                setModelsText(event.target.value)
-              }}
-              placeholder="One model per line"
-            />
-          </section>
+              {validateSettings.isPending && <p>Checking endpoint...</p>}
+              {validateSettings.error && <p className="error-text">{validateSettings.error.message}</p>}
+              {validation && (
+                <>
+                  <p>{validation.message}</p>
+                  <dl className="settings-summary-grid">
+                    <div className="settings-summary-row">
+                      <dt>Endpoint</dt>
+                      <dd title={validation.endpoint ?? ""}>{validation.endpoint ?? "not available"}</dd>
+                    </div>
+                    <div className="settings-summary-row">
+                      <dt>Model</dt>
+                      <dd title={validation.model ?? ""}>{validation.model ?? "provider default"}</dd>
+                    </div>
+                    <div className="settings-summary-row">
+                      <dt>Models</dt>
+                      <dd>{validation.model_count.toLocaleString()}</dd>
+                    </div>
+                  </dl>
+                  {validationModels.length > 0 && (
+                    <div className="settings-validation-models">
+                      {validationModels.slice(0, 12).map((item) => (
+                        <Badge key={item}>{item}</Badge>
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
+            </section>
+          )}
         </div>
-
-        <aside className="settings-side">
-          <section className="settings-summary">
-            <div className="settings-summary-head">
-              <h2>Runtime Preview</h2>
-              <Badge>{provider}</Badge>
-            </div>
-            <dl className="settings-summary-grid">
-              <div className="settings-summary-row">
-                <dt>Endpoint</dt>
-                <dd title={endpointLabel}>{endpointLabel}</dd>
-              </div>
-              <div className="settings-summary-row">
-                <dt>Model</dt>
-                <dd title={modelLabel}>{modelLabel}</dd>
-              </div>
-              <div className="settings-summary-row">
-                <dt>Effort</dt>
-                <dd>{effortLabel}</dd>
-              </div>
-            </dl>
-          </section>
-
-          <section className="settings-summary">
-            <div className="settings-summary-head">
-              <h2>Injected Variables</h2>
-              <Badge>{settings.data?.applies_to?.length ?? 0}</Badge>
-            </div>
-            <div className="env-list settings-env-list">
-              {(settings.data?.applies_to ?? []).map((item) => (
-                <Badge key={item}>{item}</Badge>
-              ))}
-              {!settings.data?.applies_to?.length && <span className="muted">No runtime variables active.</span>}
-            </div>
-          </section>
-
-          <section className="settings-summary">
-            <div className="settings-summary-head">
-              <h2>Storage</h2>
-            </div>
-            <div className="settings-code-line" title={settings.data?.config_path ?? ""}>
-              {settings.data?.config_path ?? "Loading settings path..."}
-            </div>
-          </section>
-        </aside>
 
         <div className="settings-footer">
           <div className="settings-save-state">
             {updateSettings.error && <span className="error-text">{updateSettings.error.message}</span>}
             {updateSettings.isSuccess && !updateSettings.error && <span>Settings saved.</span>}
-            {!updateSettings.isSuccess && !updateSettings.error && <span>API keys are stored locally and are not returned by the API.</span>}
+            {!updateSettings.isSuccess && !updateSettings.error && (
+              <span title={settings.data?.config_path ?? ""}>Stored locally at {settings.data?.config_path ?? "the ARIS Web settings file"}.</span>
+            )}
           </div>
           <div className="console-actions">
+            <Button disabled={validateSettings.isPending || settings.isLoading} onClick={validateConnection} type="button" variant="secondary">
+              {validateSettings.isPending ? "Validating..." : "Validate connection"}
+            </Button>
             <Button disabled={updateSettings.isPending || settings.isLoading} type="submit">
               <Save size={15} />
               Save settings
@@ -3613,7 +3629,7 @@ function SettingsPage() {
             <Button
               variant="destructive"
               onClick={() => save(true)}
-              disabled={!settings.data?.api_key_set || updateSettings.isPending}
+              disabled={!selectedKeySet || updateSettings.isPending}
               type="button"
             >
               <XCircle size={15} />

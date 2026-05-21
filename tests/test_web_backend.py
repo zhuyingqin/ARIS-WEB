@@ -27,6 +27,7 @@ from app.team_configs import (  # noqa: E402
 )
 from app.global_settings import (  # noqa: E402
     build_runtime_env,
+    effective_effort_override,
     effective_model_override,
     get_global_settings,
     get_planner_llm_settings,
@@ -34,7 +35,9 @@ from app.global_settings import (  # noqa: E402
     planner_llm_summary,
     update_global_settings,
     update_planner_llm_settings,
+    validate_global_settings,
 )
+import app.global_settings as global_settings_module  # noqa: E402
 from app.models import (  # noqa: E402
     AgentConfigRequest,
     CreateRunRequest,
@@ -58,6 +61,8 @@ from app.runner import (  # noqa: E402
     build_aris_command,
     build_aris_prompt,
     expand_codex_payload_events,
+    parse_stdout_json_payload,
+    runtime_meta_event_to_run_event,
     summarize_codex_event,
 )
 from app.skills import parse_skill_frontmatter, scan_skills  # noqa: E402
@@ -282,6 +287,9 @@ def test_global_settings_mask_and_runtime_env(tmp_path: Path) -> None:
 
     assert settings.api_key_set is True
     assert settings.api_key_masked == "sk-t...3456"
+    openai_profile = next(item for item in settings.providers if item.provider == "openai")
+    assert openai_profile.api_key_set is True
+    assert openai_profile.active is True
     settings_data = settings.model_dump() if hasattr(settings, "model_dump") else settings.dict()
     assert "sk-test-123456" not in json.dumps(settings_data)
 
@@ -313,6 +321,9 @@ def test_global_settings_mask_and_runtime_env(tmp_path: Path) -> None:
     assert "ARIS_REVIEWER_MODEL" not in env_after_clear
 
     update_global_settings(UpdateGlobalSettingsRequest(provider="minimax", api_key="sk-minimax-123"), tmp_path)
+    profiles = get_global_settings(tmp_path).providers
+    assert next(item for item in profiles if item.provider == "openai").api_key_set is False
+    assert next(item for item in profiles if item.provider == "minimax").api_key_set is True
     minimax_env = build_runtime_env(base_env={"ARIS_REVIEWER_MODEL": "claude-opus-4-7"}, home=tmp_path)
     assert minimax_env["EXECUTOR_PROVIDER"] == "anthropic"
     assert minimax_env["ANTHROPIC_API_KEY"] == "sk-minimax-123"
@@ -323,6 +334,88 @@ def test_global_settings_mask_and_runtime_env(tmp_path: Path) -> None:
     assert minimax_env["ARIS_REVIEWER_MODEL"] == "MiniMax-M2.7"
     assert effective_model_override(tmp_path) == "MiniMax-M2.7"
     assert openai_compatible_settings(tmp_path) is None
+
+
+def test_global_settings_validation_falls_back_to_v1_models(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    update_global_settings(
+        UpdateGlobalSettingsRequest(
+            provider="openai",
+            api_key="sk-test-123456",
+            base_url="https://proxy.example",
+            model="gpt-5.5",
+        ),
+        tmp_path,
+    )
+    requested_urls: list[str] = []
+
+    def fake_request_json(method: str, url: str, **_kwargs: object) -> tuple[int, object]:
+        requested_urls.append(f"{method} {url}")
+        if url == "https://proxy.example/models":
+            raise global_settings_module.NonJsonResponseError(200, "text/html; charset=utf-8", "<html></html>")
+        if url == "https://proxy.example/v1/models":
+            return 200, {"data": [{"id": "gpt-5.5"}, {"id": "gpt-5.4"}]}
+        raise AssertionError(f"unexpected validation URL: {url}")
+
+    monkeypatch.setattr(global_settings_module, "_request_json", fake_request_json)
+
+    result = validate_global_settings(
+        UpdateGlobalSettingsRequest(provider="openai", base_url="https://proxy.example", model="gpt-5.5"),
+        tmp_path,
+    )
+
+    assert result.ok is True
+    assert result.endpoint == "https://proxy.example/v1/models"
+    assert result.models == ["gpt-5.5", "gpt-5.4"]
+    assert requested_urls == ["GET https://proxy.example/models", "GET https://proxy.example/v1/models"]
+
+
+def test_runtime_env_routes_to_provider_matching_selected_model(tmp_path: Path) -> None:
+    update_global_settings(
+        UpdateGlobalSettingsRequest(
+            provider="openai",
+            api_key="sk-openai-123456",
+            base_url="https://openai.example/v1",
+            model="gpt-5.5",
+            models=["gpt-5.5", "gpt-5.4"],
+            effort="xhigh",
+        ),
+        tmp_path,
+    )
+    update_global_settings(
+        UpdateGlobalSettingsRequest(
+            provider="minimax",
+            api_key="sk-minimax-123456",
+            base_url="https://api.minimaxi.com/anthropic",
+            model="MiniMax-M2.7",
+            models=["MiniMax-M2.7", "MiniMax-M2.7-highspeed"],
+        ),
+        tmp_path,
+    )
+
+    assert get_global_settings(tmp_path).provider == "minimax"
+
+    gpt_env = build_runtime_env(base_env={}, home=tmp_path, model="gpt-5.5")
+    assert gpt_env["EXECUTOR_PROVIDER"] == "openai"
+    assert gpt_env["EXECUTOR_API_KEY"] == "sk-openai-123456"
+    assert gpt_env["OPENAI_API_KEY"] == "sk-openai-123456"
+    assert gpt_env["EXECUTOR_BASE_URL"] == "https://openai.example/v1"
+    assert gpt_env["ARIS_REVIEWER_MODEL"] == "gpt-5.5"
+    assert gpt_env["ARIS_REASONING_EFFORT"] == "xhigh"
+    assert "MINIMAX_API_KEY" not in gpt_env
+
+    minimax_env = build_runtime_env(base_env={}, home=tmp_path, model="MiniMax-M2.7")
+    assert minimax_env["EXECUTOR_PROVIDER"] == "anthropic"
+    assert minimax_env["ANTHROPIC_API_KEY"] == "sk-minimax-123456"
+    assert minimax_env["ANTHROPIC_BASE_URL"] == "https://api.minimaxi.com/anthropic"
+    assert minimax_env["MINIMAX_API_KEY"] == "sk-minimax-123456"
+    assert minimax_env["ARIS_REVIEWER_MODEL"] == "MiniMax-M2.7"
+    assert "OPENAI_API_KEY" not in minimax_env
+
+    assert effective_effort_override(tmp_path, model="gpt-5.5") == "xhigh"
+    assert effective_effort_override(tmp_path, model="MiniMax-M2.7") is None
 
 
 def test_planner_llm_settings_are_separate_and_masked(tmp_path: Path) -> None:
@@ -1175,6 +1268,105 @@ def test_workflow_forwards_run_system_events_as_run_events(tmp_path: Path) -> No
     assert workflow_event_type_for_run_stream("tool") == "tool"
     assert workflow_event_type_for_run_stream("result") == "result"
     assert workflow_event_type_for_run_stream("system") == "run"
+    asyncio.run(run())
+
+
+def test_run_manager_parses_json_stdout_with_terminal_wrappers() -> None:
+    payload = parse_stdout_json_payload(
+        '\x1b[2K\x1b[1GThinking... {"message":"done","events":[{"kind":"assistant_text","text":"done"}]}\x1b[0m'
+    )
+    assert payload is not None
+    assert payload["message"] == "done"
+    assert payload["events"][0]["text"] == "done"
+
+
+def test_runtime_meta_events_become_terminal_run_events() -> None:
+    event = runtime_meta_event_to_run_event(
+        "run-live",
+        {
+            "ts": "2026-05-21T07:20:00Z",
+            "session": "run-live",
+            "event": "llm_call_start",
+            "iteration": 2,
+            "messages": 5,
+        },
+    )
+    assert event is not None
+    assert event.stream == "thinking"
+    assert event.message == "LLM call 2 started (5 messages)"
+
+    other = runtime_meta_event_to_run_event(
+        "run-live",
+        {"session": "other-run", "event": "llm_call_start", "iteration": 1, "messages": 1},
+    )
+    assert other is None
+
+
+def test_workflow_drains_late_terminal_run_events(tmp_path: Path) -> None:
+    class FakeBus:
+        def __init__(self) -> None:
+            self.queues: set[asyncio.Queue[RunEvent]] = set()
+
+        async def subscribe(self, run_id: str) -> asyncio.Queue[RunEvent]:
+            queue: asyncio.Queue[RunEvent] = asyncio.Queue()
+            self.queues.add(queue)
+            return queue
+
+        async def unsubscribe(self, run_id: str, queue: asyncio.Queue[RunEvent]) -> None:
+            self.queues.discard(queue)
+
+        async def publish(self, event: RunEvent) -> None:
+            for queue in list(self.queues):
+                queue.put_nowait(event)
+
+    class FakeRunManager:
+        def __init__(self) -> None:
+            self.bus = FakeBus()
+            self.events: list[RunEvent] = []
+
+        async def create_run(self, request: CreateRunRequest, skill: SkillInfo, workspace: Path) -> RunRecord:
+            run_id = "late-terminal"
+            record = RunRecord(
+                id=run_id,
+                workspace=str(workspace),
+                skill=request.skill,
+                model=request.model,
+                effort=request.effort,
+                status="succeeded",
+                created_at=utc_now(),
+                updated_at=utc_now(),
+                finished_at=utc_now(),
+                exit_code=0,
+                command=[],
+            )
+            insert_run(record)
+            asyncio.create_task(self._publish_late_result(run_id))
+            return record
+
+        async def _publish_late_result(self, run_id: str) -> None:
+            await asyncio.sleep(0.03)
+            event = RunEvent(
+                run_id=run_id,
+                timestamp=utc_now(),
+                stream="result",
+                message="final answer",
+                payload={"kind": "final_result"},
+            )
+            self.events.append(event)
+            await self.bus.publish(event)
+
+        async def replay_events(self, workspace: Path, run_id: str) -> list[RunEvent]:
+            return list(self.events)
+
+    manager = WorkflowManager(FakeRunManager())
+
+    async def run() -> None:
+        workflow = await manager.create(tmp_path, "Late terminal", "Goal", WorkflowGraph(nodes=[WorkflowNode(id="a", name="A")]))
+        result = await manager._run_node_with_aris(tmp_path, workflow, workflow.graph_json.nodes[0])
+        events = await manager.replay_events(tmp_path, workflow.id)
+        assert result.succeeded
+        assert any(event.event_type == "result" and event.message == "final answer" for event in events)
+
     asyncio.run(run())
 
 

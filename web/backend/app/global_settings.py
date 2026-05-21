@@ -2,15 +2,30 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
 from .config import REPO_ROOT, WEB_HOME
-from .models import GlobalApiProvider, GlobalSettings, UpdateGlobalSettingsRequest
+from .models import (
+    GlobalApiProvider,
+    GlobalProviderSettings,
+    GlobalSettings,
+    UpdateGlobalSettingsRequest,
+    ValidateGlobalSettingsResponse,
+)
 from .storage import utc_now
+
+try:
+    import certifi
+except Exception:  # pragma: no cover - certifi may be unavailable in minimal installs
+    certifi = None
 
 
 DEFAULT_BASE_URLS: dict[str, str] = {
+    "anthropic": "https://api.anthropic.com/v1",
     "openai": "https://api.openai.com/v1",
     "gemini": "https://generativelanguage.googleapis.com/v1beta/openai",
     "glm": "https://open.bigmodel.cn/api/paas/v4",
@@ -36,6 +51,9 @@ DEFAULT_MODEL_OPTIONS: dict[str, list[str]] = {
     "custom": [],
 }
 
+PROVIDER_IDS: tuple[GlobalApiProvider, ...] = ("openai", "minimax", "anthropic", "gemini", "glm", "kimi", "custom")
+PROVIDER_ID_SET = set(PROVIDER_IDS)
+
 MANAGED_ENV_KEYS = {
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
@@ -58,6 +76,14 @@ DEFAULT_AUTO_COMPACT_INPUT_TOKENS = "80000"
 
 
 LOCAL_BIN_DIR = REPO_ROOT / ".aris-bin"
+
+
+class NonJsonResponseError(ValueError):
+    def __init__(self, status_code: int, content_type: str | None, preview: str) -> None:
+        super().__init__("Response was not JSON.")
+        self.status_code = status_code
+        self.content_type = content_type
+        self.preview = preview
 
 
 def _prepend_local_bin(env: dict[str, str]) -> None:
@@ -202,12 +228,104 @@ def clean_model_options(*groups: object) -> list[str]:
     return options
 
 
+def normalize_provider(value: object, default: GlobalApiProvider = "openai") -> GlobalApiProvider:
+    provider = str(value or "").strip()
+    return provider if provider in PROVIDER_ID_SET else default  # type: ignore[return-value]
+
+
+def _clean_profile(profile: object, provider: GlobalApiProvider) -> dict[str, Any]:
+    data = profile if isinstance(profile, dict) else {}
+    return {
+        "api_key": str(data.get("api_key") or ""),
+        "base_url": str(data.get("base_url") or "").strip() or None,
+        "model": str(data.get("model") or "").strip() or None,
+        "models": clean_model_options(data.get("model"), data.get("models")),
+        "effort": str(data.get("effort") or "").strip() or None,
+        "updated_at": data.get("updated_at") or None,
+        "provider": provider,
+    }
+
+
+def _profiles_from_raw(data: dict[str, Any]) -> dict[GlobalApiProvider, dict[str, Any]]:
+    profiles: dict[GlobalApiProvider, dict[str, Any]] = {}
+    raw_profiles = data.get("providers")
+    if isinstance(raw_profiles, dict):
+        for key, value in raw_profiles.items():
+            provider = normalize_provider(key, default="custom")
+            profiles[provider] = _clean_profile(value, provider)
+
+    active_provider = normalize_provider(data.get("provider"))
+    has_legacy_values = any(data.get(key) for key in ("api_key", "base_url", "model", "models", "effort"))
+    if has_legacy_values:
+        legacy = _clean_profile(data, active_provider)
+        current = profiles.get(active_provider)
+        if current is None or legacy.get("api_key") or not current.get("api_key"):
+            profiles[active_provider] = {**(current or {}), **legacy}
+    return profiles
+
+
+def _active_provider(data: dict[str, Any], profiles: dict[GlobalApiProvider, dict[str, Any]]) -> GlobalApiProvider:
+    provider = normalize_provider(data.get("provider"))
+    if provider in profiles or data.get("provider"):
+        return provider
+    for candidate in PROVIDER_IDS:
+        if profiles.get(candidate, {}).get("api_key"):
+            return candidate
+    return provider
+
+
+def _active_profile(data: dict[str, Any]) -> tuple[GlobalApiProvider, dict[str, Any]]:
+    profiles = _profiles_from_raw(data)
+    provider = _active_provider(data, profiles)
+    return provider, profiles.get(provider, _clean_profile({}, provider))
+
+
+def _profile_for_model(data: dict[str, Any], model: str | None) -> tuple[GlobalApiProvider, dict[str, Any]]:
+    profiles = _profiles_from_raw(data)
+    active_provider = _active_provider(data, profiles)
+    requested_model = str(model or "").strip()
+    if requested_model:
+        ordered_providers = [active_provider, *[item for item in PROVIDER_IDS if item != active_provider]]
+        for provider in ordered_providers:
+            profile = profiles.get(provider, _clean_profile({}, provider))
+            if not str(profile.get("api_key") or "").strip():
+                continue
+            if requested_model in model_options_for(provider, profile):
+                return provider, profile
+    return active_provider, profiles.get(active_provider, _clean_profile({}, active_provider))
+
+
 def model_options_for(provider: GlobalApiProvider, data: dict[str, Any]) -> list[str]:
     return clean_model_options(
         data.get("model"),
         DEFAULT_MODELS.get(provider),
         data.get("models"),
         DEFAULT_MODEL_OPTIONS.get(provider, []),
+    )
+
+
+def provider_settings_for(
+    provider: GlobalApiProvider,
+    profile: dict[str, Any],
+    *,
+    active: bool,
+) -> GlobalProviderSettings:
+    api_key = str(profile.get("api_key") or "")
+    base_url = str(profile.get("base_url") or "").strip() or DEFAULT_BASE_URLS.get(provider)
+    model = str(profile.get("model") or "").strip() or DEFAULT_MODELS.get(provider)
+    effort = str(profile.get("effort") or "").strip() or None
+    models = model_options_for(provider, profile)
+    return GlobalProviderSettings(
+        provider=provider,
+        active=active,
+        api_key_set=bool(api_key),
+        api_key_masked=mask_secret(api_key),
+        base_url=base_url,
+        model=model,
+        models=models,
+        effort=effort,
+        updated_at=profile.get("updated_at") or None,
+        applies_to=applies_to(provider, bool(api_key), base_url, model, effort),
     )
 
 
@@ -255,14 +373,18 @@ def applies_to(
 
 def get_global_settings(home: Path = WEB_HOME) -> GlobalSettings:
     data = _read_raw(home)
-    provider = data.get("provider") or "anthropic"
-    if provider not in {"anthropic", "openai", "gemini", "glm", "minimax", "kimi", "custom"}:
-        provider = "anthropic"
-    api_key = str(data.get("api_key") or "")
-    base_url = str(data.get("base_url") or "").strip() or None
-    model = str(data.get("model") or "").strip() or None
-    effort = str(data.get("effort") or "").strip() or None
-    models = model_options_for(provider, data)
+    profiles = _profiles_from_raw(data)
+    provider = _active_provider(data, profiles)
+    active_profile = profiles.get(provider, _clean_profile({}, provider))
+    api_key = str(active_profile.get("api_key") or "")
+    base_url = str(active_profile.get("base_url") or "").strip() or DEFAULT_BASE_URLS.get(provider)
+    model = str(active_profile.get("model") or "").strip() or DEFAULT_MODELS.get(provider)
+    effort = str(active_profile.get("effort") or "").strip() or None
+    models = model_options_for(provider, active_profile)
+    provider_summaries = [
+        provider_settings_for(item, profiles.get(item, _clean_profile({}, item)), active=item == provider)
+        for item in PROVIDER_IDS
+    ]
     return GlobalSettings(
         provider=provider,
         api_key_set=bool(api_key),
@@ -271,39 +393,300 @@ def get_global_settings(home: Path = WEB_HOME) -> GlobalSettings:
         model=model,
         models=models,
         effort=effort,
-        updated_at=data.get("updated_at") or None,
+        updated_at=active_profile.get("updated_at") or data.get("updated_at") or None,
         config_path=str(settings_path(home)),
         applies_to=applies_to(provider, bool(api_key), base_url, model, effort),
+        providers=provider_summaries,
     )
 
 
 def update_global_settings(request: UpdateGlobalSettingsRequest, home: Path = WEB_HOME) -> GlobalSettings:
     current = _read_raw(home)
-    api_key = str(current.get("api_key") or "")
+    profiles = _profiles_from_raw(current)
+    provider = normalize_provider(request.provider)
+    profile = profiles.get(provider, _clean_profile({}, provider))
+    api_key = str(profile.get("api_key") or "")
     if request.clear_api_key:
         api_key = ""
     elif request.api_key is not None and request.api_key.strip():
         api_key = request.api_key.strip()
     model = request.model.strip() if request.model else None
-    models = clean_model_options(model, request.models if request.models is not None else current.get("models"))
-    data = {
-        "provider": request.provider,
+    models = clean_model_options(model, request.models if request.models is not None else profile.get("models"))
+    updated_at = utc_now()
+    profiles[provider] = {
+        "provider": provider,
         "api_key": api_key,
         "base_url": request.base_url.strip() if request.base_url else None,
         "model": model,
         "models": models,
         "effort": request.effort.strip() if request.effort else None,
-        "updated_at": utc_now(),
+        "updated_at": updated_at,
+    }
+    data = {
+        "provider": provider,
+        "api_key": api_key,
+        "base_url": request.base_url.strip() if request.base_url else None,
+        "model": model,
+        "models": models,
+        "effort": request.effort.strip() if request.effort else None,
+        "updated_at": updated_at,
+        "providers": profiles,
     }
     _write_raw(data, home)
     return get_global_settings(home)
 
 
+def validate_global_settings(request: UpdateGlobalSettingsRequest, home: Path = WEB_HOME) -> ValidateGlobalSettingsResponse:
+    current = _read_raw(home)
+    profiles = _profiles_from_raw(current)
+    provider = normalize_provider(request.provider)
+    profile = profiles.get(provider, _clean_profile({}, provider))
+    api_key = ""
+    if not request.clear_api_key:
+        api_key = (request.api_key or "").strip() or str(profile.get("api_key") or "").strip()
+    base_url = (request.base_url.strip() if request.base_url else "") or str(profile.get("base_url") or "").strip()
+    base_url = (base_url or DEFAULT_BASE_URLS.get(provider) or DEFAULT_BASE_URLS["openai"]).rstrip("/")
+    model = (request.model.strip() if request.model else "") or str(profile.get("model") or "").strip() or DEFAULT_MODELS.get(provider)
+    if not api_key:
+        return ValidateGlobalSettingsResponse(
+            ok=False,
+            provider=provider,  # type: ignore[arg-type]
+            endpoint=base_url,
+            model=model,
+            message="API key is required before validation.",
+        )
+
+    responses: list[ValidateGlobalSettingsResponse] = []
+    candidate_bases = _validation_base_candidates(provider, base_url)
+    for candidate_base in candidate_bases:
+        response = _validate_models_endpoint(provider, api_key, candidate_base, model)
+        if response.ok:
+            return response
+        responses.append(response)
+
+    if provider in {"openai", "gemini", "glm", "kimi", "custom"} and model:
+        for candidate_base in candidate_bases:
+            fallback = _validate_openai_chat_endpoint(provider, api_key, candidate_base, model)
+            if fallback.ok:
+                return fallback
+            responses.append(fallback)
+    if responses:
+        return responses[-1]
+    return ValidateGlobalSettingsResponse(
+        ok=False,
+        provider=provider,  # type: ignore[arg-type]
+        endpoint=base_url,
+        model=model,
+        message="Validation failed.",
+    )
+
+
+def _validate_models_endpoint(
+    provider: str,
+    api_key: str,
+    base_url: str,
+    model: str | None,
+) -> ValidateGlobalSettingsResponse:
+    url = _validation_models_url(provider, base_url)
+    headers = _validation_headers(provider, api_key)
+    try:
+        status_code, payload = _request_json("GET", url, headers=headers)
+    except urllib.error.HTTPError as exc:
+        return ValidateGlobalSettingsResponse(
+            ok=False,
+            provider=provider,  # type: ignore[arg-type]
+            endpoint=url,
+            model=model,
+            status_code=exc.code,
+            message=_http_error_message(exc),
+        )
+    except NonJsonResponseError as exc:
+        return ValidateGlobalSettingsResponse(
+            ok=False,
+            provider=provider,  # type: ignore[arg-type]
+            endpoint=url,
+            model=model,
+            status_code=exc.status_code,
+            message=_non_json_message(exc),
+        )
+    except Exception as exc:
+        return ValidateGlobalSettingsResponse(
+            ok=False,
+            provider=provider,  # type: ignore[arg-type]
+            endpoint=url,
+            model=model,
+            message=f"Connection failed: {exc}",
+        )
+    models = _extract_model_ids(payload)
+    model_message = f" Connected; {len(models)} model(s) returned." if models else " Connected."
+    if model and models and model not in models:
+        model_message += f" Warning: configured model `{model}` was not in the returned catalog."
+    return ValidateGlobalSettingsResponse(
+        ok=True,
+        provider=provider,  # type: ignore[arg-type]
+        endpoint=url,
+        model=model,
+        status_code=status_code,
+        message=model_message.strip(),
+        models=models[:50],
+        model_count=len(models),
+    )
+
+
+def _validate_openai_chat_endpoint(
+    provider: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+) -> ValidateGlobalSettingsResponse:
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+    }
+    try:
+        status_code, _payload = _request_json("POST", url, headers=_validation_headers(provider, api_key), body=body)
+    except urllib.error.HTTPError as exc:
+        return ValidateGlobalSettingsResponse(
+            ok=False,
+            provider=provider,  # type: ignore[arg-type]
+            endpoint=url,
+            model=model,
+            status_code=exc.code,
+            message=_http_error_message(exc),
+        )
+    except NonJsonResponseError as exc:
+        return ValidateGlobalSettingsResponse(
+            ok=False,
+            provider=provider,  # type: ignore[arg-type]
+            endpoint=url,
+            model=model,
+            status_code=exc.status_code,
+            message=_non_json_message(exc),
+        )
+    except Exception as exc:
+        return ValidateGlobalSettingsResponse(
+            ok=False,
+            provider=provider,  # type: ignore[arg-type]
+            endpoint=url,
+            model=model,
+            message=f"Connection failed: {exc}",
+        )
+    return ValidateGlobalSettingsResponse(
+        ok=True,
+        provider=provider,  # type: ignore[arg-type]
+        endpoint=url,
+        model=model,
+        status_code=status_code,
+        message="Connection verified with a minimal chat request. The model catalog endpoint was not available.",
+    )
+
+
+def _validation_base_candidates(provider: str, base_url: str) -> list[str]:
+    base = base_url.rstrip("/")
+    candidates = [base]
+    if provider in {"openai", "custom"} and not base.endswith("/v1"):
+        candidates.append(f"{base}/v1")
+    return candidates
+
+
+def _validation_models_url(provider: str, base_url: str) -> str:
+    base = base_url.rstrip("/")
+    if provider in {"anthropic", "minimax"}:
+        return f"{base}/models" if base.endswith("/v1") else f"{base}/v1/models"
+    return f"{base}/models"
+
+
+def _validation_headers(provider: str, api_key: str) -> dict[str, str]:
+    if provider in {"anthropic", "minimax"}:
+        return {
+            "anthropic-version": "2023-06-01",
+            "x-api-key": api_key,
+        }
+    return {"Authorization": f"Bearer {api_key}"}
+
+
+def _request_json(
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str],
+    body: dict[str, Any] | None = None,
+) -> tuple[int, Any]:
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    request = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            **headers,
+        },
+    )
+    context = ssl.create_default_context(cafile=certifi.where()) if certifi else None
+    with urllib.request.urlopen(request, timeout=15, context=context) as response:  # noqa: S310 - user-configured local console endpoint
+        raw = response.read().decode("utf-8", errors="replace")
+        if not raw.strip():
+            return response.status, {}
+        try:
+            return response.status, json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise NonJsonResponseError(response.status, response.headers.get("content-type"), raw[:500]) from exc
+
+
+def _extract_model_ids(payload: Any) -> list[str]:
+    items = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return []
+    result: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            value = item.get("id") or item.get("name")
+        else:
+            value = item
+        if isinstance(value, str) and value.strip():
+            result.append(value.strip())
+    return clean_model_options(result)
+
+
+def _http_error_message(exc: urllib.error.HTTPError) -> str:
+    try:
+        raw = exc.read().decode("utf-8", errors="replace")
+    except Exception:
+        raw = ""
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                error = parsed.get("error")
+                if isinstance(error, dict):
+                    message = error.get("message")
+                    if isinstance(message, str) and message.strip():
+                        return message.strip()
+                detail = parsed.get("detail") or parsed.get("message")
+                if isinstance(detail, str) and detail.strip():
+                    return detail.strip()
+        except json.JSONDecodeError:
+            return raw[:500]
+    return f"Validation request failed with HTTP {exc.code}."
+
+
+def _non_json_message(exc: NonJsonResponseError) -> str:
+    content_type = exc.content_type or "unknown content type"
+    return (
+        f"Validation endpoint returned non-JSON content ({content_type}). "
+        "Check that Base URL points to the API root, for example including /v1 when required."
+    )
+
+
 def _read_secret_settings(home: Path = WEB_HOME) -> dict[str, object]:
     data = _read_raw(home)
-    if not data.get("api_key"):
+    _provider, profile = _active_profile(data)
+    if not profile.get("api_key"):
         return {}
-    return data
+    return profile
 
 
 def _clear_managed_env(env: dict[str, str]) -> None:
@@ -313,31 +696,38 @@ def _clear_managed_env(env: dict[str, str]) -> None:
 
 def effective_model_override(home: Path = WEB_HOME) -> str | None:
     raw = _read_raw(home)
-    if not raw or not str(raw.get("api_key") or "").strip():
+    if not raw:
         return None
-    provider = str(raw.get("provider") or "anthropic")
-    model = str(raw.get("model") or "").strip()
+    provider, profile = _active_profile(raw)
+    if not str(profile.get("api_key") or "").strip():
+        return None
+    model = str(profile.get("model") or "").strip()
     if model:
         return model
     return DEFAULT_MODELS.get(provider)
 
 
-def effective_effort_override(home: Path = WEB_HOME) -> str | None:
+def effective_effort_override(home: Path = WEB_HOME, model: str | None = None) -> str | None:
     raw = _read_raw(home)
-    if not raw or not str(raw.get("api_key") or "").strip():
+    if not raw:
         return None
-    return str(raw.get("effort") or "").strip() or None
+    _provider, profile = _profile_for_model(raw, model)
+    if not str(profile.get("api_key") or "").strip():
+        return None
+    return str(profile.get("effort") or "").strip() or None
 
 
 def openai_compatible_settings(home: Path = WEB_HOME) -> dict[str, str] | None:
     raw = _read_raw(home)
-    api_key = str(raw.get("api_key") or "").strip()
-    if not raw or not api_key:
+    if not raw:
         return None
-    provider = str(raw.get("provider") or "anthropic")
+    provider, profile = _active_profile(raw)
+    api_key = str(profile.get("api_key") or "").strip()
+    if not api_key:
+        return None
     if provider not in {"openai", "gemini", "glm", "minimax", "kimi", "custom"}:
         return None
-    base_url = str(raw.get("base_url") or "").strip() or DEFAULT_BASE_URLS.get(provider)
+    base_url = str(profile.get("base_url") or "").strip() or DEFAULT_BASE_URLS.get(provider)
     model = effective_model_override(home)
     if not base_url or not model:
         return None
@@ -348,11 +738,15 @@ def openai_compatible_settings(home: Path = WEB_HOME) -> dict[str, str] | None:
         "api_key": api_key,
         "base_url": base_url.rstrip("/"),
         "model": model,
-        "effort": str(raw.get("effort") or "").strip(),
+        "effort": str(profile.get("effort") or "").strip(),
     }
 
 
-def build_runtime_env(base_env: dict[str, str] | None = None, home: Path = WEB_HOME) -> dict[str, str]:
+def build_runtime_env(
+    base_env: dict[str, str] | None = None,
+    home: Path = WEB_HOME,
+    model: str | None = None,
+) -> dict[str, str]:
     env = dict(base_env if base_env is not None else os.environ)
     _prepend_local_bin(env)
     raw = _read_raw(home)
@@ -360,11 +754,11 @@ def build_runtime_env(base_env: dict[str, str] | None = None, home: Path = WEB_H
         return env
     _clear_managed_env(env)
 
-    provider = raw.get("provider") or "anthropic"
-    api_key = str(raw.get("api_key") or "").strip()
-    base_url = str(raw.get("base_url") or "").strip()
-    model = str(raw.get("model") or "").strip()
-    effort = str(raw.get("effort") or "").strip()
+    provider, profile = _profile_for_model(raw, model)
+    api_key = str(profile.get("api_key") or "").strip()
+    base_url = str(profile.get("base_url") or "").strip()
+    configured_model = str(profile.get("model") or "").strip()
+    effort = str(profile.get("effort") or "").strip()
     if not api_key:
         return env
     env.setdefault("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS", DEFAULT_AUTO_COMPACT_INPUT_TOKENS)
@@ -397,7 +791,7 @@ def build_runtime_env(base_env: dict[str, str] | None = None, home: Path = WEB_H
         if base_url:
             env["EXECUTOR_BASE_URL"] = base_url
 
-    effective_model = model or DEFAULT_MODELS.get(str(provider))
+    effective_model = str(model or "").strip() or configured_model or DEFAULT_MODELS.get(str(provider))
     if effective_model:
         env["ARIS_REVIEWER_MODEL"] = effective_model
     if effort:

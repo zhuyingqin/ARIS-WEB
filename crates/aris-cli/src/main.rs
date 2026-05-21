@@ -3698,7 +3698,9 @@ fn build_event_sink(
     if level == runtime::MetaLoggingLevel::Off {
         return Box::new(runtime::NoopEventSink);
     }
-    let path = runtime::JsonlEventSink::default_path();
+    let path = std::env::var("ARIS_META_LOG_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| runtime::JsonlEventSink::default_path());
     let session_id = std::env::var("ARIS_SESSION_ID").unwrap_or_default();
     Box::new(runtime::JsonlEventSink::new(path, level, session_id))
 }

@@ -157,6 +157,19 @@ export type TeamConfigPayload = {
 
 export type GlobalApiProvider = "anthropic" | "openai" | "gemini" | "glm" | "minimax" | "kimi" | "custom"
 
+export type GlobalProviderSettings = {
+  provider: GlobalApiProvider
+  active: boolean
+  api_key_set: boolean
+  api_key_masked?: string | null
+  base_url?: string | null
+  model?: string | null
+  models?: string[]
+  effort?: string | null
+  updated_at?: string | null
+  applies_to: string[]
+}
+
 export type GlobalSettings = {
   provider: GlobalApiProvider
   api_key_set: boolean
@@ -168,6 +181,7 @@ export type GlobalSettings = {
   updated_at?: string | null
   config_path: string
   applies_to: string[]
+  providers: GlobalProviderSettings[]
 }
 
 export type UpdateGlobalSettingsPayload = {
@@ -178,6 +192,17 @@ export type UpdateGlobalSettingsPayload = {
   model?: string | null
   models?: string[]
   effort?: string | null
+}
+
+export type ValidateSettingsResponse = {
+  ok: boolean
+  provider: GlobalApiProvider
+  endpoint?: string | null
+  model?: string | null
+  message: string
+  status_code?: number | null
+  models: string[]
+  model_count: number
 }
 
 export type WorkflowStatus = "draft" | "running" | "paused" | "succeeded" | "failed" | "cancelled"
