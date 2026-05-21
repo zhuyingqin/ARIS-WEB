@@ -557,7 +557,6 @@ function workflowEventMatchesFilter(event: WorkflowEvent, filter: WorkflowEventF
 
 function organizeWorkflowPositions(workflow: WorkflowRecord, expandedFanoutGroups: Set<string> = new Set()) {
   const order = workflowNodeOrder(workflow)
-  const orderIndex = new Map(order.map((id, index) => [id, index]))
   const nodeMap = new Map(workflow.graph_json.nodes.map((node) => [node.id, node]))
   const stackCandidates = new Map<string, WorkflowNodeInfo[]>()
 
@@ -610,7 +609,7 @@ function organizeWorkflowPositions(workflow: WorkflowRecord, expandedFanoutGroup
 
   for (const id of unitOrder) {
     const deps = Array.from(depsByUnit.get(id) ?? [])
-    const layer = deps.reduce((max, dep) => Math.max(max, (layerById.get(dep) ?? 0) + 1), 0)
+    const layer = deps.reduce((max, dep) => Math.max(max, (layerByUnit.get(dep) ?? 0) + 1), 0)
     layerByUnit.set(id, layer)
   }
 
@@ -1621,7 +1620,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
 
   function organizeWorkflow() {
     updateDraft((workflow) => {
-      organizeWorkflowPositions(workflow)
+      organizeWorkflowPositions(workflow, expandedFanoutGroups)
     })
     window.setTimeout(() => {
       flowInstanceRef.current?.fitView({ padding: 0.16, duration: 320 })
