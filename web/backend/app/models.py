@@ -705,6 +705,7 @@ class RefineWorkflowRequest(BaseModel):
 class OptimizeNodePromptRequest(BaseModel):
     graph_json: WorkflowGraph | None = None
     instructions: str | None = None
+    model: str | None = None
 
 
 class OptimizeNodePromptResponse(BaseModel):

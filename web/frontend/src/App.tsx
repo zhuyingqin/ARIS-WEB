@@ -63,7 +63,6 @@ import type {
   RunOutput,
   RunRecord,
   SkillInfo,
-  WorkflowDeltaRecord,
   WorkflowEvent,
   WorkflowGate,
   WorkflowHandoff,
@@ -101,14 +100,29 @@ const workflowEventFilterOptions: { value: WorkflowEventFilter; label: string }[
   { value: "errors", label: "Errors" },
 ]
 
-const WORKFLOW_EVENT_LIMIT = 5000
+const WORKFLOW_EVENT_LIMIT = 800
+const WORKFLOW_REPLAY_LIMIT = 600
+const NODE_EVENT_LIMIT = 400
+const NODE_REPLAY_LIMIT = 300
+const EVENT_FLUSH_INTERVAL_MS = 80
+
+function appendLimited<T>(current: T[], incoming: T[], limit: number) {
+  return [...current, ...incoming].slice(-limit)
+}
+
+function isRecentEvent(timestamp: string, windowMs = 45000) {
+  const eventTime = Date.parse(timestamp)
+  if (!Number.isFinite(eventTime)) return true
+  const ageMs = Date.now() - eventTime
+  return ageMs > -5000 && ageMs < windowMs
+}
 
 function statusClass(status: string) {
   return `status status-${status}`
 }
 
 function isLiveWorkflowStatus(status?: string | null) {
-  return status === "running" || status === "paused"
+  return status === "running"
 }
 
 function executionStateLabel(state?: string | null) {
@@ -541,36 +555,78 @@ function workflowEventMatchesFilter(event: WorkflowEvent, filter: WorkflowEventF
   return true
 }
 
-function organizeWorkflowPositions(workflow: WorkflowRecord) {
+function organizeWorkflowPositions(workflow: WorkflowRecord, expandedFanoutGroups: Set<string> = new Set()) {
   const order = workflowNodeOrder(workflow)
   const orderIndex = new Map(order.map((id, index) => [id, index]))
   const nodeMap = new Map(workflow.graph_json.nodes.map((node) => [node.id, node]))
-  const layerById = new Map<string, number>()
+  const stackCandidates = new Map<string, WorkflowNodeInfo[]>()
+
+  for (const node of workflow.graph_json.nodes) {
+    const key = fanoutStackKey(node)
+    if (!key || expandedFanoutGroups.has(key)) continue
+    stackCandidates.set(key, [...(stackCandidates.get(key) ?? []), node])
+  }
+
+  const collapsedStackKeys = new Set(
+    Array.from(stackCandidates.entries())
+      .filter(([, nodes]) => nodes.length >= FANOUT_STACK_MIN_SIZE)
+      .map(([key]) => key),
+  )
+  const unitForNode = (node: WorkflowNodeInfo) => {
+    const key = fanoutStackKey(node)
+    return key && collapsedStackKeys.has(key) ? fanoutStackNodeId(key) : node.id
+  }
+  const unitMembers = new Map<string, WorkflowNodeInfo[]>()
+  const nodeUnitById = new Map<string, string>()
 
   for (const id of order) {
     const node = nodeMap.get(id)
     if (!node) continue
-    const deps = [
-      ...node.depends_on,
-      ...workflow.graph_json.edges.filter((edge) => edge.target === id).map((edge) => edge.source),
-    ].filter((dep) => nodeMap.has(dep))
+    const unit = unitForNode(node)
+    nodeUnitById.set(id, unit)
+    unitMembers.set(unit, [...(unitMembers.get(unit) ?? []), node])
+  }
+
+  const unitOrder = Array.from(unitMembers.keys())
+  const unitOrderIndex = new Map(unitOrder.map((id, index) => [id, index]))
+  const depsByUnit = new Map<string, Set<string>>()
+
+  for (const [unit, members] of unitMembers) {
+    const deps = depsByUnit.get(unit) ?? new Set<string>()
+    for (const node of members) {
+      const rawDeps = [
+        ...node.depends_on,
+        ...workflow.graph_json.edges.filter((edge) => edge.target === node.id).map((edge) => edge.source),
+      ]
+      for (const dep of rawDeps) {
+        const depUnit = nodeUnitById.get(dep)
+        if (depUnit && depUnit !== unit) deps.add(depUnit)
+      }
+    }
+    depsByUnit.set(unit, deps)
+  }
+
+  const layerByUnit = new Map<string, number>()
+
+  for (const id of unitOrder) {
+    const deps = Array.from(depsByUnit.get(id) ?? [])
     const layer = deps.reduce((max, dep) => Math.max(max, (layerById.get(dep) ?? 0) + 1), 0)
-    layerById.set(id, layer)
+    layerByUnit.set(id, layer)
   }
 
   const rowsByLayer = new Map<number, string[]>()
-  for (const id of order) {
-    const layer = layerById.get(id) ?? 0
+  for (const id of unitOrder) {
+    const layer = layerByUnit.get(id) ?? 0
     rowsByLayer.set(layer, [...(rowsByLayer.get(layer) ?? []), id])
   }
 
   for (const ids of rowsByLayer.values()) {
-    ids.sort((a, b) => (orderIndex.get(a) ?? 0) - (orderIndex.get(b) ?? 0))
+    ids.sort((a, b) => (unitOrderIndex.get(a) ?? 0) - (unitOrderIndex.get(b) ?? 0))
   }
 
   const layerCount = Math.max(...Array.from(rowsByLayer.keys()), 0) + 1
   const maxRowsInLayer = Math.max(...Array.from(rowsByLayer.values()).map((ids) => ids.length), 1)
-  const nodeCount = workflow.graph_json.nodes.length
+  const nodeCount = unitMembers.size
   const columnsPerBand = Math.min(layerCount, Math.min(5, Math.max(3, Math.ceil(Math.sqrt(nodeCount * 1.7)))))
   const xGap = layerCount > columnsPerBand ? 260 : 300
   const yGap = maxRowsInLayer > 2 ? 126 : 148
@@ -578,19 +634,37 @@ function organizeWorkflowPositions(workflow: WorkflowRecord) {
   const originX = 96
   const originY = 96
 
-  workflow.graph_json.nodes = workflow.graph_json.nodes.map((node) => {
-    const layer = layerById.get(node.id) ?? 0
-    const row = rowsByLayer.get(layer)?.indexOf(node.id) ?? 0
+  const positionByUnit = new Map<string, { x: number; y: number }>()
+  for (const unit of unitOrder) {
+    const layer = layerByUnit.get(unit) ?? 0
+    const row = rowsByLayer.get(layer)?.indexOf(unit) ?? 0
     const band = Math.floor(layer / columnsPerBand)
     const columnInBand = layer % columnsPerBand
     const visualColumn = band % 2 === 0 ? columnInBand : columnsPerBand - 1 - columnInBand
     const idsInLayer = rowsByLayer.get(layer) ?? []
     const verticalInset = ((maxRowsInLayer - idsInLayer.length) * yGap) / 2
+    positionByUnit.set(unit, {
+      x: originX + visualColumn * xGap,
+      y: originY + band * bandHeight + verticalInset + row * yGap,
+    })
+  }
+
+  workflow.graph_json.nodes = workflow.graph_json.nodes.map((node) => {
+    const unit = nodeUnitById.get(node.id) ?? node.id
+    const base = positionByUnit.get(unit) ?? { x: originX, y: originY }
+    const members = unitMembers.get(unit) ?? [node]
+    const memberIndex = members.findIndex((member) => member.id === node.id)
+    const compactOffset = collapsedStackKeys.has(fanoutStackKey(node) ?? "")
+      ? {
+          x: Math.min(memberIndex, 3) * 10,
+          y: Math.min(memberIndex, 3) * 10,
+        }
+      : { x: 0, y: 0 }
     return {
       ...node,
       position: {
-        x: originX + visualColumn * xGap,
-        y: originY + band * bandHeight + verticalInset + row * yGap,
+        x: base.x + compactOffset.x,
+        y: base.y + compactOffset.y,
       },
     }
   })
@@ -600,6 +674,54 @@ function nodeKindLabel(node: WorkflowNodeInfo) {
   if (node.type === "human_gate") return "Gate"
   if (node.skill === "research-lit" && node.dynamic_parent_id) return "Research"
   return "Agent"
+}
+
+const FANOUT_STACK_MIN_SIZE = 3
+const FANOUT_STACK_NODE_PREFIX = "fanout-stack:"
+const STACK_EDGE_PREFIX = "stack-edge:"
+
+type FanoutStackGroup = {
+  key: string
+  parentId: string
+  parent?: WorkflowNodeInfo
+  nodes: WorkflowNodeInfo[]
+}
+
+function fanoutStackKey(node: WorkflowNodeInfo) {
+  if (node.fanout_parent_id) return `fanout:${node.fanout_parent_id}`
+  if (node.dynamic_parent_id && node.type !== "human_gate") return `dynamic:${node.dynamic_parent_id}`
+  return null
+}
+
+function fanoutStackNodeId(key: string) {
+  return `${FANOUT_STACK_NODE_PREFIX}${key}`
+}
+
+function isFanoutStackNodeId(id: string) {
+  return id.startsWith(FANOUT_STACK_NODE_PREFIX)
+}
+
+function isStackEdgeId(id: string) {
+  return id.startsWith(STACK_EDGE_PREFIX)
+}
+
+function statusSummary(nodes: WorkflowNodeInfo[]) {
+  const order: WorkflowNodeInfo["status"][] = [
+    "failed",
+    "running",
+    "waiting_approval",
+    "waiting_dynamic_dependency",
+    "blocked",
+    "queued",
+    "succeeded",
+    "skipped",
+    "cancelled",
+  ]
+  const counts = new Map<WorkflowNodeInfo["status"], number>()
+  nodes.forEach((node) => counts.set(node.status, (counts.get(node.status) ?? 0) + 1))
+  return order
+    .map((status) => ({ status, count: counts.get(status) ?? 0 }))
+    .filter((item) => item.count > 0)
 }
 
 type WorkflowFlowNodeData = {
@@ -652,6 +774,7 @@ function WorkflowHandoffEdge({
     targetPosition,
   })
   const label = typeof data?.label === "string" ? data.label : ""
+  const canOpen = Boolean(data?.onOpen)
   const handleOpen = (event: ReactMouseEvent<HTMLButtonElement>) => {
     event.preventDefault()
     event.stopPropagation()
@@ -670,16 +793,25 @@ function WorkflowHandoffEdge({
       />
       {label && (
         <EdgeLabelRenderer>
-          <button
-            aria-label={`${label}. View handoff preview.`}
-            className={`nodrag nopan flow-edge-label-button${selected ? " flow-edge-label-button-selected" : ""}`}
-            onClick={handleOpen}
-            style={{ transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)` }}
-            title="View handoff preview"
-            type="button"
-          >
-            {label}
-          </button>
+          {canOpen ? (
+            <button
+              aria-label={`${label}. View handoff preview.`}
+              className={`nodrag nopan flow-edge-label-button${selected ? " flow-edge-label-button-selected" : ""}`}
+              onClick={handleOpen}
+              style={{ transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)` }}
+              title="View handoff preview"
+              type="button"
+            >
+              {label}
+            </button>
+          ) : (
+            <span
+              className="nodrag nopan flow-edge-label-button flow-edge-label-static"
+              style={{ transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)` }}
+            >
+              {label}
+            </span>
+          )}
         </EdgeLabelRenderer>
       )}
     </>
@@ -742,7 +874,15 @@ function NodeResultPanel({ workflow, node }: { workflow: WorkflowRecord; node: W
   const queryClient = useQueryClient()
   const [nodeEvents, setNodeEvents] = useState<WorkflowEvent[]>([])
   const nodeEventLogRef = useAutoScrollToEnd<HTMLDivElement>([nodeEvents.length, node.id])
+  const outputRefreshTimerRef = useRef<number | null>(null)
   const runId = node.run_id ?? ""
+  const scheduleOutputRefresh = useCallback(() => {
+    if (!runId || outputRefreshTimerRef.current !== null) return
+    outputRefreshTimerRef.current = window.setTimeout(() => {
+      outputRefreshTimerRef.current = null
+      queryClient.invalidateQueries({ queryKey: ["run-output", workflow.workspace, runId] })
+    }, 500)
+  }, [queryClient, runId, workflow.workspace])
   const outputQuery = useQuery({
     queryKey: ["run-output", workflow.workspace, runId],
     queryFn: () => api.runOutput(workflow.workspace, runId),
@@ -756,16 +896,38 @@ function NodeResultPanel({ workflow, node }: { workflow: WorkflowRecord; node: W
 
   useEffect(() => {
     setNodeEvents([])
-    const socket = new WebSocket(api.workflowNodeStreamUrl(workflow, node.id))
+    const socket = new WebSocket(api.workflowNodeStreamUrl(workflow, node.id, NODE_REPLAY_LIMIT))
+    const pendingEvents: WorkflowEvent[] = []
+    let flushTimer: number | null = null
+    let active = true
+    const flushEvents = () => {
+      flushTimer = null
+      if (!active || pendingEvents.length === 0) return
+      const nextEvents = pendingEvents.splice(0, pendingEvents.length)
+      setNodeEvents((current) => appendLimited(current, nextEvents, NODE_EVENT_LIMIT))
+    }
     socket.onmessage = (message) => {
       const event = JSON.parse(message.data) as WorkflowEvent
-      setNodeEvents((current) => [...current, event].slice(-1000))
-      if (runId && ["node", "run", "result"].includes(event.event_type)) {
-        queryClient.invalidateQueries({ queryKey: ["run-output", workflow.workspace, runId] })
+      pendingEvents.push(event)
+      if (flushTimer === null) {
+        flushTimer = window.setTimeout(flushEvents, EVENT_FLUSH_INTERVAL_MS)
+      }
+      if (runId && isRecentEvent(event.timestamp) && ["node", "run", "result"].includes(event.event_type)) {
+        scheduleOutputRefresh()
       }
     }
-    return () => socket.close()
-  }, [node.id, queryClient, runId, workflow.id, workflow.workspace])
+    return () => {
+      active = false
+      if (flushTimer !== null) window.clearTimeout(flushTimer)
+      socket.close()
+    }
+  }, [node.id, runId, scheduleOutputRefresh, workflow.id, workflow.workspace])
+
+  useEffect(() => {
+    return () => {
+      if (outputRefreshTimerRef.current !== null) window.clearTimeout(outputRefreshTimerRef.current)
+    }
+  }, [])
 
   return (
     <div className="node-result-panel">
@@ -1056,6 +1218,8 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
   const [flowPanelCollapsed, setFlowPanelCollapsed] = useState(false)
   const [generatorCollapsed, setGeneratorCollapsed] = useState(true)
   const [canvasToolsCollapsed, setCanvasToolsCollapsed] = useState(true)
+  const [expandedFanoutGroups, setExpandedFanoutGroups] = useState<Set<string>>(() => new Set())
+  const [fanoutStackPositions, setFanoutStackPositions] = useState<Record<string, { x: number; y: number }>>({})
   const [selectedNodeId, setSelectedNodeId] = useState("")
   const [selectedEdgeId, setSelectedEdgeId] = useState("")
   const [promptOptimizationNote, setPromptOptimizationNote] = useState("")
@@ -1068,6 +1232,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
   const flowInstanceRef = useRef<ReactFlowInstance<Node, WorkflowCanvasEdge> | null>(null)
   const workflowRefreshTimerRef = useRef<number | null>(null)
   const artifactRefreshTimerRef = useRef<number | null>(null)
+  const runtimeRefreshTimerRef = useRef<number | null>(null)
   const [canvasNodes, setCanvasNodes] = useState<Node[]>([])
   const workflows = useQuery({
     queryKey: ["workflows", workspace],
@@ -1088,24 +1253,6 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
     enabled: Boolean(workspace),
     refetchInterval: isLiveWorkflowStatus(draft?.status) ? 5000 : false,
   })
-  const nodesWithRuns = useMemo(() => (draft?.graph_json.nodes ?? []).filter((node) => Boolean(node.run_id)), [draft?.graph_json.nodes])
-  const nodeOutputQueries = useQueries({
-    queries: nodesWithRuns.map((node) => ({
-      queryKey: ["run-output", workspace, node.run_id],
-      queryFn: () => api.runOutput(workspace, node.run_id as string),
-      enabled: Boolean(workspace && node.run_id),
-      staleTime: 5000,
-    })),
-  })
-  const nodeOutputSignature = nodeOutputQueries.map((query) => query.dataUpdatedAt).join(":")
-  const runOutputByRunId = useMemo(() => {
-    const next = new Map<string, RunOutput>()
-    nodesWithRuns.forEach((node, index) => {
-      const data = nodeOutputQueries[index]?.data
-      if (node.run_id && data) next.set(node.run_id, data)
-    })
-    return next
-  }, [nodeOutputSignature, nodesWithRuns])
   const selected = (workflows.data ?? []).find((workflow) => workflow.id === selectedId) ?? workflows.data?.[0]
   const artifactsByPath = useMemo(() => artifactByPath(workspaceArtifacts.data), [workspaceArtifacts.data])
   const runtime = useQuery<WorkflowRuntimeResponse>({
@@ -1113,18 +1260,6 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
     queryFn: () => api.workflowRuntime(selected as WorkflowRecord),
     enabled: Boolean(selected),
     refetchInterval: isLiveWorkflowStatus(selected?.status) ? 5000 : false,
-  })
-  const decisions = useQuery({
-    queryKey: ["workflow-decisions", selected?.id],
-    queryFn: () => api.workflowDecisions(selected as WorkflowRecord),
-    enabled: Boolean(selected),
-    refetchInterval: isLiveWorkflowStatus(selected?.status) ? 7000 : false,
-  })
-  const deltas = useQuery({
-    queryKey: ["workflow-deltas", selected?.id],
-    queryFn: () => api.workflowDeltas(selected as WorkflowRecord),
-    enabled: Boolean(selected),
-    refetchInterval: isLiveWorkflowStatus(selected?.status) ? 7000 : false,
   })
 
   const scheduleWorkflowRefresh = useCallback(() => {
@@ -1142,6 +1277,14 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
       queryClient.invalidateQueries({ queryKey: ["artifacts", workspace] })
     }, 1800)
   }, [queryClient, workspace])
+
+  const scheduleRuntimeRefresh = useCallback((workflowId: string) => {
+    if (runtimeRefreshTimerRef.current !== null) return
+    runtimeRefreshTimerRef.current = window.setTimeout(() => {
+      runtimeRefreshTimerRef.current = null
+      queryClient.invalidateQueries({ queryKey: ["workflow-runtime", workflowId] })
+    }, 900)
+  }, [queryClient])
 
   useEffect(() => {
     if (!selectedId && workflows.data?.[0]) setSelectedId(workflows.data[0].id)
@@ -1177,25 +1320,40 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
   useEffect(() => {
     setEvents([])
     if (!selected) return
-    const socket = new WebSocket(api.workflowStreamUrl(selected))
+    const socket = new WebSocket(api.workflowStreamUrl(selected, WORKFLOW_REPLAY_LIMIT))
+    const pendingEvents: WorkflowEvent[] = []
+    let flushTimer: number | null = null
+    let active = true
+    const flushEvents = () => {
+      flushTimer = null
+      if (!active || pendingEvents.length === 0) return
+      const nextEvents = pendingEvents.splice(0, pendingEvents.length)
+      setEvents((current) => appendLimited(current, nextEvents, WORKFLOW_EVENT_LIMIT))
+    }
     socket.onmessage = (message) => {
       const event = JSON.parse(message.data) as WorkflowEvent
-      setEvents((current) => [...current, event].slice(-WORKFLOW_EVENT_LIMIT))
-      if (["workflow", "node", "planner", "delta", "session", "approval"].includes(event.event_type)) {
+      pendingEvents.push(event)
+      if (flushTimer === null) {
+        flushTimer = window.setTimeout(flushEvents, EVENT_FLUSH_INTERVAL_MS)
+      }
+      if (isRecentEvent(event.timestamp) && ["workflow", "node", "planner", "delta", "session", "approval"].includes(event.event_type)) {
         scheduleWorkflowRefresh()
         scheduleArtifactRefresh()
-        queryClient.invalidateQueries({ queryKey: ["workflow-runtime", selected.id] })
-        queryClient.invalidateQueries({ queryKey: ["workflow-decisions", selected.id] })
-        queryClient.invalidateQueries({ queryKey: ["workflow-deltas", selected.id] })
+        scheduleRuntimeRefresh(selected.id)
       }
     }
-    return () => socket.close()
-  }, [queryClient, scheduleArtifactRefresh, scheduleWorkflowRefresh, selected?.id, selected?.workspace, workspace])
+    return () => {
+      active = false
+      if (flushTimer !== null) window.clearTimeout(flushTimer)
+      socket.close()
+    }
+  }, [scheduleArtifactRefresh, scheduleRuntimeRefresh, scheduleWorkflowRefresh, selected?.id, selected?.workspace, workspace])
 
   useEffect(() => {
     return () => {
       if (workflowRefreshTimerRef.current !== null) window.clearTimeout(workflowRefreshTimerRef.current)
       if (artifactRefreshTimerRef.current !== null) window.clearTimeout(artifactRefreshTimerRef.current)
+      if (runtimeRefreshTimerRef.current !== null) window.clearTimeout(runtimeRefreshTimerRef.current)
     }
   }, [])
 
@@ -1269,8 +1427,6 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
       setSelectedEdgeId("")
       setEvents([])
       queryClient.removeQueries({ queryKey: ["workflow-runtime", workflow.id] })
-      queryClient.removeQueries({ queryKey: ["workflow-decisions", workflow.id] })
-      queryClient.removeQueries({ queryKey: ["workflow-deltas", workflow.id] })
     },
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: ["workflows", workspace] })
@@ -1331,11 +1487,20 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
       setDraft(cloneWorkflow(workflow))
     },
   })
+  const restoreNode = useMutation({
+    mutationFn: ({ workflow, nodeId }: { workflow: WorkflowRecord; nodeId: string }) =>
+      api.restoreWorkflowNode(workflow, nodeId),
+    onSuccess: (workflow) => {
+      queryClient.invalidateQueries({ queryKey: ["workflows", workspace] })
+      setDraft(cloneWorkflow(workflow))
+    },
+  })
   const optimizeNodePrompt = useMutation({
-    mutationFn: ({ workflow, nodeId, instructions }: { workflow: WorkflowRecord; nodeId: string; instructions: string }) =>
+    mutationFn: ({ workflow, nodeId, instructions, model }: { workflow: WorkflowRecord; nodeId: string; instructions: string; model?: string | null }) =>
       api.optimizeWorkflowNodePrompt(workflow, nodeId, {
         graph_json: workflow.graph_json,
         instructions: instructions.trim() || null,
+        model: model?.trim() || null,
       }),
     onSuccess: (response, variables) => {
       setPromptSuggestion({ nodeId: variables.nodeId, prompt: response.prompt })
@@ -1477,6 +1642,110 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
     setSelectedEdgeId(edgeId)
     setSelectedNodeId("")
   }, [])
+  const fanoutStackGroups = useMemo<FanoutStackGroup[]>(() => {
+    const nodes = draft?.graph_json.nodes ?? []
+    const nodeMap = new Map(nodes.map((node) => [node.id, node]))
+    const groups = new Map<string, FanoutStackGroup>()
+    for (const node of nodes) {
+      const key = fanoutStackKey(node)
+      if (!key) continue
+      const parentId = node.fanout_parent_id ?? node.dynamic_parent_id ?? key
+      const group = groups.get(key) ?? {
+        key,
+        parentId,
+        parent: nodeMap.get(parentId),
+        nodes: [],
+      }
+      group.nodes.push(node)
+      groups.set(key, group)
+    }
+    return Array.from(groups.values())
+      .filter((group) => group.nodes.length >= FANOUT_STACK_MIN_SIZE)
+      .map((group) => ({
+        ...group,
+        nodes: [...group.nodes].sort((a, b) => a.name.localeCompare(b.name)),
+      }))
+  }, [draft])
+  useEffect(() => {
+    setExpandedFanoutGroups((current) => {
+      if (!current.size) return current
+      const validKeys = new Set(fanoutStackGroups.map((group) => group.key))
+      const next = new Set(Array.from(current).filter((key) => validKeys.has(key)))
+      return next.size === current.size ? current : next
+    })
+  }, [fanoutStackGroups])
+  useEffect(() => {
+    setFanoutStackPositions((current) => {
+      const validKeys = new Set<string>()
+      fanoutStackGroups.forEach((group) => {
+        validKeys.add(group.key)
+        validKeys.add(`${group.key}:expanded-control`)
+      })
+      const entries = Object.entries(current).filter(([key]) => validKeys.has(key))
+      return entries.length === Object.keys(current).length ? current : Object.fromEntries(entries)
+    })
+  }, [fanoutStackGroups])
+  const expandFanoutGroup = useCallback((key: string) => {
+    setExpandedFanoutGroups((current) => {
+      if (current.has(key)) return current
+      const next = new Set(current)
+      next.add(key)
+      return next
+    })
+  }, [])
+  const collapseFanoutGroup = useCallback((key: string) => {
+    setExpandedFanoutGroups((current) => {
+      if (!current.has(key)) return current
+      const next = new Set(current)
+      next.delete(key)
+      return next
+    })
+  }, [])
+  const stackableFanoutGroupByNodeId = useMemo(() => {
+    const next = new Map<string, FanoutStackGroup>()
+    for (const group of fanoutStackGroups) {
+      group.nodes.forEach((node) => next.set(node.id, group))
+    }
+    return next
+  }, [fanoutStackGroups])
+  const collapsedFanoutGroups = useMemo(
+    () => fanoutStackGroups.filter((group) => !expandedFanoutGroups.has(group.key)),
+    [expandedFanoutGroups, fanoutStackGroups],
+  )
+  const collapsedNodeToStackId = useMemo(() => {
+    const next = new Map<string, string>()
+    for (const group of collapsedFanoutGroups) {
+      const stackId = fanoutStackNodeId(group.key)
+      group.nodes.forEach((node) => next.set(node.id, stackId))
+    }
+    return next
+  }, [collapsedFanoutGroups])
+  const collapsedNodeIds = useMemo(() => new Set(collapsedNodeToStackId.keys()), [collapsedNodeToStackId])
+  const nodesWithRuns = useMemo(
+    () =>
+      (draft?.graph_json.nodes ?? []).filter(
+        (node) => Boolean(node.run_id) && (!collapsedNodeIds.has(node.id) || node.id === selectedNodeId),
+      ),
+    [collapsedNodeIds, draft?.graph_json.nodes, selectedNodeId],
+  )
+  const nodeOutputQueries = useQueries({
+    queries: nodesWithRuns.map((node) => ({
+      queryKey: ["run-output", workspace, node.run_id],
+      queryFn: () => api.runOutput(workspace, node.run_id as string),
+      enabled: Boolean(workspace && node.run_id),
+      staleTime: 30000,
+      refetchOnWindowFocus: false,
+    })),
+  })
+  const nodeOutputSignature = nodeOutputQueries.map((query) => query.dataUpdatedAt).join(":")
+  const runOutputByRunId = useMemo(() => {
+    const next = new Map<string, RunOutput>()
+    nodesWithRuns.forEach((node, index) => {
+      const data = nodeOutputQueries[index]?.data
+      if (node.run_id && data) next.set(node.run_id, data)
+    })
+    return next
+  }, [nodeOutputSignature, nodesWithRuns])
   const selectedRuntimeSessionId = draft && selectedNode ? `node:${draft.id}:${selectedNode.id}` : runtime.data?.runtime_summary.planner_session_id
   const selectedSession = useQuery({
     queryKey: ["workflow-session", selected?.id, selectedRuntimeSessionId],
@@ -1547,20 +1816,6 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
     ).length ?? 0
   const runtimeSummary = runtime.data?.runtime_summary
   const executionState = runtimeSummary?.execution_state ?? draft?.status ?? "idle"
-  const executionAction = runtimeSummary?.next_action || "Runtime state has not been recorded yet."
-  const executionLastEvent = runtimeSummary?.last_event_at ? runtimeSummary.last_event_at.slice(11, 19) : "no events"
-  const activeNodeIds = runtimeSummary?.active_node_ids ?? []
-  const waitingApprovalIds = runtimeSummary?.waiting_approval_node_ids ?? []
-  const waitingLiteratureIds = runtimeSummary?.waiting_dynamic_dependency_node_ids ?? []
-  const readyNodeIds = runtimeSummary?.ready_node_ids ?? []
-  const latestDecision =
-    runtime.data?.latest_decision ?? (decisions.data?.length ? decisions.data[decisions.data.length - 1] : null)
-  const recentDecisionCards = useMemo(() => [...(decisions.data ?? [])].slice(-4).reverse(), [decisions.data])
-  const recentDeltaCards = useMemo(() => [...(deltas.data ?? [])].slice(-5).reverse(), [deltas.data])
-  const recentRuntimeEvents = useMemo(
-    () => events.filter((event) => ["planner", "delta", "session", "approval"].includes(event.event_type)).slice(-8).reverse(),
-    [events],
-  )
   const selectedNodeRuntimeArtifacts = useMemo(
     () => (selectedNode ? (runtime.data?.artifact_index ?? []).filter((artifact) => artifact.producer_node_id === selectedNode.id) : []),
     [runtime.data?.artifact_index, selectedNode],
@@ -1574,8 +1829,9 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
   )
   const nodeSequence = useMemo(() => workflowNodeSequence(draft), [draft])
   const draftFlowNodes: Node[] = useMemo(
-    () =>
-      (draft?.graph_json.nodes ?? []).map((node) => {
+    () => {
+      const visibleNodes = (draft?.graph_json.nodes ?? []).filter((node) => !collapsedNodeIds.has(node.id))
+      const normalNodes = visibleNodes.map((node) => {
         const agentConfig = findAgentConfig(agentConfigs.data, node.config_file)
         const inheritedSkill = node.skill ?? agentConfig?.skill ?? null
         const skillLabel = node.type === "sub_agent" && inheritedSkill ? `/${inheritedSkill}` : null
@@ -1600,6 +1856,8 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
         const nodeArtifacts = [...new Set(nodeArtifactPaths)]
           .map((path) => artifactsByPath.get(path))
           .filter((artifact): artifact is ArtifactInfo => Boolean(artifact))
+        const fanoutGroup = stackableFanoutGroupByNodeId.get(node.id)
+        const fanoutGroupExpanded = Boolean(fanoutGroup && expandedFanoutGroups.has(fanoutGroup.key))
         return {
           id: node.id,
           type: "workflow",
@@ -1651,6 +1909,20 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                 {skillLabel && <small>{skillLabel}</small>}
                 {node.status === "waiting_dynamic_dependency" && <small>waiting for literature</small>}
                 {node.dynamic_reason && <small title={node.dynamic_reason}>{truncate(node.dynamic_reason, 72)}</small>}
+                {fanoutGroup && fanoutGroupExpanded && (
+                  <button
+                    className="flow-node-group-action nodrag nopan"
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      collapseFanoutGroup(fanoutGroup.key)
+                    }}
+                    title={`Stack ${fanoutGroup.nodes.length} generated agents`}
+                    type="button"
+                  >
+                    <Layers3 size={12} />
+                    Stack group
+                  </button>
+                )}
                 {nodeArtifacts.length > 0 && (
                   <div className="flow-node-artifacts">
                     {nodeArtifacts.slice(0, 3).map((artifact) => (
@@ -1684,8 +1956,122 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
           className: `flow-node flow-node-${node.type} flow-node-${node.status}${isDynamicResearch ? " flow-node-dynamic-research" : ""}`,
           style,
         }
-      }),
-    [artifactsByPath, draft, agentConfigs.data, nodeSequence, runOutputByRunId, workspace, workspaceArtifacts.data],
+      })
+
+      const renderFanoutStackLabel = (group: FanoutStackGroup, mode: "collapsed" | "expanded") => {
+        const statusItems = statusSummary(group.nodes)
+        const primaryStatus = statusItems[0]?.status ?? "queued"
+        const succeededCount = group.nodes.filter((node) => node.status === "succeeded").length
+        return (
+          <div className="fanout-stack-label">
+            <div className="flow-node-topline">
+              <span className="flow-node-kind-row">
+                <span className="flow-node-order">{group.nodes.length}</span>
+                <span className="node-kind node-kind-fanout">
+                  <Layers3 size={13} />
+                  {mode === "collapsed" ? "Stack" : "Expanded"}
+                </span>
+              </span>
+              <em className={statusClass(primaryStatus)}>{primaryStatus}</em>
+            </div>
+            <strong>{group.parent?.name ?? group.parentId} fan-out</strong>
+            <span>
+              {group.nodes.length} generated Agents · {succeededCount}/{group.nodes.length} done
+            </span>
+            {mode === "collapsed" && (
+              <>
+                <div className="fanout-stack-statuses">
+                  {statusItems.slice(0, 4).map((item) => (
+                    <small key={item.status}>
+                      {item.count} {item.status}
+                    </small>
+                  ))}
+                </div>
+                <div className="fanout-stack-preview">
+                  {group.nodes.slice(0, 4).map((node) => (
+                    <span key={node.id}>{node.name}</span>
+                  ))}
+                  {group.nodes.length > 4 && <span>+{group.nodes.length - 4} more</span>}
+                </div>
+              </>
+            )}
+            <button
+              className="fanout-stack-expand nodrag nopan"
+              onClick={(event) => {
+                event.stopPropagation()
+                if (mode === "collapsed") {
+                  expandFanoutGroup(group.key)
+                } else {
+                  collapseFanoutGroup(group.key)
+                }
+              }}
+              type="button"
+            >
+              {mode === "collapsed" ? "Expand" : "Collapse"}
+            </button>
+          </div>
+        )
+      }
+
+      const stackNodes: Node[] = collapsedFanoutGroups.map((group) => {
+        const xValues = group.nodes.map((node) => Number(node.position?.x ?? 0))
+        const yValues = group.nodes.map((node) => Number(node.position?.y ?? 0))
+        const position = fanoutStackPositions[group.key] ?? {
+          x: Math.min(...xValues),
+          y: Math.min(...yValues),
+        }
+        return {
+          id: fanoutStackNodeId(group.key),
+          type: "workflow",
+          position,
+          connectable: false,
+          data: {
+            label: renderFanoutStackLabel(group, "collapsed"),
+          },
+          className: "flow-node flow-node-fanout-stack",
+        }
+      })
+
+      const expandedStackControls: Node[] = fanoutStackGroups
+        .filter((group) => expandedFanoutGroups.has(group.key))
+        .map((group) => {
+          const xValues = group.nodes.map((node) => Number(node.position?.x ?? 0))
+          const yValues = group.nodes.map((node) => Number(node.position?.y ?? 0))
+          const collapsedPosition = fanoutStackPositions[group.key]
+          return {
+            id: fanoutStackNodeId(`${group.key}:expanded-control`),
+            type: "workflow",
+            position: fanoutStackPositions[`${group.key}:expanded-control`] ?? {
+              x: collapsedPosition?.x ?? Math.min(...xValues),
+              y: Math.max(24, (collapsedPosition?.y ?? Math.min(...yValues)) - 120),
+            },
+            connectable: false,
+            data: {
+              label: renderFanoutStackLabel(group, "expanded"),
+            },
+            className: "flow-node flow-node-fanout-stack flow-node-fanout-controller",
+          }
+        })
+
+      return [...normalNodes, ...stackNodes, ...expandedStackControls]
+    },
+    [
+      artifactsByPath,
+      draft,
+      agentConfigs.data,
+      nodeSequence,
+      runOutputByRunId,
+      workspace,
+      workspaceArtifacts.data,
+      collapsedNodeIds,
+      stackableFanoutGroupByNodeId,
+      expandedFanoutGroups,
+      collapseFanoutGroup,
+      collapsedFanoutGroups,
+      expandFanoutGroup,
+      fanoutStackGroups,
+      fanoutStackPositions,
+    ],
   )
   useEffect(() => {
     if (!isDraggingNode) {
@@ -1696,41 +2082,76 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
   const flowEdges: WorkflowCanvasEdge[] = useMemo(
     () => {
       const nodesById = new Map((draft?.graph_json.nodes ?? []).map((node) => [node.id, node]))
-      return (draft?.graph_json.edges ?? []).map((edge) => {
+      const mergedEdges = new Map<string, {
+        edge: WorkflowRecord["graph_json"]["edges"][number]
+        source: string
+        target: string
+        handoff?: WorkflowHandoff
+        plannerInserted: boolean
+        count: number
+      }>()
+
+      for (const edge of draft?.graph_json.edges ?? []) {
         const source = nodesById.get(edge.source)
         const target = nodesById.get(edge.target)
+        const mappedSource = collapsedNodeToStackId.get(edge.source) ?? edge.source
+        const mappedTarget = collapsedNodeToStackId.get(edge.target) ?? edge.target
+        if (mappedSource === mappedTarget) continue
         const handoff = handoffByEdge.get(handoffKey(edge.source, edge.target))
         const plannerInserted = Boolean(source?.dynamic_parent_id || (target?.status === "waiting_dynamic_dependency" && target.depends_on.includes(edge.source)))
+        const key = `${mappedSource}->${mappedTarget}`
+        const existing = mergedEdges.get(key)
+        if (existing) {
+          existing.count += 1
+          existing.plannerInserted = existing.plannerInserted || plannerInserted
+          existing.handoff = existing.handoff ?? handoff
+          continue
+        }
+        mergedEdges.set(key, {
+          edge,
+          source: mappedSource,
+          target: mappedTarget,
+          handoff,
+          plannerInserted,
+          count: 1,
+        })
+      }
+
+      return Array.from(mergedEdges.values()).map(({ edge, source, target, handoff, plannerInserted, count }) => {
+        const isStackEdge = count > 1 || source !== edge.source || target !== edge.target
         const handoffLabel = edgeHandoffLabel(handoff, plannerInserted)
+        const edgeLabel = count > 1 ? `${count} links` : handoffLabel
         const classes = [
           edge.id === selectedEdgeId ? "flow-edge-selected" : "",
+          isStackEdge ? "flow-edge-stacked" : "",
           plannerInserted ? "flow-edge-planner" : "",
           handoff?.preview ? "flow-edge-handoff" : "",
-          target?.status === "waiting_dynamic_dependency" ? "flow-edge-blocking" : "",
+          nodesById.get(edge.target)?.status === "waiting_dynamic_dependency" ? "flow-edge-blocking" : "",
         ].filter(Boolean)
         return {
-          id: edge.id,
+          id: isStackEdge ? `${STACK_EDGE_PREFIX}${source}->${target}` : edge.id,
           type: "workflowHandoff",
-          source: edge.source,
-          target: edge.target,
+          source,
+          target,
           markerEnd: { type: MarkerType.ArrowClosed },
-          selected: edge.id === selectedEdgeId,
+          selected: !isStackEdge && edge.id === selectedEdgeId,
           data: {
-            label: handoffLabel,
-            onOpen: openEdgePanel,
+            label: edgeLabel,
+            onOpen: isStackEdge ? undefined : openEdgePanel,
           },
-          ariaLabel: handoffLabel ? `${handoffLabel}. Click to view handoff preview.` : undefined,
-          focusable: Boolean(handoffLabel),
-          interactionWidth: handoffLabel ? 28 : 20,
+          ariaLabel: edgeLabel ? `${edgeLabel}.` : undefined,
+          focusable: Boolean(edgeLabel && !isStackEdge),
+          interactionWidth: edgeLabel ? 28 : 20,
           className: classes.join(" ") || undefined,
         }
       })
     },
-    [draft, handoffByEdge, openEdgePanel, selectedEdgeId],
+    [collapsedNodeToStackId, draft, handoffByEdge, openEdgePanel, selectedEdgeId],
   )
   const onNodesChange = useCallback((changes: NodeChange[]) => {
-    const removeChanges = changes.filter((change) => change.type === "remove")
-    setCanvasNodes((nodes) => applyNodeChanges(changes, nodes))
+    const realChanges = changes.filter((change) => !(change.type === "remove" && isFanoutStackNodeId(change.id)))
+    const removeChanges = realChanges.filter((change) => change.type === "remove")
+    setCanvasNodes((nodes) => applyNodeChanges(realChanges, nodes))
     if (!removeChanges.length) return
 
     setDraft((current) => {
@@ -1805,6 +2226,21 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
   return (
     <div className={`orchestrator-grid workflow-layout ${flowPanelCollapsed ? "flows-collapsed" : ""}`}>
       <aside className="orchestrator-left panel">
+        {flowPanelCollapsed ? (
+          <Button
+            className="flow-panel-rail-button"
+            variant="secondary"
+            onClick={() => setFlowPanelCollapsed(false)}
+            type="button"
+            aria-label="Show flows"
+            title="Show flows"
+          >
+            <ChevronRight size={16} />
+            <GitBranch size={16} />
+            <span>Flows</span>
+          </Button>
+        ) : (
+          <>
         <div className="panel-head compact-head">
           <div>
             <h2>Flows</h2>
@@ -1815,7 +2251,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
               <RefreshCcw size={15} />
             </Button>
             <Button variant="secondary" onClick={() => setFlowPanelCollapsed(true)} type="button" aria-label="Hide flows" title="Hide flows">
-              <ChevronRight size={15} />
+              <ChevronLeft size={15} />
             </Button>
           </div>
         </div>
@@ -1934,6 +2370,8 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
             </div>
           )}
         </div>
+          </>
+        )}
       </aside>
 
       <section className="orchestrator-main panel">
@@ -1954,167 +2392,8 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                 <h1>{draft.title}</h1>
                 <p>{draft.goal || "No goal set"}</p>
               </div>
-              {flowPanelCollapsed && (
-                <div className="console-actions">
-                  <Button
-                    variant="secondary"
-                    onClick={() => setFlowPanelCollapsed(false)}
-                    type="button"
-                    aria-label="Show flows"
-                    title="Show flows"
-                  >
-                    <GitBranch size={15} />
-                    Flows
-                  </Button>
-                </div>
-              )}
             </div>
             {deleteWorkflow.error && <p className="error-text">{deleteWorkflow.error.message}</p>}
-            <section className={`execution-state-panel execution-state-${executionState}`}>
-              <div className="execution-state-main">
-                <span className="execution-state-eyebrow">
-                  <Activity size={14} />
-                  Execution state
-                </span>
-                <div className="execution-state-title-row">
-                  <strong>{executionStateLabel(executionState)}</strong>
-                  <span className={statusClass(executionState)}>{executionState}</span>
-                  {runtimeSummary?.planner_active && <Badge>planner active</Badge>}
-                </div>
-                <p>{executionAction}</p>
-              </div>
-              <div className="execution-state-metrics">
-                <span>
-                  <b>{runtimeSummary?.active_node_count ?? activeNodeIds.length}</b>
-                  active
-                </span>
-                <span>
-                  <b>{runtimeSummary?.ready_node_count ?? readyNodeIds.length}</b>
-                  ready
-                </span>
-                <span>
-                  <b>{runtimeSummary?.waiting_approval_count ?? waitingApprovalIds.length}</b>
-                  approval
-                </span>
-                <span>
-                  <b>{runtimeSummary?.waiting_dynamic_dependency_count ?? waitingLiteratureIds.length}</b>
-                  literature wait
-                </span>
-                <span>
-                  <b>{runtimeSummary?.failed_node_count ?? 0}</b>
-                  failed
-                </span>
-              </div>
-              <div className="execution-state-details">
-                <span>last event: {executionLastEvent}</span>
-                {activeNodeIds.length > 0 && <span>active: {activeNodeIds.join(", ")}</span>}
-                {waitingApprovalIds.length > 0 && <span>approval: {waitingApprovalIds.join(", ")}</span>}
-                {waitingLiteratureIds.length > 0 && <span>literature: {waitingLiteratureIds.join(", ")}</span>}
-                {readyNodeIds.length > 0 && <span>ready: {readyNodeIds.join(", ")}</span>}
-              </div>
-            </section>
-            <div className="runtime-workbench">
-              <section className="runtime-card runtime-summary-card">
-                <div className="runtime-card-head">
-                  <span>
-                    <Activity size={14} />
-                    Runtime
-                  </span>
-                  <Badge>{runtimeSummary?.latest_decision_type ?? "no tick"}</Badge>
-                </div>
-                <div className="runtime-metrics">
-                  <span>
-                    <b>{runtimeSummary?.decision_count ?? 0}</b>
-                    decisions
-                  </span>
-                  <span>
-                    <b>{runtimeSummary?.delta_count ?? 0}</b>
-                    deltas
-                  </span>
-                  <span>
-                    <b>{runtimeSummary?.dynamic_node_count ?? 0}</b>
-                    dynamic
-                  </span>
-                  <span>
-                    <b>{runtimeSummary?.blocked_session_count ?? 0}</b>
-                    blocked
-                  </span>
-                </div>
-                <p>{latestDecision?.rationale || "Planner runtime has not recorded a decision yet."}</p>
-                {runtimeSummary?.latest_tick_id && <small>tick {runtimeSummary.latest_tick_id}</small>}
-              </section>
-
-              <section className="runtime-card">
-                <div className="runtime-card-head">
-                  <span>
-                    <Terminal size={14} />
-                    Timeline
-                  </span>
-                  <Badge>{recentRuntimeEvents.length}</Badge>
-                </div>
-                <div className="runtime-list">
-                  {recentRuntimeEvents.map((event, index) => (
-                    <div className="runtime-row" key={`${event.timestamp}-${event.event_type}-${index}`}>
-                      <b>{workflowEventLabel(event)}</b>
-                      <span>{event.message}</span>
-                      <small>{event.timestamp.slice(11, 19)}</small>
-                    </div>
-                  ))}
-                  {!recentRuntimeEvents.length && <p className="muted">No runtime events yet.</p>}
-                </div>
-              </section>
-
-              <section className="runtime-card">
-                <div className="runtime-card-head">
-                  <span>
-                    <Layers3 size={14} />
-                    Decision Cards
-                  </span>
-                  <Badge>{recentDecisionCards.length}</Badge>
-                </div>
-                <div className="runtime-list">
-                  {recentDecisionCards.map((decision) => (
-                    <div className="decision-card-mini" key={decision.tick_id}>
-                      <div>
-                        <Badge>{decision.decision_type}</Badge>
-                        <small>{decision.trigger}</small>
-                        {!decision.policy_result.allowed && <Badge>policy rejected</Badge>}
-                      </div>
-                      <strong>{decision.rationale || "No rationale recorded"}</strong>
-                      <span>
-                        {decision.before_graph_hash.slice(0, 8)}
-                        {" -> "}
-                        {decision.after_graph_hash.slice(0, 8)}
-                      </span>
-                    </div>
-                  ))}
-                  {!recentDecisionCards.length && <p className="muted">No decision cards yet.</p>}
-                </div>
-              </section>
-
-              <section className="runtime-card">
-                <div className="runtime-card-head">
-                  <span>
-                    <GitBranch size={14} />
-                    Graph Diff
-                  </span>
-                  <Badge>{recentDeltaCards.length}</Badge>
-                </div>
-                <div className="runtime-list">
-                  {recentDeltaCards.map((delta: WorkflowDeltaRecord) => (
-                    <div className={`delta-card-mini ${delta.applied ? "delta-applied" : delta.policy_result.allowed ? "delta-noop" : "delta-rejected"}`} key={delta.delta_id}>
-                      <div>
-                        <Badge>{delta.action}</Badge>
-                        <small>{delta.node_id || delta.target || delta.source || delta.delta_id}</small>
-                      </div>
-                      <span>{delta.reason || delta.policy_result.reason || "no reason"}</span>
-                      <pre>{jsonPreview(delta.graph_diff, 260)}</pre>
-                    </div>
-                  ))}
-                  {!recentDeltaCards.length && <p className="muted">No graph deltas yet.</p>}
-                </div>
-              </section>
-            </div>
             <div className="flow-shell">
               <div className={`flow-canvas-toolbar ${canvasToolsCollapsed ? "flow-canvas-toolbar-collapsed" : ""}`} aria-label="Flow canvas actions">
                 <Button
@@ -2233,16 +2512,32 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                 onlyRenderVisibleElements
                 onConnect={onConnect}
                 onNodeClick={(_, node) => {
+                  if (isFanoutStackNodeId(node.id)) {
+                    const key = node.id.slice(FANOUT_STACK_NODE_PREFIX.length)
+                    if (key.endsWith(":expanded-control")) return
+                    expandFanoutGroup(key)
+                    setSelectedEdgeId("")
+                    return
+                  }
                   setSelectedNodeId(node.id)
                   setSelectedEdgeId("")
                 }}
                 onEdgeClick={(_, edge) => {
+                  if (isStackEdgeId(edge.id)) return
                   setSelectedEdgeId(edge.id)
                   setSelectedNodeId("")
                 }}
                 onNodeDragStart={() => setIsDraggingNode(true)}
                 onNodeDragStop={(_, node) => {
                   setIsDraggingNode(false)
+                  if (isFanoutStackNodeId(node.id)) {
+                    const key = node.id.slice(FANOUT_STACK_NODE_PREFIX.length)
+                    setFanoutStackPositions((current) => ({
+                      ...current,
+                      [key]: { x: node.position.x, y: node.position.y },
+                    }))
+                    return
+                  }
                   updateNode(node.id, (item) => {
                     item.position = { x: node.position.x, y: node.position.y }
                   })
@@ -2487,11 +2782,17 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
               </Button>
               <Button
                 variant="secondary"
-                onClick={() => skipNode.mutate({ workflow: draft, nodeId: selectedNode.id })}
-                disabled={skipNode.isPending}
+                onClick={() =>
+                  selectedNode.status === "skipped"
+                    ? restoreNode.mutate({ workflow: draft, nodeId: selectedNode.id })
+                    : skipNode.mutate({ workflow: draft, nodeId: selectedNode.id })
+                }
+                disabled={skipNode.isPending || restoreNode.isPending}
                 type="button"
+                title={selectedNode.status === "skipped" ? "Restore this skipped node to queued" : "Skip this node"}
               >
-                Skip
+                {selectedNode.status === "skipped" && <RefreshCcw size={15} />}
+                {selectedNode.status === "skipped" ? "Restore" : "Skip"}
               </Button>
             </div>
             {isExecutableNode(selectedNode) && (
@@ -2639,6 +2940,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                     workflow: draft,
                     nodeId: selectedNode.id,
                     instructions: promptOptimizationNote,
+                    model: selectedNode.model ?? selectedNodeConfig?.model ?? settings.data?.model ?? null,
                   })
                 }
                 disabled={!selectedNode.prompt.trim() || optimizeNodePrompt.isPending}

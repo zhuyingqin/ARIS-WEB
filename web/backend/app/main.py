@@ -75,6 +75,13 @@ workspace_store = WorkspaceStore()
 run_manager = RunManager()
 workflow_manager = WorkflowManager(run_manager)
 settings_home = WEB_HOME
+MAX_STREAM_REPLAY_EVENTS = 1000
+
+
+def _stream_replay_limit(value: int | None) -> int | None:
+    if value is None:
+        return None
+    return max(0, min(value, MAX_STREAM_REPLAY_EVENTS))
 
 
 def _workspace_or_404(path: str) -> Path:
@@ -535,6 +542,25 @@ async def skip_workflow_node(workflow_id: str, node_id: str, workspace: str = Qu
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/workflows/{workflow_id}/nodes/{node_id}/restore", response_model=WorkflowRecord)
+async def restore_workflow_node(
+    workflow_id: str,
+    node_id: str,
+    request: NodeActionRequest,
+    workspace: str = Query(...),
+) -> WorkflowRecord:
+    workspace_path = _workspace_or_404(workspace)
+    try:
+        return await workflow_manager.restore_node(
+            workspace_path,
+            workflow_id,
+            node_id,
+            reset_downstream=request.reset_downstream or request.reset_descendants,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/workflows/{workflow_id}/nodes/{node_id}/optimize-prompt", response_model=OptimizeNodePromptResponse)
 async def optimize_workflow_node_prompt(
     workflow_id: str,
@@ -550,6 +576,7 @@ async def optimize_workflow_node_prompt(
             node_id,
             graph=request.graph_json,
             instructions=request.instructions,
+            model=request.model,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -576,16 +603,28 @@ async def rerun_workflow_node(
 
 
 @app.websocket("/api/workflows/{workflow_id}/stream")
-async def workflow_stream(websocket: WebSocket, workflow_id: str, workspace: str) -> None:
+async def workflow_stream(
+    websocket: WebSocket,
+    workflow_id: str,
+    workspace: str,
+    replay_limit: int | None = None,
+) -> None:
     try:
         workspace_path = workspace_store.require_allowed(workspace)
     except ValueError:
         await websocket.close(code=1008)
         return
     await websocket.accept()
-    for event in await workflow_manager.replay_events(workspace_path, workflow_id):
-        data = event.model_dump() if hasattr(event, "model_dump") else event.dict()
-        await websocket.send_json(data)
+    try:
+        for event in await workflow_manager.replay_events(
+            workspace_path,
+            workflow_id,
+            limit=_stream_replay_limit(replay_limit),
+        ):
+            data = event.model_dump() if hasattr(event, "model_dump") else event.dict()
+            await websocket.send_json(data)
+    except WebSocketDisconnect:
+        return
     queue = await workflow_manager.bus.subscribe(workflow_id)
     try:
         while True:
@@ -604,6 +643,7 @@ async def workflow_node_stream(
     workflow_id: str,
     node_id: str,
     workspace: str,
+    replay_limit: int | None = None,
 ) -> None:
     """Per-node event stream.
 
@@ -624,11 +664,18 @@ async def workflow_node_stream(
             candidate_id = event_obj.get("node_id")
         return candidate_id == node_id
 
-    for event in await workflow_manager.replay_events(workspace_path, workflow_id):
-        if not _matches(event):
-            continue
-        data = event.model_dump() if hasattr(event, "model_dump") else event.dict()
-        await websocket.send_json(data)
+    try:
+        for event in await workflow_manager.replay_events(
+            workspace_path,
+            workflow_id,
+            limit=_stream_replay_limit(replay_limit),
+        ):
+            if not _matches(event):
+                continue
+            data = event.model_dump() if hasattr(event, "model_dump") else event.dict()
+            await websocket.send_json(data)
+    except WebSocketDisconnect:
+        return
     queue = await workflow_manager.bus.subscribe(workflow_id)
     try:
         while True:

@@ -717,19 +717,19 @@ def effective_effort_override(home: Path = WEB_HOME, model: str | None = None) -
     return str(profile.get("effort") or "").strip() or None
 
 
-def openai_compatible_settings(home: Path = WEB_HOME) -> dict[str, str] | None:
+def openai_compatible_settings(home: Path = WEB_HOME, model: str | None = None) -> dict[str, str] | None:
     raw = _read_raw(home)
     if not raw:
         return None
-    provider, profile = _active_profile(raw)
+    provider, profile = _profile_for_model(raw, model)
     api_key = str(profile.get("api_key") or "").strip()
     if not api_key:
         return None
     if provider not in {"openai", "gemini", "glm", "minimax", "kimi", "custom"}:
         return None
     base_url = str(profile.get("base_url") or "").strip() or DEFAULT_BASE_URLS.get(provider)
-    model = effective_model_override(home)
-    if not base_url or not model:
+    selected_model = str(model or "").strip() or str(profile.get("model") or "").strip() or DEFAULT_MODELS.get(provider)
+    if not base_url or not selected_model:
         return None
     if provider == "minimax" and "anthropic" in base_url.rstrip("/").lower():
         return None
@@ -737,7 +737,7 @@ def openai_compatible_settings(home: Path = WEB_HOME) -> dict[str, str] | None:
         "provider": provider,
         "api_key": api_key,
         "base_url": base_url.rstrip("/"),
-        "model": model,
+        "model": selected_model,
         "effort": str(profile.get("effort") or "").strip(),
     }
 

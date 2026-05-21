@@ -1516,18 +1516,20 @@ async def optimize_node_prompt_with_aris(
     graph: WorkflowGraph,
     node: WorkflowNode,
     instructions: str | None = None,
+    model: str | None = None,
 ) -> str:
     prompt = build_node_prompt_optimization_prompt(record, graph, node, instructions)
-    settings = openai_compatible_settings()
+    optimizer_model = str(model or "").strip() or node.model or effective_model_override()
+    settings = openai_compatible_settings(model=optimizer_model)
     if settings is not None:
         raw = await asyncio.to_thread(_request_openai_compatible_workflow_json, settings, prompt)
         return parse_optimized_prompt_text(raw)
 
-    command = build_aris_command(workspace, prompt, node.model or effective_model_override())
+    command = build_aris_command(workspace, prompt, optimizer_model)
     process = await asyncio.create_subprocess_exec(
         *command,
         cwd=str(workspace),
-        env=build_runtime_env(),
+        env=build_runtime_env(model=optimizer_model),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -1691,6 +1693,90 @@ def _json_file_candidates(workspace: Path, workflow_id: str, source_node: Workfl
     return candidates
 
 
+def _split_keyword_cell(value: str) -> list[str]:
+    text = re.sub(r"<br\s*/?>", ";", value, flags=re.IGNORECASE)
+    text = text.replace("；", ";").replace("、", ";").replace("，", ";")
+    parts = re.split(r";|,|\n", text)
+    return [part.strip(" `\"'") for part in parts if part.strip(" `\"'")]
+
+
+def _parse_markdown_keyword_groups(text: str) -> list[dict[str, Any]]:
+    groups: list[dict[str, Any]] = []
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index].strip()
+        if not (line.startswith("|") and line.endswith("|")):
+            index += 1
+            continue
+        headers = [cell.strip().lower() for cell in line.strip("|").split("|")]
+        if not headers or index + 1 >= len(lines):
+            index += 1
+            continue
+        separator = lines[index + 1].strip()
+        if not (separator.startswith("|") and re.fullmatch(r"[|\s:\-]+", separator)):
+            index += 1
+            continue
+
+        header_text = " ".join(headers)
+        has_group_col = any(token in header_text for token in ("组", "group", "topic", "name"))
+        has_keyword_col = any(token in header_text for token in ("keyword", "关键词", "phrase"))
+        if not (has_group_col and has_keyword_col):
+            index += 2
+            continue
+
+        group_index = next(
+            (i for i, header in enumerate(headers) if any(token in header for token in ("组", "group", "topic", "name"))),
+            0,
+        )
+        keyword_indexes = [
+            i
+            for i, header in enumerate(headers)
+            if any(token in header for token in ("keyword", "关键词", "phrase"))
+        ]
+        purpose_index = next((i for i, header in enumerate(headers) if any(token in header for token in ("用途", "purpose", "use"))), None)
+
+        row_index = index + 2
+        while row_index < len(lines) and lines[row_index].strip().startswith("|"):
+            cells = [cell.strip() for cell in lines[row_index].strip().strip("|").split("|")]
+            if len(cells) >= len(headers):
+                name = cells[group_index].strip()
+                keywords: list[str] = []
+                for keyword_index in keyword_indexes:
+                    if keyword_index < len(cells):
+                        keywords.extend(_split_keyword_cell(cells[keyword_index]))
+                if name and keywords:
+                    item: dict[str, Any] = {
+                        "name": re.sub(r"\s+", " ", name),
+                        "keywords": list(dict.fromkeys(keywords)),
+                    }
+                    if purpose_index is not None and purpose_index < len(cells) and cells[purpose_index].strip():
+                        item["purpose"] = cells[purpose_index].strip()
+                    groups.append(item)
+            row_index += 1
+        index = row_index
+    return groups
+
+
+def _markdown_file_candidates(workspace: Path, workflow_id: str, source_node: WorkflowNode) -> list[tuple[Path, Any]]:
+    node_dir = workspace / ".aris" / "web" / "workflows" / workflow_id / "nodes" / source_node.id
+    if not node_dir.exists():
+        return []
+    candidates: list[tuple[Path, Any]] = []
+    for markdown_path in sorted([*node_dir.glob("attempt-*/*.md"), *node_dir.glob("attempt-*/*.markdown")]):
+        try:
+            text = markdown_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        parsed_json = _try_extract_json_value(text)
+        if parsed_json is not None:
+            candidates.append((markdown_path, parsed_json))
+        keyword_groups = _parse_markdown_keyword_groups(text)
+        if keyword_groups:
+            candidates.append((markdown_path, {"keyword_groups": keyword_groups}))
+    return candidates
+
+
 def _load_node_output_value(workspace: Path, workflow_id: str, source_node: WorkflowNode, path: str) -> Any:
     if not source_node.run_id:
         return _MISSING
@@ -1732,6 +1818,12 @@ def _load_node_output_value(workspace: Path, workflow_id: str, source_node: Work
             return value
         if json_path.stem == path:
             return root
+    for markdown_path, root in _markdown_file_candidates(workspace, workflow_id, source_node):
+        value = _json_path_get(root, path)
+        if value is not _MISSING:
+            return value
+        if markdown_path.stem == path:
+            return root
     return _MISSING
 
 
@@ -1743,6 +1835,37 @@ def _template_value_to_text(value: Any) -> str:
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False)
     return str(value)
+
+
+def _fanout_artifact_filename(path: str) -> str:
+    normalized = (path or "fanout_items").strip()
+    normalized = normalized[2:] if normalized.startswith("$.") else normalized
+    normalized = normalized.strip(".") or "fanout_items"
+    filename = re.sub(r"[^A-Za-z0-9_-]+", "_", normalized).strip("_") or "fanout_items"
+    return f"{filename}.json"
+
+
+def _fanout_output_requirements(graph: WorkflowGraph, source_node: WorkflowNode) -> str:
+    lines: list[str] = []
+    for template in graph.nodes:
+        if template.fanout is None:
+            continue
+        source_id = template.fanout.source or (template.depends_on[0] if template.depends_on else "")
+        if source_id != source_node.id:
+            continue
+        path = (template.fanout.path or "$").strip() or "$"
+        filename = _fanout_artifact_filename(path)
+        lines.append(
+            "\n".join(
+                [
+                    f"- `{template.name}` ({template.id}) will fan out from JSON path `{path}`.",
+                    f"  Write `ARIS_SUBAGENT_DIR/{filename}` before your final summary.",
+                    f"  The JSON must make `{path}` resolve to a non-empty array.",
+                    '  For `keyword_groups`, use objects like {"name":"...", "keywords":["..."], "query":"...", "rationale":"..."}.',
+                ]
+            )
+        )
+    return "\n".join(lines) if lines else "(none)"
 
 
 def _template_lookup(item: Any, token: str, index: int) -> Any:
@@ -2148,13 +2271,14 @@ class WorkflowManager:
         *,
         graph: WorkflowGraph | None = None,
         instructions: str | None = None,
+        model: str | None = None,
     ) -> str:
         record = self._require(workspace, workflow_id)
         normalized = normalize_workflow_graph(graph or record.graph_json, {skill.id for skill in scan_skills()})
         node = self._find_node(normalized, node_id)
         if not node.prompt.strip():
             raise ValueError("Node prompt is empty")
-        return await optimize_node_prompt_with_aris(workspace, record, normalized, node, instructions)
+        return await optimize_node_prompt_with_aris(workspace, record, normalized, node, instructions, model=model)
 
     async def expand_team(
         self,
@@ -2407,6 +2531,62 @@ class WorkflowManager:
         await self._tick(workspace, workflow_id)
         return self._require(workspace, workflow_id)
 
+    async def restore_node(
+        self,
+        workspace: Path,
+        workflow_id: str,
+        node_id: str,
+        *,
+        reset_downstream: bool = False,
+    ) -> WorkflowRecord:
+        record = self._require(workspace, workflow_id)
+        graph = record.graph_json
+        node = self._find_node(graph, node_id)
+        if node.status != "skipped":
+            raise ValueError("Only skipped nodes can be restored")
+
+        node.status = "queued"
+        node.run_id = None
+        node.error = None
+        node.attempt = 0
+        node.approved_after = False
+        if node.gate in {"before", "both"} or node.type == "human_gate":
+            node.approved_before = False
+
+        restored_downstream: list[str] = []
+        if reset_downstream:
+            descendants = self._descendants(graph, node_id)
+            for item in graph.nodes:
+                if item.id in descendants and item.status == "skipped":
+                    item.status = "queued"
+                    item.run_id = None
+                    item.error = None
+                    item.attempt = 0
+                    item.approved_before = False
+                    item.approved_after = False
+                    restored_downstream.append(item.id)
+
+        update_workflow(
+            workspace,
+            workflow_id,
+            status="paused",
+            graph_json=graph,
+            clear_error=True,
+            clear_finished_at=True,
+        )
+        await self._append_event(
+            workspace,
+            WorkflowEvent(
+                workflow_id=workflow_id,
+                timestamp=utc_now(),
+                event_type="node",
+                node_id=node_id,
+                message=f"Node restored: {node.name}",
+                payload={"status": "queued", "restored_downstream": restored_downstream},
+            ),
+        )
+        return self._require(workspace, workflow_id)
+
     async def rerun_node(self, workspace: Path, workflow_id: str, node_id: str, *, reset_downstream: bool = False) -> WorkflowRecord:
         record = self._require(workspace, workflow_id)
         graph = record.graph_json
@@ -2436,9 +2616,9 @@ class WorkflowManager:
         await self._tick(workspace, workflow_id)
         return self._require(workspace, workflow_id)
 
-    async def replay_events(self, workspace: Path, workflow_id: str) -> list[WorkflowEvent]:
+    async def replay_events(self, workspace: Path, workflow_id: str, limit: int | None = None) -> list[WorkflowEvent]:
         events: list[WorkflowEvent] = []
-        for event in replay_workflow_events(workspace, workflow_id):
+        for event in replay_workflow_events(workspace, workflow_id, limit=limit):
             events.extend(expand_replayed_workflow_event(event))
         return events
 
@@ -4047,6 +4227,7 @@ class WorkflowManager:
             f"- {output_path.as_posix()} -> {workflow_output_relative_path(workspace, record.id, node, output_path)}"
             for output_path in concrete_outputs
         ) or "(no concrete file outputs declared)"
+        fanout_output_requirements = _fanout_output_requirements(record.graph_json, node)
         inputs_text = _render_port_summary(node.inputs, kind="expected inputs")
         if not node.inputs:
             inputs_text = "(none declared)"
@@ -4094,6 +4275,9 @@ Expected outputs:
 Concrete output storage paths:
 {concrete_outputs_text}
 
+Downstream fan-out requirements:
+{fanout_output_requirements}
+
 Sub-agent execution namespace:
 - ARIS_WORKFLOW_ID={record.id}
 - ARIS_NODE_ID={node.id}
@@ -4130,6 +4314,7 @@ Execution requirements:
 - If a skill suggests a helper script that requires Bash, perform the equivalent search, reading, or writing with the safe tools instead.
 - Use relative paths for file operations; do not use absolute workspace paths in commands or tool inputs.
 - Produce every expected output that names a concrete file path at the mapped path shown in "Concrete output storage paths".
+- If "Downstream fan-out requirements" is not "(none)", write those JSON fan-out artifacts under ARIS_SUBAGENT_DIR before the final summary.
 - If a declared output is `INTRO_OUTLINE.md`, write it as `ARIS_SUBAGENT_DIR/INTRO_OUTLINE.md`, not `./INTRO_OUTLINE.md`.
 - If a declared output includes subdirectories, preserve that relative structure under ARIS_SUBAGENT_DIR unless the mapped path already starts with `.aris/`.
 - Treat upstream node outputs as read-only context. Do not rewrite upstream artifacts unless the current node explicitly declares that output path.

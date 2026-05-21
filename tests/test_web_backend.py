@@ -396,6 +396,11 @@ def test_runtime_env_routes_to_provider_matching_selected_model(tmp_path: Path) 
     )
 
     assert get_global_settings(tmp_path).provider == "minimax"
+    optimizer_settings = openai_compatible_settings(tmp_path, model="gpt-5.5")
+    assert optimizer_settings is not None
+    assert optimizer_settings["provider"] == "openai"
+    assert optimizer_settings["model"] == "gpt-5.5"
+    assert optimizer_settings["base_url"] == "https://openai.example/v1"
 
     gpt_env = build_runtime_env(base_env={}, home=tmp_path, model="gpt-5.5")
     assert gpt_env["EXECUTOR_PROVIDER"] == "openai"
@@ -805,6 +810,40 @@ def test_workflow_generation_prompt_keeps_agent_overrides_hidden() -> None:
     assert '"model"' not in schema
     assert '"effort"' not in schema
     assert '"config_file"' not in schema
+
+
+def test_node_prompt_includes_downstream_fanout_output_contract(tmp_path: Path) -> None:
+    manager = WorkflowManager(type("R", (), {})())
+    graph = WorkflowGraph(
+        nodes=[
+            WorkflowNode(id="keywords", name="Keyword planner", type="agent", prompt="Plan search groups."),
+            WorkflowNode(
+                id="literature-template",
+                name="Literature search template",
+                type="sub_agent",
+                prompt="Search {{item.name}}.",
+                depends_on=["keywords"],
+                fanout={"source": "keywords", "path": "keyword_groups"},
+            ),
+        ],
+    )
+    workflow = WorkflowRecord(
+        id="wf",
+        workspace=str(tmp_path),
+        title="Fanout",
+        goal="Search papers",
+        status="draft",
+        graph_json=graph,
+        created_at=utc_now(),
+        updated_at=utc_now(),
+    )
+
+    prompt = manager._build_node_prompt(tmp_path, workflow, graph.nodes[0])
+
+    assert "Downstream fan-out requirements:" in prompt
+    assert "ARIS_SUBAGENT_DIR/keyword_groups.json" in prompt
+    assert "keyword_groups" in prompt
+    assert "resolve to a non-empty array" in prompt
 
 
 def test_workflow_refinement_prompt_includes_current_graph_without_runtime() -> None:
@@ -1268,6 +1307,50 @@ def test_workflow_forwards_run_system_events_as_run_events(tmp_path: Path) -> No
     assert workflow_event_type_for_run_stream("tool") == "tool"
     assert workflow_event_type_for_run_stream("result") == "result"
     assert workflow_event_type_for_run_stream("system") == "run"
+    asyncio.run(run())
+
+
+def test_workflow_restore_skipped_node_returns_it_to_queue(tmp_path: Path) -> None:
+    manager = WorkflowManager(type("R", (), {})())
+    graph = WorkflowGraph(
+        nodes=[
+            WorkflowNode(
+                id="a",
+                name="A",
+                status="skipped",
+                run_id="old-run",
+                error="Skipped manually",
+                attempt=2,
+                approved_before=True,
+                approved_after=True,
+                gate="both",
+            ),
+            WorkflowNode(
+                id="b",
+                name="B",
+                status="skipped",
+                depends_on=["a"],
+                error="Blocked by upstream failure",
+            ),
+        ],
+        edges=[WorkflowEdge(id="a->b", source="a", target="b")],
+    )
+
+    async def run() -> None:
+        workflow = await manager.create(tmp_path, "Restore", "Goal", graph)
+        restored = await manager.restore_node(tmp_path, workflow.id, "a")
+        nodes = {node.id: node for node in restored.graph_json.nodes}
+        assert restored.status == "paused"
+        assert nodes["a"].status == "queued"
+        assert nodes["a"].run_id is None
+        assert nodes["a"].error is None
+        assert nodes["a"].attempt == 0
+        assert nodes["a"].approved_before is False
+        assert nodes["a"].approved_after is False
+        assert nodes["b"].status == "skipped"
+        events = await manager.replay_events(tmp_path, workflow.id)
+        assert any(event.message == "Node restored: A" for event in events)
+
     asyncio.run(run())
 
 
@@ -1979,6 +2062,81 @@ def test_workflow_manager_expands_fanout_from_node_artifact_json(tmp_path: Path)
         assert all(node.status == "waiting_approval" for node in generated)
         assert any("Bayesian point estimation" in node.prompt for node in generated)
         assert {"keywords", "literature-template-bayes", "literature-template-bootstrap"} <= set(calls)
+
+    asyncio.run(run())
+
+
+def test_workflow_manager_expands_fanout_from_markdown_keyword_table(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    async def fake_runner(workspace: Path, record, node) -> NodeRunResult:
+        calls.append(node.id)
+        run_id = f"run-{node.id}"
+        if node.id == "keywords":
+            artifact_dir = workspace / ".aris" / "web" / "workflows" / record.id / "nodes" / node.id / "attempt-1"
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            (artifact_dir / "LIT_RESEARCH_PLAN.md").write_text(
+                """
+# Literature plan
+
+| 组别 | 中文关键词 | English keywords / phrases | 用途 |
+|---|---|---|---|
+| G1 贝叶斯神经网络 | 贝叶斯神经网络、贝叶斯深度学习 | Bayesian neural network; Bayesian deep learning; BNN | 核心方法 |
+| G2 时间序列点预测 | 点预测、时间序列预测 | point forecast; time series forecasting; RMSE | 核心场景 |
+""".strip(),
+                encoding="utf-8",
+            )
+            last_message_path(workspace, run_id).parent.mkdir(parents=True, exist_ok=True)
+            last_message_path(workspace, run_id).write_text("Wrote LIT_RESEARCH_PLAN.md.", encoding="utf-8")
+            node_output_path(workspace, run_id).write_text(
+                json.dumps({"text": "see markdown plan", "json": None}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        return NodeRunResult(run_id=run_id, succeeded=True, message="ok")
+
+    manager = WorkflowManager(type("R", (), {})(), node_runner=fake_runner)
+    graph = WorkflowGraph(
+        schema_version=2,
+        nodes=[
+            WorkflowNode(id="keywords", type="agent", name="Keyword planner", role="planner", prompt="Write a keyword table."),
+            WorkflowNode(
+                id="literature-template",
+                type="sub_agent",
+                name="Literature search template",
+                role="literature scout",
+                prompt="Search for {{item.name}}: {{item.keywords}}",
+                depends_on=["keywords"],
+                fanout={"source": "keywords", "path": "keyword_groups", "name_template": "Search: {{item.name}}"},
+            ),
+        ],
+    )
+
+    async def run() -> None:
+        workflow = await manager.create(tmp_path, "Fanout markdown", "Search keyword tables", graph)
+        await manager.execute(tmp_path, workflow.id)
+        for _ in range(40):
+            current = get_workflow(tmp_path, workflow.id)
+            if current and current.status == "paused" and current.graph_json.nodes[0].status == "waiting_approval":
+                break
+            await asyncio.sleep(0.05)
+
+        await manager.approve_batch(tmp_path, workflow.id)
+        for _ in range(80):
+            current = get_workflow(tmp_path, workflow.id)
+            generated = [node for node in current.graph_json.nodes if node.fanout_parent_id == "literature-template"] if current else []
+            if current and current.status == "paused" and len(generated) == 2 and all(node.status == "waiting_approval" for node in generated):
+                break
+            await asyncio.sleep(0.05)
+
+        current = get_workflow(tmp_path, workflow.id)
+        assert current is not None
+        generated = [node for node in current.graph_json.nodes if node.fanout_parent_id == "literature-template"]
+        assert {node.id for node in generated} == {
+            "literature-template-g1",
+            "literature-template-g2",
+        }
+        assert any("Bayesian neural network" in node.prompt for node in generated)
+        assert {"keywords", "literature-template-g1", "literature-template-g2"} <= set(calls)
 
     asyncio.run(run())
 

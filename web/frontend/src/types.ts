@@ -561,6 +561,7 @@ export type RefineWorkflowPayload = {
 export type OptimizeNodePromptPayload = {
   graph_json?: WorkflowGraph
   instructions?: string | null
+  model?: string | null
 }
 
 export type OptimizeNodePromptResponse = {

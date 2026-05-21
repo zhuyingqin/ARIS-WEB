@@ -218,6 +218,14 @@ export const api = {
       `/api/workflows/${workflow.id}/nodes/${nodeId}/skip?workspace=${encodeURIComponent(workflow.workspace)}`,
       { method: "POST" },
     ),
+  restoreWorkflowNode: (workflow: WorkflowRecord, nodeId: string, resetDownstream = false) =>
+    request<WorkflowRecord>(
+      `/api/workflows/${workflow.id}/nodes/${nodeId}/restore?workspace=${encodeURIComponent(workflow.workspace)}`,
+      {
+        method: "POST",
+        body: JSON.stringify({ reset_downstream: resetDownstream }),
+      },
+    ),
   optimizeWorkflowNodePrompt: (workflow: WorkflowRecord, nodeId: string, payload: OptimizeNodePromptPayload) =>
     request<OptimizeNodePromptResponse>(
       `/api/workflows/${workflow.id}/nodes/${nodeId}/optimize-prompt?workspace=${encodeURIComponent(workflow.workspace)}`,
@@ -252,8 +260,12 @@ export const api = {
     `${API_BASE}/api/artifacts/${encodeArtifactId(path)}?workspace=${encodeURIComponent(workspace)}`,
   runStreamUrl: (run: RunRecord) =>
     `${wsBase()}/api/runs/${run.id}/stream?workspace=${encodeURIComponent(run.workspace)}`,
-  workflowStreamUrl: (workflow: WorkflowRecord) =>
-    `${wsBase()}/api/workflows/${workflow.id}/stream?workspace=${encodeURIComponent(workflow.workspace)}`,
-  workflowNodeStreamUrl: (workflow: WorkflowRecord, nodeId: string) =>
-    `${wsBase()}/api/workflows/${workflow.id}/nodes/${nodeId}/stream?workspace=${encodeURIComponent(workflow.workspace)}`,
+  workflowStreamUrl: (workflow: WorkflowRecord, replayLimit?: number) =>
+    `${wsBase()}/api/workflows/${workflow.id}/stream?workspace=${encodeURIComponent(workflow.workspace)}${
+      replayLimit === undefined ? "" : `&replay_limit=${replayLimit}`
+    }`,
+  workflowNodeStreamUrl: (workflow: WorkflowRecord, nodeId: string, replayLimit?: number) =>
+    `${wsBase()}/api/workflows/${workflow.id}/nodes/${nodeId}/stream?workspace=${encodeURIComponent(workflow.workspace)}${
+      replayLimit === undefined ? "" : `&replay_limit=${replayLimit}`
+    }`,
 }

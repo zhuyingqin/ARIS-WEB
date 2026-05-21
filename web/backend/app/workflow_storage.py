@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -150,6 +151,7 @@ def update_workflow(
     finished_at: str | None = None,
     error: str | None = None,
     clear_error: bool = False,
+    clear_finished_at: bool = False,
 ) -> None:
     updates: dict[str, Any] = {"updated_at": utc_now()}
     if title is not None:
@@ -162,7 +164,9 @@ def update_workflow(
         updates["graph_json"] = json.dumps(dump_model(graph_json), ensure_ascii=False)
     if started_at is not None:
         updates["started_at"] = started_at
-    if finished_at is not None:
+    if clear_finished_at:
+        updates["finished_at"] = None
+    elif finished_at is not None:
         updates["finished_at"] = finished_at
     if clear_error:
         updates["error"] = None
@@ -255,12 +259,19 @@ def read_artifact_index(workspace: Path, workflow_id: str) -> list[ArtifactIndex
     return entries
 
 
-def replay_workflow_events(workspace: Path, workflow_id: str) -> list[WorkflowEvent]:
+def replay_workflow_events(workspace: Path, workflow_id: str, limit: int | None = None) -> list[WorkflowEvent]:
     path = workflow_events_path(workspace, workflow_id)
     if not path.exists():
         return []
+    if limit is not None and limit <= 0:
+        return []
+    if limit is None:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    else:
+        with path.open(encoding="utf-8") as handle:
+            lines = list(deque(handle, maxlen=limit))
     events: list[WorkflowEvent] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in lines:
         if not line.strip():
             continue
         try:
