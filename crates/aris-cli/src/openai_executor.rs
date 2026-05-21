@@ -55,12 +55,16 @@ fn supports_reasoning_effort(model: &str) -> bool {
 #[must_use]
 fn supports_reasoning_content_replay(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
+    // Exclude deepseek non-R1 models from reasoning_content replay
+    if m.contains("deepseek") && !m.contains("deepseek-r1") {
+        return false;
+    }
     supports_reasoning_effort(&m)
         || m.contains("kimi")
         || m.contains("moonshot")
         || m.contains("mimo")
         || m.contains("deepseek-r1")
-        || m.contains("-r1")
+        || (m.contains("-r1") && !m.contains("deepseek"))
 }
 
 /// Effort tier sent alongside reasoning-capable models. Reads

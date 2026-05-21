@@ -3582,6 +3582,7 @@ const providerOptions: { value: GlobalApiProvider; label: string; hint: string }
   { value: "glm", label: "GLM OpenAI-compatible", hint: "Zhipu/GLM via OpenAI-compatible endpoint." },
   { value: "kimi", label: "Kimi OpenAI-compatible", hint: "Moonshot/Kimi via OpenAI-compatible endpoint." },
   { value: "minimax", label: "MiniMax Anthropic-compatible", hint: "MiniMax through the Anthropic-compatible API." },
+  { value: "deepseek", label: "DeepSeek OpenAI-compatible", hint: "DeepSeek via OpenAI-compatible endpoint." },
   { value: "custom", label: "Custom OpenAI-compatible", hint: "Any endpoint that accepts OpenAI-style requests." },
 ]
 

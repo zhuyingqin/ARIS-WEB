@@ -1,4 +1,5 @@
 mod config;
+mod deepseek_executor;
 mod init;
 mod input;
 mod memories;
@@ -95,12 +96,13 @@ fn has_any_executor_auth() -> bool {
     // pass the gate but the resolver would reject it, causing a silent fallback
     // to the Anthropic runtime with an OpenAI model.
     let openai_selected = std::env::var("EXECUTOR_PROVIDER").ok().as_deref() == Some("openai");
+    let deepseek_selected = std::env::var("EXECUTOR_PROVIDER").ok().as_deref() == Some("deepseek");
 
-    if openai_selected {
-        // OpenAI-compat executor: only OpenAI-style keys count. Anthropic
+    if openai_selected || deepseek_selected {
+        // OpenAI-compat or DeepSeek executor: only OpenAI-style keys count. Anthropic
         // OAuth tokens can't authenticate an OpenAI endpoint, so they must
         // NOT make this function return true.
-        return env_non_empty("EXECUTOR_API_KEY") || env_non_empty("OPENAI_API_KEY");
+        return env_non_empty("EXECUTOR_API_KEY") || env_non_empty("OPENAI_API_KEY") || env_non_empty("DEEPSEEK_API_KEY");
     }
 
     // Anthropic executor (default or explicit): native API key or Bearer token.
@@ -3660,8 +3662,9 @@ fn build_runtime(
     permission_mode: PermissionMode,
 ) -> Result<ConversationRuntime<ExecutorClient, CliToolExecutor>, Box<dyn std::error::Error>> {
     let executor: ExecutorClient =
-        if let Some(config) = openai_executor::resolve_openai_executor_config() {
-            ExecutorClient::OpenAI(openai_executor::OpenAIRuntimeClient::new(
+        if let Some(config) = deepseek_executor::resolve_deepseek_executor_config() {
+            eprintln!("\x1b[33mUsing DeepSeek executor\x1b[0m");
+            ExecutorClient::DeepSeek(deepseek_executor::DeepSeekRuntimeClient::new(
                 config,
                 model,
                 enable_tools,
@@ -3669,12 +3672,28 @@ fn build_runtime(
                 allowed_tools.clone(),
             )?)
         } else {
-            ExecutorClient::Anthropic(AnthropicRuntimeClient::new(
-                model,
-                enable_tools,
-                emit_output,
-                allowed_tools.clone(),
-            )?)
+            let provider = std::env::var("EXECUTOR_PROVIDER").unwrap_or_else(|_| "unset".to_string());
+            let api_key_set = std::env::var("EXECUTOR_API_KEY").is_ok();
+            let deepseek_key = std::env::var("DEEPSEEK_API_KEY").is_ok();
+            eprintln!("\x1b[33mDeepSeek config not found, EXECUTOR_PROVIDER='{}', EXECUTOR_API_KEY set={}, DEEPSEEK_API_KEY set={}\x1b[0m", provider, api_key_set, deepseek_key);
+            if let Some(config) = openai_executor::resolve_openai_executor_config() {
+                eprintln!("\x1b[33mUsing OpenAI executor\x1b[0m");
+                ExecutorClient::OpenAI(openai_executor::OpenAIRuntimeClient::new(
+                    config,
+                    model,
+                    enable_tools,
+                    emit_output,
+                    allowed_tools.clone(),
+                )?)
+            } else {
+                eprintln!("\x1b[33mUsing Anthropic executor\x1b[0m");
+                ExecutorClient::Anthropic(AnthropicRuntimeClient::new(
+                    model,
+                    enable_tools,
+                    emit_output,
+                    allowed_tools.clone(),
+                )?)
+            }
         };
 
     let feature_config = build_runtime_feature_config()?;
@@ -3756,6 +3775,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 enum ExecutorClient {
     Anthropic(AnthropicRuntimeClient),
     OpenAI(openai_executor::OpenAIRuntimeClient),
+    DeepSeek(deepseek_executor::DeepSeekRuntimeClient),
 }
 
 impl ApiClient for ExecutorClient {
@@ -3763,19 +3783,15 @@ impl ApiClient for ExecutorClient {
         match self {
             Self::Anthropic(c) => c.stream(request),
             Self::OpenAI(c) => c.stream(request),
+            Self::DeepSeek(c) => c.stream(request),
         }
     }
 
     fn on_session_compacted(&mut self, removed_count: usize) {
         match self {
-            // Anthropic uses thinking blocks inside session content, no
-            // out-of-band cache to invalidate.
             Self::Anthropic(_) => {}
-            // OpenAI executor's reasoning_cache is keyed by message index;
-            // compaction shifts every index so we drop the whole cache.
-            // Re-population happens organically as the model emits new
-            // reasoning_content blocks post-compaction.
             Self::OpenAI(c) => c.on_session_compacted(removed_count),
+            Self::DeepSeek(c) => c.on_session_compacted(removed_count),
         }
     }
 }

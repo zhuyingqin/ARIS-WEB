@@ -31,6 +31,7 @@ DEFAULT_BASE_URLS: dict[str, str] = {
     "glm": "https://open.bigmodel.cn/api/paas/v4",
     "minimax": "https://api.minimaxi.com/anthropic",
     "kimi": "https://api.moonshot.cn/v1",
+    "deepseek": "https://api.deepseek.com/v1",
 }
 
 DEFAULT_MODELS: dict[str, str] = {
@@ -51,7 +52,7 @@ DEFAULT_MODEL_OPTIONS: dict[str, list[str]] = {
     "custom": [],
 }
 
-PROVIDER_IDS: tuple[GlobalApiProvider, ...] = ("openai", "minimax", "anthropic", "gemini", "glm", "kimi", "custom")
+PROVIDER_IDS: tuple[GlobalApiProvider, ...] = ("openai", "minimax", "anthropic", "gemini", "glm", "kimi", "deepseek", "custom")
 PROVIDER_ID_SET = set(PROVIDER_IDS)
 
 MANAGED_ENV_KEYS = {
@@ -360,6 +361,8 @@ def applies_to(
         ])
     elif provider == "kimi":
         envs.extend(["EXECUTOR_PROVIDER=openai", "EXECUTOR_API_KEY", "KIMI_API_KEY", "EXECUTOR_BASE_URL"])
+    elif provider == "deepseek":
+        envs.extend(["EXECUTOR_PROVIDER=deepseek", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL"])
     else:
         envs.extend(["EXECUTOR_PROVIDER=openai", "EXECUTOR_API_KEY"])
         if base_url:
@@ -725,7 +728,7 @@ def openai_compatible_settings(home: Path = WEB_HOME, model: str | None = None) 
     api_key = str(profile.get("api_key") or "").strip()
     if not api_key:
         return None
-    if provider not in {"openai", "gemini", "glm", "minimax", "kimi", "custom"}:
+    if provider not in {"openai", "gemini", "glm", "minimax", "kimi", "deepseek", "custom"}:
         return None
     base_url = str(profile.get("base_url") or "").strip() or DEFAULT_BASE_URLS.get(provider)
     selected_model = str(model or "").strip() or str(profile.get("model") or "").strip() or DEFAULT_MODELS.get(provider)
@@ -785,6 +788,10 @@ def build_runtime_env(
         env["ANTHROPIC_BASE_URL"] = base_url or DEFAULT_BASE_URLS["minimax"]
         env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
         env["MINIMAX_API_KEY"] = api_key
+    elif provider == "deepseek":
+        env["EXECUTOR_PROVIDER"] = "deepseek"
+        env["DEEPSEEK_API_KEY"] = api_key
+        env["DEEPSEEK_BASE_URL"] = base_url or DEFAULT_BASE_URLS["deepseek"]
     else:
         env["EXECUTOR_PROVIDER"] = "openai"
         env["EXECUTOR_API_KEY"] = api_key
