@@ -26,6 +26,16 @@ DEFAULT_MODELS: dict[str, str] = {
     "kimi": "kimi-k2.5",
 }
 
+DEFAULT_MODEL_OPTIONS: dict[str, list[str]] = {
+    "anthropic": ["claude-sonnet-4-5", "claude-opus-4"],
+    "openai": ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"],
+    "gemini": ["gemini-2.5-pro", "gemini-2.5-flash"],
+    "glm": ["GLM-5", "GLM-5-Turbo"],
+    "minimax": ["MiniMax-M2.7", "MiniMax-M2.7-highspeed"],
+    "kimi": ["kimi-k2.5"],
+    "custom": [],
+}
+
 MANAGED_ENV_KEYS = {
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
@@ -41,7 +51,10 @@ MANAGED_ENV_KEYS = {
     "OPENAI_API_KEY",
     "ARIS_REASONING_EFFORT",
     "ARIS_REVIEWER_MODEL",
+    "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS",
 }
+
+DEFAULT_AUTO_COMPACT_INPUT_TOKENS = "80000"
 
 
 LOCAL_BIN_DIR = REPO_ROOT / ".aris-bin"
@@ -59,6 +72,10 @@ def _prepend_local_bin(env: dict[str, str]) -> None:
 
 def settings_path(home: Path = WEB_HOME) -> Path:
     return home / "global-settings.json"
+
+
+def planner_settings_path(home: Path = WEB_HOME) -> Path:
+    return home / "planner-settings.json"
 
 
 def _read_raw(home: Path = WEB_HOME) -> dict[str, Any]:
@@ -84,12 +101,114 @@ def _write_raw(data: dict[str, Any], home: Path = WEB_HOME) -> None:
         pass
 
 
+def _read_planner_raw(home: Path = WEB_HOME) -> dict[str, Any]:
+    path = planner_settings_path(home)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_planner_raw(data: dict[str, Any], home: Path = WEB_HOME) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    path = planner_settings_path(home)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def get_planner_llm_settings(home: Path = WEB_HOME) -> dict[str, str] | None:
+    data = _read_planner_raw(home)
+    api_key = str(data.get("api_key") or "").strip()
+    model = str(data.get("model") or "").strip() or "gpt-5.5"
+    base_url = str(data.get("base_url") or "").strip()
+    wire_api = str(data.get("wire_api") or "").strip() or "responses"
+    provider = str(data.get("provider") or "").strip() or "openai"
+    if not api_key or not base_url:
+        return None
+    return {
+        "provider": provider,
+        "api_key": api_key,
+        "base_url": base_url.rstrip("/"),
+        "model": model,
+        "wire_api": wire_api,
+    }
+
+
+def planner_llm_summary(home: Path = WEB_HOME) -> dict[str, str] | None:
+    settings = get_planner_llm_settings(home)
+    if not settings:
+        return None
+    return {
+        "provider": settings["provider"],
+        "base_url": settings["base_url"],
+        "model": settings["model"],
+        "wire_api": settings["wire_api"],
+        "api_key": mask_secret(settings["api_key"]) or "",
+    }
+
+
+def update_planner_llm_settings(
+    *,
+    api_key: str,
+    base_url: str,
+    model: str = "gpt-5.5",
+    wire_api: str = "responses",
+    provider: str = "openai",
+    home: Path = WEB_HOME,
+) -> dict[str, str] | None:
+    _write_planner_raw(
+        {
+            "provider": provider.strip() or "openai",
+            "api_key": api_key.strip(),
+            "base_url": base_url.strip().rstrip("/"),
+            "model": model.strip() or "gpt-5.5",
+            "wire_api": wire_api.strip() or "responses",
+            "updated_at": utc_now(),
+        },
+        home,
+    )
+    return get_planner_llm_settings(home)
+
+
 def mask_secret(secret: str | None) -> str | None:
     if not secret:
         return None
     if len(secret) <= 8:
         return "••••"
     return f"{secret[:4]}...{secret[-4:]}"
+
+
+def clean_model_options(*groups: object) -> list[str]:
+    seen: set[str] = set()
+    options: list[str] = []
+    for group in groups:
+        values = group if isinstance(group, list) else [group]
+        for value in values:
+            if not isinstance(value, str):
+                continue
+            item = value.strip()
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            options.append(item)
+    return options
+
+
+def model_options_for(provider: GlobalApiProvider, data: dict[str, Any]) -> list[str]:
+    return clean_model_options(
+        data.get("model"),
+        DEFAULT_MODELS.get(provider),
+        data.get("models"),
+        DEFAULT_MODEL_OPTIONS.get(provider, []),
+    )
 
 
 def applies_to(
@@ -143,12 +262,14 @@ def get_global_settings(home: Path = WEB_HOME) -> GlobalSettings:
     base_url = str(data.get("base_url") or "").strip() or None
     model = str(data.get("model") or "").strip() or None
     effort = str(data.get("effort") or "").strip() or None
+    models = model_options_for(provider, data)
     return GlobalSettings(
         provider=provider,
         api_key_set=bool(api_key),
         api_key_masked=mask_secret(api_key),
         base_url=base_url,
         model=model,
+        models=models,
         effort=effort,
         updated_at=data.get("updated_at") or None,
         config_path=str(settings_path(home)),
@@ -163,11 +284,14 @@ def update_global_settings(request: UpdateGlobalSettingsRequest, home: Path = WE
         api_key = ""
     elif request.api_key is not None and request.api_key.strip():
         api_key = request.api_key.strip()
+    model = request.model.strip() if request.model else None
+    models = clean_model_options(model, request.models if request.models is not None else current.get("models"))
     data = {
         "provider": request.provider,
         "api_key": api_key,
         "base_url": request.base_url.strip() if request.base_url else None,
-        "model": request.model.strip() if request.model else None,
+        "model": model,
+        "models": models,
         "effort": request.effort.strip() if request.effort else None,
         "updated_at": utc_now(),
     }
@@ -243,6 +367,7 @@ def build_runtime_env(base_env: dict[str, str] | None = None, home: Path = WEB_H
     effort = str(raw.get("effort") or "").strip()
     if not api_key:
         return env
+    env.setdefault("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS", DEFAULT_AUTO_COMPACT_INPUT_TOKENS)
 
     if provider == "anthropic":
         env["ANTHROPIC_API_KEY"] = api_key

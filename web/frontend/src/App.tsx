@@ -1,9 +1,12 @@
-import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { type MouseEvent as ReactMouseEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   applyNodeChanges,
+  BaseEdge,
   Background,
   Controls,
+  EdgeLabelRenderer,
+  getBezierPath,
   Handle,
   MarkerType,
   MiniMap,
@@ -12,15 +15,17 @@ import {
   type Connection,
   type Edge,
   type EdgeChange,
+  type EdgeProps,
+  type EdgeTypes,
   type Node,
   type NodeChange,
   type NodeProps,
+  type ReactFlowInstance,
   type NodeTypes,
 } from "@xyflow/react"
 import "@xyflow/react/dist/style.css"
 import {
   Activity,
-  Bot,
   BookOpen,
   ChevronDown,
   ChevronLeft,
@@ -36,7 +41,6 @@ import {
   Layers3,
   Pause,
   Play,
-  Plus,
   RefreshCcw,
   Save,
   Search,
@@ -58,20 +62,20 @@ import type {
   RunOutput,
   RunRecord,
   SkillInfo,
-  TeamConfig,
+  WorkflowDeltaRecord,
   WorkflowEvent,
   WorkflowGate,
+  WorkflowHandoff,
   WorkflowNodeInfo,
   WorkflowPort,
   WorkflowRecord,
+  WorkflowRuntimeResponse,
   WorkspaceInfo,
 } from "./types"
 import { Badge, Button, Card, Dialog, Input, Select, Tabs, Textarea } from "./components/ui"
-import { AgentsPage } from "./components/AgentsPage"
 
 const navItems = [
   { value: "orchestrator", label: "Orchestrator", icon: <GitBranch size={16} /> },
-  { value: "agents", label: "SubAgents", icon: <Bot size={16} /> },
   { value: "skills", label: "Skills", icon: <BookOpen size={16} /> },
   { value: "runs", label: "Runs", icon: <Terminal size={16} /> },
   { value: "artifacts", label: "Artifacts", icon: <FileText size={16} /> },
@@ -84,8 +88,55 @@ const workflowTemplateOptions = [
   { value: "paper_introduction", label: "Paper introduction" },
 ] as const
 
+type WorkflowEventFilter = "all" | "aris" | "workflow" | "node" | "planner" | "runtime" | "errors"
+
+const workflowEventFilterOptions: { value: WorkflowEventFilter; label: string }[] = [
+  { value: "all", label: "All" },
+  { value: "aris", label: "ARIS" },
+  { value: "workflow", label: "Flow" },
+  { value: "node", label: "Nodes" },
+  { value: "planner", label: "Planner" },
+  { value: "runtime", label: "Runtime" },
+  { value: "errors", label: "Errors" },
+]
+
+const WORKFLOW_EVENT_LIMIT = 5000
+
 function statusClass(status: string) {
   return `status status-${status}`
+}
+
+function isLiveWorkflowStatus(status?: string | null) {
+  return status === "running" || status === "paused"
+}
+
+function executionStateLabel(state?: string | null) {
+  switch (state) {
+    case "planning":
+      return "Planner checking"
+    case "running":
+      return "Running"
+    case "waiting_approval":
+      return "Waiting approval"
+    case "waiting_dynamic_dependency":
+      return "Waiting literature"
+    case "ready":
+      return "Ready to schedule"
+    case "scheduled":
+      return "Scheduled"
+    case "succeeded":
+      return "Done"
+    case "failed":
+      return "Failed"
+    case "cancelled":
+      return "Cancelled"
+    case "paused":
+      return "Paused"
+    case "draft":
+      return "Draft"
+    default:
+      return "Idle"
+  }
 }
 
 function compactPath(path: string) {
@@ -115,6 +166,7 @@ function useDefaultWorkspace(workspaces: WorkspaceInfo[] | undefined) {
 export default function App() {
   const queryClient = useQueryClient()
   const [view, setView] = useState("orchestrator")
+  const [sidebarHidden, setSidebarHidden] = useState(false)
   const workspaces = useQuery({ queryKey: ["workspaces"], queryFn: api.workspaces })
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, refetchInterval: 8000 })
   const skills = useQuery({ queryKey: ["skills"], queryFn: api.skills })
@@ -139,53 +191,78 @@ export default function App() {
   })
 
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-mark">A</div>
-          <div>
-            <strong>ARIS-Code</strong>
-            <span>Research cockpit</span>
-          </div>
-        </div>
-        <div className="branch-pill">
-          <Sparkles size={14} />
-          <span>aris-code</span>
-        </div>
-        <Tabs value={view} onChange={setView} items={navItems} />
-        <Card className="workspace-card">
-          <label>Workspace</label>
-          <Select value={workspace} onChange={(event) => setWorkspace(event.target.value)}>
-            {(workspaces.data ?? []).map((item) => (
-              <option key={item.path} value={item.path} disabled={!item.exists}>
-                {compactPath(item.path)}
-              </option>
-            ))}
-          </Select>
-          <div className="inline-form">
-            <Input
-              value={workspaceDraft}
-              onChange={(event) => setWorkspaceDraft(event.target.value)}
-              placeholder="/path/to/project"
-            />
-            <Button
+    <div className={`app-shell ${sidebarHidden ? "sidebar-hidden" : ""}`}>
+      {!sidebarHidden && (
+        <aside className="sidebar">
+          <div className="sidebar-head">
+            <div className="brand">
+              <div className="brand-mark">A</div>
+              <div>
+                <strong>ARIS-Code</strong>
+                <span>Research cockpit</span>
+              </div>
+            </div>
+            <button
+              aria-label="Hide sidebar"
+              className="sidebar-toggle"
+              onClick={() => setSidebarHidden(true)}
+              title="Hide sidebar"
               type="button"
-              variant="secondary"
-              onClick={() => addWorkspace.mutate(workspaceDraft)}
-              disabled={!workspaceDraft || addWorkspace.isPending}
-              aria-label="Add workspace"
-              title="Add workspace"
             >
-              <Folder size={15} />
-            </Button>
+              <ChevronLeft size={16} />
+            </button>
           </div>
-          {addWorkspace.error && <p className="error-text">{addWorkspace.error.message}</p>}
-        </Card>
-      </aside>
+          <div className="branch-pill">
+            <Sparkles size={14} />
+            <span>aris-code</span>
+          </div>
+          <Tabs value={view} onChange={setView} items={navItems} />
+          <Card className="workspace-card">
+            <label>Workspace</label>
+            <Select value={workspace} onChange={(event) => setWorkspace(event.target.value)}>
+              {(workspaces.data ?? []).map((item) => (
+                <option key={item.path} value={item.path} disabled={!item.exists}>
+                  {compactPath(item.path)}
+                </option>
+              ))}
+            </Select>
+            <div className="inline-form">
+              <Input
+                value={workspaceDraft}
+                onChange={(event) => setWorkspaceDraft(event.target.value)}
+                placeholder="/path/to/project"
+              />
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={() => addWorkspace.mutate(workspaceDraft)}
+                disabled={!workspaceDraft || addWorkspace.isPending}
+                aria-label="Add workspace"
+                title="Add workspace"
+              >
+                <Folder size={15} />
+              </Button>
+            </div>
+            {addWorkspace.error && <p className="error-text">{addWorkspace.error.message}</p>}
+          </Card>
+        </aside>
+      )}
 
       <main className="main">
         <div className="topbar">
           <div className="topbar-title">
+            {sidebarHidden && (
+              <button
+                aria-label="Show sidebar"
+                className="sidebar-restore"
+                onClick={() => setSidebarHidden(false)}
+                title="Show sidebar"
+                type="button"
+              >
+                <ChevronRight size={15} />
+                <span>Menu</span>
+              </button>
+            )}
             <span className="eyebrow">Auto Research in Sleep</span>
             <h1>{navItems.find((item) => item.value === view)?.label ?? "Console"}</h1>
           </div>
@@ -208,7 +285,6 @@ export default function App() {
           </div>
         </div>
         {view === "orchestrator" && <OrchestratorPage workspace={workspace} />}
-        {view === "agents" && <AgentsPage workspace={workspace} />}
         {view === "skills" && <SkillsPage workspace={workspace} onRunCreated={() => setView("runs")} />}
         {view === "runs" && <RunsPage workspace={workspace} />}
         {view === "artifacts" && <ArtifactsPage workspace={workspace} />}
@@ -247,6 +323,11 @@ function outputFilePaths(outputs: WorkflowPort[]) {
     })
     .map((item) => portName(item).replace(/^\.\//, ""))
     .filter(Boolean)
+}
+
+function workflowOutputArtifactPaths(workflow: WorkflowRecord, node: WorkflowNodeInfo) {
+  const base = `.aris/web/workflows/${workflow.id}/nodes/${node.id}/attempt-${(node.attempt ?? 0) + 1}`
+  return outputFilePaths(node.outputs).map((path) => (path.startsWith(".aris/") ? path : `${base}/${path}`))
 }
 
 function artifactExtension(path: string) {
@@ -328,27 +409,11 @@ function slug(value: string) {
   return normalized || `node-${Date.now().toString(36)}`
 }
 
-function uniqueTeamPrefix(teamId: string, nodes: WorkflowNodeInfo[]) {
-  const base = slug(teamId)
-  const used = new Set(nodes.map((node) => node.id))
-  let candidate = base
-  let index = 2
-  while ([...used].some((id) => id === candidate || id.startsWith(`${candidate}-`))) {
-    candidate = `${base}-${index}`
-    index += 1
-  }
-  return candidate
-}
-
 function workflowCounts(workflow: WorkflowRecord) {
   const nodes = workflow.graph_json.nodes
-  const agents = nodes.filter((node) => node.type === "agent").length
-  const subAgents = nodes.filter((node) => node.type === "sub_agent").length
+  const agents = nodes.filter((node) => node.type === "agent" || node.type === "sub_agent").length
   const gates = nodes.filter((node) => node.type === "human_gate").length
-  const specialists = new Set(
-    nodes.filter((node) => node.type === "sub_agent" && node.config_file).map((node) => node.config_file as string),
-  ).size
-  return { agents, subAgents, gates, specialists }
+  return { agents, gates }
 }
 
 function workflowNodeOrder(workflow: WorkflowRecord | null): string[] {
@@ -399,6 +464,82 @@ function workflowNodeSequence(workflow: WorkflowRecord | null): Map<string, numb
   return new Map(workflowNodeOrder(workflow).map((id, index) => [id, index + 1]))
 }
 
+function workflowEventLabel(event: WorkflowEvent) {
+  if (event.event_type === "workflow") return "workflow"
+  if (event.event_type === "planner") return "planner"
+  if (event.event_type === "delta") return "delta"
+  if (event.event_type === "session") return "session"
+  if (event.event_type === "approval") return "approval"
+  if (event.event_type === "node" || event.event_type === "run") return event.node_id ?? event.event_type
+  if (["aris", "thinking", "tool", "result", "stdout", "stderr"].includes(event.event_type)) {
+    return event.event_type === "aris" ? "aris" : `aris/${event.event_type}`
+  }
+  return event.event_type
+}
+
+function workflowEventTitle(event: WorkflowEvent) {
+  return [
+    event.event_type,
+    event.node_id ? `node: ${event.node_id}` : "",
+    event.run_id ? `run: ${event.run_id}` : "",
+  ]
+    .filter(Boolean)
+    .join(" | ")
+}
+
+function eventPayloadEntries(event: WorkflowEvent) {
+  const payload = event.payload ?? {}
+  return Object.entries(payload).filter(([, value]) => value !== null && value !== undefined && value !== "")
+}
+
+function workflowEventMetaItems(event: WorkflowEvent): { key: string; value: string }[] {
+  const payload = event.payload ?? {}
+  const items: { key: string; value: string }[] = []
+  if (event.node_id) items.push({ key: "node", value: event.node_id })
+  if (event.run_id) items.push({ key: "run", value: event.run_id })
+  for (const key of ["model", "skill", "effort", "tick_id", "trigger", "decision_type", "action", "delta_id", "status", "session_id"]) {
+    const value = payload[key]
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      items.push({ key, value: String(value) })
+    }
+  }
+  const policy = payload["policy_result"]
+  if (policy && typeof policy === "object" && "allowed" in policy) {
+    const allowed = (policy as { allowed?: unknown }).allowed
+    const reason = (policy as { reason?: unknown }).reason
+    items.push({ key: "policy", value: `${allowed ? "allowed" : "rejected"}${reason ? `: ${String(reason)}` : ""}` })
+  }
+  return items
+}
+
+function workflowEventPayloadText(event: WorkflowEvent) {
+  if (!event.payload || eventPayloadEntries(event).length === 0) return ""
+  try {
+    return JSON.stringify(event.payload, null, 2)
+  } catch {
+    return String(event.payload)
+  }
+}
+
+function isArisOutputEvent(event: WorkflowEvent) {
+  return ["aris", "thinking", "tool", "result", "stdout", "stderr"].includes(event.event_type)
+}
+
+function isWorkflowErrorEvent(event: WorkflowEvent) {
+  return event.event_type === "stderr" || /\b(error|failed|failure|unauthorized|timeout)\b/i.test(event.message)
+}
+
+function workflowEventMatchesFilter(event: WorkflowEvent, filter: WorkflowEventFilter) {
+  if (filter === "all") return true
+  if (filter === "aris") return isArisOutputEvent(event)
+  if (filter === "workflow") return event.event_type === "workflow"
+  if (filter === "node") return event.event_type === "node" || event.event_type === "run"
+  if (filter === "planner") return event.event_type === "planner"
+  if (filter === "runtime") return ["delta", "session", "approval"].includes(event.event_type)
+  if (filter === "errors") return isWorkflowErrorEvent(event)
+  return true
+}
+
 function organizeWorkflowPositions(workflow: WorkflowRecord) {
   const order = workflowNodeOrder(workflow)
   const orderIndex = new Map(order.map((id, index) => [id, index]))
@@ -426,14 +567,29 @@ function organizeWorkflowPositions(workflow: WorkflowRecord) {
     ids.sort((a, b) => (orderIndex.get(a) ?? 0) - (orderIndex.get(b) ?? 0))
   }
 
+  const layerCount = Math.max(...Array.from(rowsByLayer.keys()), 0) + 1
+  const maxRowsInLayer = Math.max(...Array.from(rowsByLayer.values()).map((ids) => ids.length), 1)
+  const nodeCount = workflow.graph_json.nodes.length
+  const columnsPerBand = Math.min(layerCount, Math.min(5, Math.max(3, Math.ceil(Math.sqrt(nodeCount * 1.7)))))
+  const xGap = layerCount > columnsPerBand ? 260 : 300
+  const yGap = maxRowsInLayer > 2 ? 126 : 148
+  const bandHeight = Math.max(250, maxRowsInLayer * yGap + 88)
+  const originX = 96
+  const originY = 96
+
   workflow.graph_json.nodes = workflow.graph_json.nodes.map((node) => {
     const layer = layerById.get(node.id) ?? 0
     const row = rowsByLayer.get(layer)?.indexOf(node.id) ?? 0
+    const band = Math.floor(layer / columnsPerBand)
+    const columnInBand = layer % columnsPerBand
+    const visualColumn = band % 2 === 0 ? columnInBand : columnsPerBand - 1 - columnInBand
+    const idsInLayer = rowsByLayer.get(layer) ?? []
+    const verticalInset = ((maxRowsInLayer - idsInLayer.length) * yGap) / 2
     return {
       ...node,
       position: {
-        x: 80 + layer * 300,
-        y: 92 + row * 148,
+        x: originX + visualColumn * xGap,
+        y: originY + band * bandHeight + verticalInset + row * yGap,
       },
     }
   })
@@ -441,7 +597,7 @@ function organizeWorkflowPositions(workflow: WorkflowRecord) {
 
 function nodeKindLabel(node: WorkflowNodeInfo) {
   if (node.type === "human_gate") return "Gate"
-  if (node.type === "sub_agent") return "SubAgent"
+  if (node.skill === "research-lit" && node.dynamic_parent_id) return "Research"
   return "Agent"
 }
 
@@ -462,6 +618,75 @@ function WorkflowFlowNode({ data }: NodeProps) {
 
 const workflowNodeTypes: NodeTypes = {
   workflow: WorkflowFlowNode,
+}
+
+type WorkflowEdgeData = Record<string, unknown> & {
+  label?: string
+  onOpen?: (edgeId: string) => void
+}
+
+type WorkflowCanvasEdge = Edge<WorkflowEdgeData, "workflowHandoff">
+
+function WorkflowHandoffEdge({
+  id,
+  sourceX,
+  sourceY,
+  targetX,
+  targetY,
+  sourcePosition,
+  targetPosition,
+  markerEnd,
+  markerStart,
+  style,
+  selected,
+  data,
+  interactionWidth,
+}: EdgeProps<WorkflowCanvasEdge>) {
+  const [edgePath, labelX, labelY] = getBezierPath({
+    sourceX,
+    sourceY,
+    sourcePosition,
+    targetX,
+    targetY,
+    targetPosition,
+  })
+  const label = typeof data?.label === "string" ? data.label : ""
+  const handleOpen = (event: ReactMouseEvent<HTMLButtonElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+    data?.onOpen?.(id)
+  }
+
+  return (
+    <>
+      <BaseEdge
+        id={id}
+        path={edgePath}
+        markerEnd={markerEnd}
+        markerStart={markerStart}
+        style={style}
+        interactionWidth={interactionWidth}
+      />
+      {label && (
+        <EdgeLabelRenderer>
+          <button
+            aria-label={`${label}. View handoff preview.`}
+            className={`nodrag nopan flow-edge-label-button${selected ? " flow-edge-label-button-selected" : ""}`}
+            onClick={handleOpen}
+            style={{ transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)` }}
+            title="View handoff preview"
+            type="button"
+          >
+            {label}
+          </button>
+        </EdgeLabelRenderer>
+      )}
+    </>
+  )
+}
+
+const workflowEdgeTypes: EdgeTypes = {
+  workflowHandoff: WorkflowHandoffEdge,
 }
 
 function isExecutableNode(node: WorkflowNodeInfo) {
@@ -500,6 +725,16 @@ function jsonPreview(value: unknown, max = 420) {
     text = String(value)
   }
   return truncate(text, max)
+}
+
+function handoffKey(source: string, target: string) {
+  return `${source}->${target}`
+}
+
+function edgeHandoffLabel(handoff: WorkflowHandoff | undefined, plannerInserted: boolean) {
+  if (!handoff?.preview) return plannerInserted ? "planner" : undefined
+  const typeLabel = handoff.content_type === "json" ? "json" : handoff.content_type === "text" ? "text" : "handoff"
+  return plannerInserted ? `planner ${typeLabel} view` : `${typeLabel} view`
 }
 
 function NodeResultPanel({ workflow, node }: { workflow: WorkflowRecord; node: WorkflowNodeInfo }) {
@@ -546,6 +781,12 @@ function NodeResultPanel({ workflow, node }: { workflow: WorkflowRecord; node: W
           Run
           <b>{runId || "not started"}</b>
         </span>
+        {(node.usage?.model || node.model) && (
+          <span>
+            Model
+            <b>{node.usage?.model ?? node.model}</b>
+          </span>
+        )}
         {node.usage && (
           <>
             <span>
@@ -780,15 +1021,21 @@ function NodeArtifactDialog({ preview, onClose }: { preview: NodeArtifactPreview
             </a>
           </div>
           {error ? (
-            <p className="error-text">{error}</p>
-          ) : isImageArtifact(path) ? (
-            <img className="preview-image" src={api.artifactUrlForPath(preview.workspace, path)} alt={artifactLabel(path)} />
-          ) : isFrameArtifact(path) ? (
-            <iframe className="preview-frame" src={api.artifactUrlForPath(preview.workspace, path)} title={artifactLabel(path)} />
-          ) : isMarkdownArtifact(path) ? (
-            text ? <MarkdownPreview text={text} /> : <p className="muted">Loading Markdown...</p>
+            <div className="node-artifact-reader-content">
+              <p className="error-text">{error}</p>
+            </div>
           ) : (
-            <pre className="preview-text">{text || "Loading..."}</pre>
+            <div className="node-artifact-reader-content">
+              {isImageArtifact(path) ? (
+                <img className="preview-image" src={api.artifactUrlForPath(preview.workspace, path)} alt={artifactLabel(path)} />
+              ) : isFrameArtifact(path) ? (
+                <iframe className="preview-frame" src={api.artifactUrlForPath(preview.workspace, path)} title={artifactLabel(path)} />
+              ) : isMarkdownArtifact(path) ? (
+                text ? <MarkdownPreview text={text} /> : <p className="muted">Loading Markdown...</p>
+              ) : (
+                <pre className="preview-text">{text || "Loading..."}</pre>
+              )}
+            </div>
           )}
         </div>
       )}
@@ -810,35 +1057,35 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
   const [canvasToolsCollapsed, setCanvasToolsCollapsed] = useState(true)
   const [selectedNodeId, setSelectedNodeId] = useState("")
   const [selectedEdgeId, setSelectedEdgeId] = useState("")
+  const [promptOptimizationNote, setPromptOptimizationNote] = useState("")
+  const [promptSuggestion, setPromptSuggestion] = useState<{ nodeId: string; prompt: string } | null>(null)
   const [artifactPreview, setArtifactPreview] = useState<NodeArtifactPreview | null>(null)
-  const [teamDialogOpen, setTeamDialogOpen] = useState(false)
-  const [selectedTeamId, setSelectedTeamId] = useState("")
-  const [teamPrefix, setTeamPrefix] = useState("")
   const [events, setEvents] = useState<WorkflowEvent[]>([])
-  const workflowLogRef = useAutoScrollToEnd<HTMLDivElement>([events.length, selectedId])
+  const [workflowEventFilter, setWorkflowEventFilter] = useState<WorkflowEventFilter>("all")
+  const [showFullWorkflowLog, setShowFullWorkflowLog] = useState(true)
+  const workflowLogRef = useAutoScrollToEnd<HTMLDivElement>([events.length, selectedId, workflowEventFilter, showFullWorkflowLog])
+  const flowInstanceRef = useRef<ReactFlowInstance<Node, WorkflowCanvasEdge> | null>(null)
+  const workflowRefreshTimerRef = useRef<number | null>(null)
+  const artifactRefreshTimerRef = useRef<number | null>(null)
   const [canvasNodes, setCanvasNodes] = useState<Node[]>([])
   const workflows = useQuery({
     queryKey: ["workflows", workspace],
     queryFn: () => api.workflows(workspace),
     enabled: Boolean(workspace),
-    refetchInterval: dirty || isDraggingNode ? false : 3000,
+    refetchInterval: dirty || isDraggingNode ? false : isLiveWorkflowStatus(draft?.status) ? 10000 : false,
   })
   const skills = useQuery({ queryKey: ["skills"], queryFn: api.skills })
+  const settings = useQuery({ queryKey: ["settings"], queryFn: api.settings })
   const agentConfigs = useQuery({
     queryKey: ["agent-configs", workspace],
     queryFn: () => api.agentConfigs(workspace),
-    enabled: Boolean(workspace),
-  })
-  const teamConfigs = useQuery({
-    queryKey: ["team-configs", workspace],
-    queryFn: () => api.teamConfigs(workspace),
     enabled: Boolean(workspace),
   })
   const workspaceArtifacts = useQuery({
     queryKey: ["artifacts", workspace],
     queryFn: () => api.artifacts(workspace),
     enabled: Boolean(workspace),
-    refetchInterval: draft?.status === "running" ? 5000 : false,
+    refetchInterval: isLiveWorkflowStatus(draft?.status) ? 5000 : false,
   })
   const nodesWithRuns = useMemo(() => (draft?.graph_json.nodes ?? []).filter((node) => Boolean(node.run_id)), [draft?.graph_json.nodes])
   const nodeOutputQueries = useQueries({
@@ -860,6 +1107,40 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
   }, [nodeOutputSignature, nodesWithRuns])
   const selected = (workflows.data ?? []).find((workflow) => workflow.id === selectedId) ?? workflows.data?.[0]
   const artifactsByPath = useMemo(() => artifactByPath(workspaceArtifacts.data), [workspaceArtifacts.data])
+  const runtime = useQuery<WorkflowRuntimeResponse>({
+    queryKey: ["workflow-runtime", selected?.id],
+    queryFn: () => api.workflowRuntime(selected as WorkflowRecord),
+    enabled: Boolean(selected),
+    refetchInterval: isLiveWorkflowStatus(selected?.status) ? 5000 : false,
+  })
+  const decisions = useQuery({
+    queryKey: ["workflow-decisions", selected?.id],
+    queryFn: () => api.workflowDecisions(selected as WorkflowRecord),
+    enabled: Boolean(selected),
+    refetchInterval: isLiveWorkflowStatus(selected?.status) ? 7000 : false,
+  })
+  const deltas = useQuery({
+    queryKey: ["workflow-deltas", selected?.id],
+    queryFn: () => api.workflowDeltas(selected as WorkflowRecord),
+    enabled: Boolean(selected),
+    refetchInterval: isLiveWorkflowStatus(selected?.status) ? 7000 : false,
+  })
+
+  const scheduleWorkflowRefresh = useCallback(() => {
+    if (workflowRefreshTimerRef.current !== null) return
+    workflowRefreshTimerRef.current = window.setTimeout(() => {
+      workflowRefreshTimerRef.current = null
+      queryClient.invalidateQueries({ queryKey: ["workflows", workspace] })
+    }, 900)
+  }, [queryClient, workspace])
+
+  const scheduleArtifactRefresh = useCallback(() => {
+    if (artifactRefreshTimerRef.current !== null) return
+    artifactRefreshTimerRef.current = window.setTimeout(() => {
+      artifactRefreshTimerRef.current = null
+      queryClient.invalidateQueries({ queryKey: ["artifacts", workspace] })
+    }, 1800)
+  }, [queryClient, workspace])
 
   useEffect(() => {
     if (!selectedId && workflows.data?.[0]) setSelectedId(workflows.data[0].id)
@@ -867,13 +1148,15 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
 
   useEffect(() => {
     if (!workflows.data) return
-    setGeneratorCollapsed(workflows.data.length > 0)
-    setFlowPanelCollapsed(workflows.data.length > 0)
+    if (workflows.data.length === 0) {
+      setGeneratorCollapsed(false)
+      setFlowPanelCollapsed(false)
+    }
   }, [workflows.data?.length])
 
   useEffect(() => {
-    if (!selectedTeamId && teamConfigs.data?.[0]) setSelectedTeamId(teamConfigs.data[0].id)
-  }, [selectedTeamId, teamConfigs.data])
+    setPromptSuggestion(null)
+  }, [selectedNodeId])
 
   useEffect(() => {
     if (!selected) return
@@ -882,7 +1165,11 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
       return cloneWorkflow(selected)
     })
     if (!dirty) {
-      setSelectedNodeId(selected.graph_json.nodes[0]?.id ?? "")
+      setSelectedNodeId((current) =>
+        current && selected.graph_json.nodes.some((node) => node.id === current)
+          ? current
+          : selected.graph_json.nodes[0]?.id ?? "",
+      )
     }
   }, [dirty, selected?.id, selected?.updated_at])
 
@@ -892,14 +1179,24 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
     const socket = new WebSocket(api.workflowStreamUrl(selected))
     socket.onmessage = (message) => {
       const event = JSON.parse(message.data) as WorkflowEvent
-      setEvents((current) => [...current, event].slice(-800))
-      if (["workflow", "node"].includes(event.event_type)) {
-        queryClient.invalidateQueries({ queryKey: ["workflows", workspace] })
-        queryClient.invalidateQueries({ queryKey: ["artifacts", workspace] })
+      setEvents((current) => [...current, event].slice(-WORKFLOW_EVENT_LIMIT))
+      if (["workflow", "node", "planner", "delta", "session", "approval"].includes(event.event_type)) {
+        scheduleWorkflowRefresh()
+        scheduleArtifactRefresh()
+        queryClient.invalidateQueries({ queryKey: ["workflow-runtime", selected.id] })
+        queryClient.invalidateQueries({ queryKey: ["workflow-decisions", selected.id] })
+        queryClient.invalidateQueries({ queryKey: ["workflow-deltas", selected.id] })
       }
     }
     return () => socket.close()
-  }, [queryClient, selected?.id, selected?.workspace, workspace])
+  }, [queryClient, scheduleArtifactRefresh, scheduleWorkflowRefresh, selected?.id, selected?.workspace, workspace])
+
+  useEffect(() => {
+    return () => {
+      if (workflowRefreshTimerRef.current !== null) window.clearTimeout(workflowRefreshTimerRef.current)
+      if (artifactRefreshTimerRef.current !== null) window.clearTimeout(artifactRefreshTimerRef.current)
+    }
+  }, [])
 
   const createWorkflow = useMutation({
     mutationFn: api.createWorkflow,
@@ -950,21 +1247,39 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
   })
   const deleteWorkflow = useMutation({
     mutationFn: api.deleteWorkflow,
-    onSuccess: (_result, workflow) => {
+    onMutate: async (workflow) => {
+      await queryClient.cancelQueries({ queryKey: ["workflows", workspace] })
+      const previousWorkflows = queryClient.getQueryData<WorkflowRecord[]>(["workflows", workspace])
       queryClient.setQueryData<WorkflowRecord[]>(["workflows", workspace], (current) =>
         (current ?? []).filter((item) => item.id !== workflow.id),
       )
-      queryClient.invalidateQueries({ queryKey: ["workflows", workspace] })
+      return { previousWorkflows }
+    },
+    onError: (_error, _workflow, context) => {
+      if (context?.previousWorkflows) {
+        queryClient.setQueryData(["workflows", workspace], context.previousWorkflows)
+      }
+    },
+    onSuccess: (_result, workflow) => {
       setSelectedId((current) => (current === workflow.id ? "" : current))
       setDraft((current) => (current?.id === workflow.id ? null : current))
       setDirty(false)
       setSelectedNodeId("")
       setSelectedEdgeId("")
       setEvents([])
+      queryClient.removeQueries({ queryKey: ["workflow-runtime", workflow.id] })
+      queryClient.removeQueries({ queryKey: ["workflow-decisions", workflow.id] })
+      queryClient.removeQueries({ queryKey: ["workflow-deltas", workflow.id] })
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ["workflows", workspace] })
     },
   })
   const executeWorkflow = useMutation({
-    mutationFn: api.executeWorkflow,
+    mutationFn: async (workflow: WorkflowRecord) => {
+      const saved = await api.updateWorkflow(workflow)
+      return api.executeWorkflow(saved)
+    },
     onSuccess: (workflow) => {
       queryClient.invalidateQueries({ queryKey: ["workflows", workspace] })
       setDraft(cloneWorkflow(workflow))
@@ -1015,35 +1330,38 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
       setDraft(cloneWorkflow(workflow))
     },
   })
-  const rerunNode = useMutation({
-    mutationFn: ({ workflow, nodeId }: { workflow: WorkflowRecord; nodeId: string }) =>
-      api.rerunWorkflowNode(workflow, nodeId, true),
-    onSuccess: (workflow) => {
-      queryClient.invalidateQueries({ queryKey: ["workflows", workspace] })
-      setDraft(cloneWorkflow(workflow))
-    },
-  })
-  const expandTeam = useMutation({
-    mutationFn: ({ workflow, team, prefix }: { workflow: WorkflowRecord; team: TeamConfig; prefix: string }) =>
-      api.expandWorkflowTeam(workflow, {
-        team_id: team.id,
-        prefix,
-        position: selectedNode?.position
-          ? { x: selectedNode.position.x + 280, y: selectedNode.position.y }
-          : { x: 120, y: 140 },
-        depends_on: selectedNodeId ? [selectedNodeId] : [],
-        connect_to: [],
+  const optimizeNodePrompt = useMutation({
+    mutationFn: ({ workflow, nodeId, instructions }: { workflow: WorkflowRecord; nodeId: string; instructions: string }) =>
+      api.optimizeWorkflowNodePrompt(workflow, nodeId, {
+        graph_json: workflow.graph_json,
+        instructions: instructions.trim() || null,
       }),
+    onSuccess: (response, variables) => {
+      setPromptSuggestion({ nodeId: variables.nodeId, prompt: response.prompt })
+    },
+  })
+  const runNode = useMutation({
+    mutationFn: async ({ workflow, nodeId }: { workflow: WorkflowRecord; nodeId: string }) => {
+      const saved = await api.updateWorkflow(workflow)
+      return api.rerunWorkflowNode(saved, nodeId, false)
+    },
     onSuccess: (workflow) => {
       queryClient.invalidateQueries({ queryKey: ["workflows", workspace] })
       setDraft(cloneWorkflow(workflow))
-      setSelectedId(workflow.id)
       setDirty(false)
-      setTeamDialogOpen(false)
-      setTeamPrefix("")
     },
   })
-
+  const rerunNode = useMutation({
+    mutationFn: async ({ workflow, nodeId }: { workflow: WorkflowRecord; nodeId: string }) => {
+      const saved = await api.updateWorkflow(workflow)
+      return api.rerunWorkflowNode(saved, nodeId, true)
+    },
+    onSuccess: (workflow) => {
+      queryClient.invalidateQueries({ queryKey: ["workflows", workspace] })
+      setDraft(cloneWorkflow(workflow))
+      setDirty(false)
+    },
+  })
   function updateDraft(updater: (workflow: WorkflowRecord) => void) {
     setDraft((current) => {
       if (!current) return current
@@ -1084,11 +1402,11 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
   function addNode(type: WorkflowNodeInfo["type"]) {
     updateDraft((workflow) => {
       const index = workflow.graph_json.nodes.length + 1
-      const id = slug(`${type === "human_gate" ? "gate" : type === "sub_agent" ? "sub-agent" : "agent"}-${index}`)
+      const id = slug(`${type === "human_gate" ? "gate" : "agent"}-${index}`)
       workflow.graph_json.nodes.push({
         id,
         type,
-        name: type === "human_gate" ? `Gate ${index}` : type === "sub_agent" ? `SubAgent ${index}` : `Agent ${index}`,
+        name: type === "human_gate" ? `Gate ${index}` : `Agent ${index}`,
         role: type === "human_gate" ? "human approval" : type === "sub_agent" ? "executor" : "planner",
         skill: null,
         config_file: null,
@@ -1101,6 +1419,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
         outputs: [],
         status: "queued",
         run_id: null,
+        session_path: null,
         error: null,
         approved_before: false,
         approved_after: false,
@@ -1112,6 +1431,10 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
         fanout: null,
         fanout_parent_id: null,
         fanout_item: null,
+        dynamic_parent_id: null,
+        dynamic_reason: null,
+        auto_approve_after: false,
+        research_request: null,
       })
       setSelectedNodeId(id)
       setSelectedEdgeId("")
@@ -1134,40 +1457,124 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
     updateDraft((workflow) => {
       organizeWorkflowPositions(workflow)
     })
+    window.setTimeout(() => {
+      flowInstanceRef.current?.fitView({ padding: 0.16, duration: 320 })
+    }, 80)
   }
 
   const selectedNode = draft?.graph_json.nodes.find((node) => node.id === selectedNodeId) ?? null
   const selectedEdge = draft?.graph_json.edges.find((edge) => edge.id === selectedEdgeId) ?? null
+  const handoffByEdge = useMemo(() => {
+    const next = new Map<string, WorkflowHandoff>()
+    for (const handoff of runtime.data?.handoffs ?? []) {
+      next.set(handoffKey(handoff.source, handoff.target), handoff)
+    }
+    return next
+  }, [runtime.data?.handoffs])
+  const selectedHandoff = selectedEdge ? handoffByEdge.get(handoffKey(selectedEdge.source, selectedEdge.target)) : undefined
+  const openEdgePanel = useCallback((edgeId: string) => {
+    setSelectedEdgeId(edgeId)
+    setSelectedNodeId("")
+  }, [])
+  const selectedRuntimeSessionId = draft && selectedNode ? `node:${draft.id}:${selectedNode.id}` : runtime.data?.runtime_summary.planner_session_id
+  const selectedSession = useQuery({
+    queryKey: ["workflow-session", selected?.id, selectedRuntimeSessionId],
+    queryFn: () => api.workflowSession(selected as WorkflowRecord, selectedRuntimeSessionId as string),
+    enabled: Boolean(selected && selectedRuntimeSessionId),
+    refetchInterval: isLiveWorkflowStatus(selected?.status) ? 7000 : false,
+  })
+  const workflowTerminalStats = useMemo(
+    () => ({
+      aris: events.filter(isArisOutputEvent).length,
+      total: events.length,
+    }),
+    [events],
+  )
+  const workflowTerminalCounts = useMemo(
+    () => ({
+      all: events.length,
+      aris: events.filter(isArisOutputEvent).length,
+      workflow: events.filter((event) => event.event_type === "workflow").length,
+      node: events.filter((event) => event.event_type === "node" || event.event_type === "run").length,
+      planner: events.filter((event) => event.event_type === "planner").length,
+      runtime: events.filter((event) => ["delta", "session", "approval"].includes(event.event_type)).length,
+      errors: events.filter(isWorkflowErrorEvent).length,
+    }),
+    [events],
+  )
+  const displayedWorkflowEvents = useMemo(
+    () => events.filter((event) => workflowEventMatchesFilter(event, workflowEventFilter)),
+    [events, workflowEventFilter],
+  )
   const selectedNodeConfig =
     selectedNode?.type === "sub_agent" ? findAgentConfig(agentConfigs.data, selectedNode?.config_file) : null
-  const selectedTeam = (teamConfigs.data ?? []).find((team) => team.id === selectedTeamId) ?? teamConfigs.data?.[0] ?? null
+  const nodeModelOptions = uniqueModelOptions(
+    selectedNode?.model,
+    selectedNodeConfig?.model,
+    settings.data?.model,
+    settings.data?.models ?? [],
+  )
+  const nodeModelDefaultLabel = selectedNodeConfig?.model
+    ? `Use profile default (${selectedNodeConfig.model})`
+    : settings.data?.model
+      ? `Use global default (${settings.data.model})`
+      : "Use runtime default"
   const draftCounts = draft
     ? workflowCounts(draft)
-    : { agents: 0, subAgents: 0, gates: 0, specialists: 0 }
+    : { agents: 0, gates: 0 }
   const waitingBatchCount =
     draft?.graph_json.nodes.filter(
       (node) => isExecutableNode(node) && node.status === "waiting_approval" && Boolean(node.run_id) && !node.approved_after,
     ).length ?? 0
+  const runtimeSummary = runtime.data?.runtime_summary
+  const executionState = runtimeSummary?.execution_state ?? draft?.status ?? "idle"
+  const executionAction = runtimeSummary?.next_action || "Runtime state has not been recorded yet."
+  const executionLastEvent = runtimeSummary?.last_event_at ? runtimeSummary.last_event_at.slice(11, 19) : "no events"
+  const activeNodeIds = runtimeSummary?.active_node_ids ?? []
+  const waitingApprovalIds = runtimeSummary?.waiting_approval_node_ids ?? []
+  const waitingLiteratureIds = runtimeSummary?.waiting_dynamic_dependency_node_ids ?? []
+  const readyNodeIds = runtimeSummary?.ready_node_ids ?? []
+  const latestDecision =
+    runtime.data?.latest_decision ?? (decisions.data?.length ? decisions.data[decisions.data.length - 1] : null)
+  const recentDecisionCards = useMemo(() => [...(decisions.data ?? [])].slice(-4).reverse(), [decisions.data])
+  const recentDeltaCards = useMemo(() => [...(deltas.data ?? [])].slice(-5).reverse(), [deltas.data])
+  const recentRuntimeEvents = useMemo(
+    () => events.filter((event) => ["planner", "delta", "session", "approval"].includes(event.event_type)).slice(-8).reverse(),
+    [events],
+  )
+  const selectedNodeRuntimeArtifacts = useMemo(
+    () => (selectedNode ? (runtime.data?.artifact_index ?? []).filter((artifact) => artifact.producer_node_id === selectedNode.id) : []),
+    [runtime.data?.artifact_index, selectedNode],
+  )
+  const selectedBlockedSession = useMemo(
+    () =>
+      selectedNode
+        ? (runtime.data?.blocked_sessions ?? []).find((item) => item["node_id"] === selectedNode.id)
+        : null,
+    [runtime.data?.blocked_sessions, selectedNode],
+  )
   const nodeSequence = useMemo(() => workflowNodeSequence(draft), [draft])
   const draftFlowNodes: Node[] = useMemo(
     () =>
       (draft?.graph_json.nodes ?? []).map((node) => {
         const agentConfig = findAgentConfig(agentConfigs.data, node.config_file)
         const inheritedSkill = node.skill ?? agentConfig?.skill ?? null
-        const skillLabel =
-          node.type === "sub_agent" ? (inheritedSkill ? `/${inheritedSkill}` : "ad-hoc") : null
+        const skillLabel = node.type === "sub_agent" && inheritedSkill ? `/${inheritedSkill}` : null
         const roleLabel = agentConfig
           ? agentConfig.name
           : node.role || (node.type === "human_gate" ? "human approval" : node.type === "sub_agent" ? "executor" : "planner")
         const roleAccent = agentConfig ? roleColor(agentConfig.id) : null
         const teamAccent = node.team_instance_id ? roleColor(node.team_instance_id) : null
-        const accent = roleAccent ?? teamAccent
+        const isDynamicResearch = node.skill === "research-lit" && Boolean(node.dynamic_parent_id)
+        const dynamicAccent = isDynamicResearch ? "#0891b2" : null
+        const accent = roleAccent ?? teamAccent ?? dynamicAccent
         const style: React.CSSProperties | undefined = accent
           ? { borderLeft: `4px solid ${accent}` }
           : undefined
         const sequence = nodeSequence.get(node.id) ?? 0
         const runOutput = node.run_id ? runOutputByRunId.get(node.run_id) : undefined
         const nodeArtifactPaths = [
+          ...(draft ? workflowOutputArtifactPaths(draft, node) : []),
           ...outputFilePaths(node.outputs),
           ...extractArtifactPathsFromRunOutput(runOutput, workspaceArtifacts.data),
         ]
@@ -1184,15 +1591,20 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                 <div className="flow-node-topline">
                   <span className="flow-node-kind-row">
                     <span className="flow-node-order">{String(sequence).padStart(2, "0")}</span>
-                    <span className={`node-kind node-kind-${node.type}`}>
-                      {node.type === "human_gate" ? <ClipboardCheck size={13} /> : node.type === "sub_agent" ? <Bot size={13} /> : <Cpu size={13} />}
+                    <span className={`node-kind node-kind-${isDynamicResearch ? "research" : node.type}`}>
+                      {node.type === "human_gate" ? <ClipboardCheck size={13} /> : <Cpu size={13} />}
                       {nodeKindLabel(node)}
                     </span>
                   </span>
                   <em className={statusClass(node.status)}>{node.status}</em>
                 </div>
                 <strong>{node.name}</strong>
-                {node.type === "sub_agent" && agentConfig ? (
+                {isDynamicResearch ? (
+                  <span className="role-chip role-chip-research">
+                    <Sparkles size={11} />
+                    planned by Agent
+                  </span>
+                ) : node.type === "sub_agent" && agentConfig ? (
                   <span
                     className="role-chip"
                     style={{
@@ -1218,6 +1630,8 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                   <span>{roleLabel}</span>
                 )}
                 {skillLabel && <small>{skillLabel}</small>}
+                {node.status === "waiting_dynamic_dependency" && <small>waiting for literature</small>}
+                {node.dynamic_reason && <small title={node.dynamic_reason}>{truncate(node.dynamic_reason, 72)}</small>}
                 {nodeArtifacts.length > 0 && (
                   <div className="flow-node-artifacts">
                     {nodeArtifacts.slice(0, 3).map((artifact) => (
@@ -1248,7 +1662,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
               </div>
             ),
           },
-          className: `flow-node flow-node-${node.type} flow-node-${node.status}`,
+          className: `flow-node flow-node-${node.type} flow-node-${node.status}${isDynamicResearch ? " flow-node-dynamic-research" : ""}`,
           style,
         }
       }),
@@ -1260,17 +1674,40 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
     }
   }, [draftFlowNodes, isDraggingNode])
 
-  const flowEdges: Edge[] = useMemo(
-    () =>
-      (draft?.graph_json.edges ?? []).map((edge) => ({
-        id: edge.id,
-        source: edge.source,
-        target: edge.target,
-        markerEnd: { type: MarkerType.ArrowClosed },
-        selected: edge.id === selectedEdgeId,
-        className: edge.id === selectedEdgeId ? "flow-edge-selected" : undefined,
-      })),
-    [draft, selectedEdgeId],
+  const flowEdges: WorkflowCanvasEdge[] = useMemo(
+    () => {
+      const nodesById = new Map((draft?.graph_json.nodes ?? []).map((node) => [node.id, node]))
+      return (draft?.graph_json.edges ?? []).map((edge) => {
+        const source = nodesById.get(edge.source)
+        const target = nodesById.get(edge.target)
+        const handoff = handoffByEdge.get(handoffKey(edge.source, edge.target))
+        const plannerInserted = Boolean(source?.dynamic_parent_id || (target?.status === "waiting_dynamic_dependency" && target.depends_on.includes(edge.source)))
+        const handoffLabel = edgeHandoffLabel(handoff, plannerInserted)
+        const classes = [
+          edge.id === selectedEdgeId ? "flow-edge-selected" : "",
+          plannerInserted ? "flow-edge-planner" : "",
+          handoff?.preview ? "flow-edge-handoff" : "",
+          target?.status === "waiting_dynamic_dependency" ? "flow-edge-blocking" : "",
+        ].filter(Boolean)
+        return {
+          id: edge.id,
+          type: "workflowHandoff",
+          source: edge.source,
+          target: edge.target,
+          markerEnd: { type: MarkerType.ArrowClosed },
+          selected: edge.id === selectedEdgeId,
+          data: {
+            label: handoffLabel,
+            onOpen: openEdgePanel,
+          },
+          ariaLabel: handoffLabel ? `${handoffLabel}. Click to view handoff preview.` : undefined,
+          focusable: Boolean(handoffLabel),
+          interactionWidth: handoffLabel ? 28 : 20,
+          className: classes.join(" ") || undefined,
+        }
+      })
+    },
+    [draft, handoffByEdge, openEdgePanel, selectedEdgeId],
   )
   const onNodesChange = useCallback((changes: NodeChange[]) => {
     const removeChanges = changes.filter((change) => change.type === "remove")
@@ -1340,24 +1777,10 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
     })
   }
 
-  function handleDeleteWorkflow() {
-    if (!draft) return
-    if (!globalThis.confirm(`Delete Flow "${draft.title}"? This cannot be undone.`)) return
-    deleteWorkflow.mutate(draft)
-  }
-
-  function openTeamDialog() {
-    if (!draft) return
-    const team = selectedTeam ?? teamConfigs.data?.[0]
-    if (team && !selectedTeamId) setSelectedTeamId(team.id)
-    setTeamPrefix(team ? uniqueTeamPrefix(team.id, draft.graph_json.nodes) : "")
-    setTeamDialogOpen(true)
-  }
-
-  function handleInsertTeam() {
-    if (!draft || !selectedTeam) return
-    const prefix = teamPrefix.trim() || uniqueTeamPrefix(selectedTeam.id, draft.graph_json.nodes)
-    expandTeam.mutate({ workflow: draft, team: selectedTeam, prefix })
+  function handleDeleteWorkflow(workflow: WorkflowRecord | null = draft) {
+    if (!workflow) return
+    if (!globalThis.confirm(`Delete Flow "${workflow.title}"? This cannot be undone.`)) return
+    deleteWorkflow.mutate(workflow)
   }
 
   return (
@@ -1381,26 +1804,39 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
           {(workflows.data ?? []).map((workflow) => {
             const counts = workflowCounts(workflow)
             return (
-              <button
+              <div
                 className={`workflow-row ${draft?.id === workflow.id ? "selected" : ""}`}
                 key={workflow.id}
-                onClick={() => {
-                  setSelectedId(workflow.id)
-                  setDirty(false)
-                  setFlowPanelCollapsed(true)
-                  setGeneratorCollapsed(true)
-                }}
-                type="button"
               >
-                <div className="workflow-row-title">
-                  <strong>{workflow.title}</strong>
-                  <Badge>Flow</Badge>
-                </div>
-                <span>
-                  {counts.agents} Agents · {counts.subAgents} SubAgents · {counts.gates} Gates
-                </span>
-                <em className={statusClass(workflow.status)}>{workflow.status}</em>
-              </button>
+                <button
+                  className="workflow-row-main"
+                  onClick={() => {
+                    setSelectedId(workflow.id)
+                    setDirty(false)
+                  }}
+                  type="button"
+                >
+                  <div className="workflow-row-title">
+                    <strong>{workflow.title}</strong>
+                    <Badge>Flow</Badge>
+                  </div>
+                  <span>
+                  {counts.agents} Agents · {counts.gates} Gates
+                  </span>
+                  <em className={statusClass(workflow.status)}>{workflow.status}</em>
+                </button>
+                <Button
+                  aria-label={`Delete flow ${workflow.title}`}
+                  className="workflow-row-delete"
+                  disabled={deleteWorkflow.isPending}
+                  onClick={() => handleDeleteWorkflow(workflow)}
+                  title="Delete flow"
+                  type="button"
+                  variant="ghost"
+                >
+                  <Trash2 size={15} />
+                </Button>
+              </div>
             )
           })}
           {workflows.data?.length === 0 && (
@@ -1492,8 +1928,6 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                     Flow
                   </Badge>
                   <span>{draftCounts.agents} Agents</span>
-                  <span>{draftCounts.subAgents} SubAgents</span>
-                  <span>{draftCounts.specialists} Specialists</span>
                   <span>{draftCounts.gates} Gates</span>
                   {dirty && <Badge>unsaved</Badge>}
                   <span className={statusClass(draft.status)}>{draft.status}</span>
@@ -1517,6 +1951,151 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
               )}
             </div>
             {deleteWorkflow.error && <p className="error-text">{deleteWorkflow.error.message}</p>}
+            <section className={`execution-state-panel execution-state-${executionState}`}>
+              <div className="execution-state-main">
+                <span className="execution-state-eyebrow">
+                  <Activity size={14} />
+                  Execution state
+                </span>
+                <div className="execution-state-title-row">
+                  <strong>{executionStateLabel(executionState)}</strong>
+                  <span className={statusClass(executionState)}>{executionState}</span>
+                  {runtimeSummary?.planner_active && <Badge>planner active</Badge>}
+                </div>
+                <p>{executionAction}</p>
+              </div>
+              <div className="execution-state-metrics">
+                <span>
+                  <b>{runtimeSummary?.active_node_count ?? activeNodeIds.length}</b>
+                  active
+                </span>
+                <span>
+                  <b>{runtimeSummary?.ready_node_count ?? readyNodeIds.length}</b>
+                  ready
+                </span>
+                <span>
+                  <b>{runtimeSummary?.waiting_approval_count ?? waitingApprovalIds.length}</b>
+                  approval
+                </span>
+                <span>
+                  <b>{runtimeSummary?.waiting_dynamic_dependency_count ?? waitingLiteratureIds.length}</b>
+                  literature wait
+                </span>
+                <span>
+                  <b>{runtimeSummary?.failed_node_count ?? 0}</b>
+                  failed
+                </span>
+              </div>
+              <div className="execution-state-details">
+                <span>last event: {executionLastEvent}</span>
+                {activeNodeIds.length > 0 && <span>active: {activeNodeIds.join(", ")}</span>}
+                {waitingApprovalIds.length > 0 && <span>approval: {waitingApprovalIds.join(", ")}</span>}
+                {waitingLiteratureIds.length > 0 && <span>literature: {waitingLiteratureIds.join(", ")}</span>}
+                {readyNodeIds.length > 0 && <span>ready: {readyNodeIds.join(", ")}</span>}
+              </div>
+            </section>
+            <div className="runtime-workbench">
+              <section className="runtime-card runtime-summary-card">
+                <div className="runtime-card-head">
+                  <span>
+                    <Activity size={14} />
+                    Runtime
+                  </span>
+                  <Badge>{runtimeSummary?.latest_decision_type ?? "no tick"}</Badge>
+                </div>
+                <div className="runtime-metrics">
+                  <span>
+                    <b>{runtimeSummary?.decision_count ?? 0}</b>
+                    decisions
+                  </span>
+                  <span>
+                    <b>{runtimeSummary?.delta_count ?? 0}</b>
+                    deltas
+                  </span>
+                  <span>
+                    <b>{runtimeSummary?.dynamic_node_count ?? 0}</b>
+                    dynamic
+                  </span>
+                  <span>
+                    <b>{runtimeSummary?.blocked_session_count ?? 0}</b>
+                    blocked
+                  </span>
+                </div>
+                <p>{latestDecision?.rationale || "Planner runtime has not recorded a decision yet."}</p>
+                {runtimeSummary?.latest_tick_id && <small>tick {runtimeSummary.latest_tick_id}</small>}
+              </section>
+
+              <section className="runtime-card">
+                <div className="runtime-card-head">
+                  <span>
+                    <Terminal size={14} />
+                    Timeline
+                  </span>
+                  <Badge>{recentRuntimeEvents.length}</Badge>
+                </div>
+                <div className="runtime-list">
+                  {recentRuntimeEvents.map((event, index) => (
+                    <div className="runtime-row" key={`${event.timestamp}-${event.event_type}-${index}`}>
+                      <b>{workflowEventLabel(event)}</b>
+                      <span>{event.message}</span>
+                      <small>{event.timestamp.slice(11, 19)}</small>
+                    </div>
+                  ))}
+                  {!recentRuntimeEvents.length && <p className="muted">No runtime events yet.</p>}
+                </div>
+              </section>
+
+              <section className="runtime-card">
+                <div className="runtime-card-head">
+                  <span>
+                    <Layers3 size={14} />
+                    Decision Cards
+                  </span>
+                  <Badge>{recentDecisionCards.length}</Badge>
+                </div>
+                <div className="runtime-list">
+                  {recentDecisionCards.map((decision) => (
+                    <div className="decision-card-mini" key={decision.tick_id}>
+                      <div>
+                        <Badge>{decision.decision_type}</Badge>
+                        <small>{decision.trigger}</small>
+                        {!decision.policy_result.allowed && <Badge>policy rejected</Badge>}
+                      </div>
+                      <strong>{decision.rationale || "No rationale recorded"}</strong>
+                      <span>
+                        {decision.before_graph_hash.slice(0, 8)}
+                        {" -> "}
+                        {decision.after_graph_hash.slice(0, 8)}
+                      </span>
+                    </div>
+                  ))}
+                  {!recentDecisionCards.length && <p className="muted">No decision cards yet.</p>}
+                </div>
+              </section>
+
+              <section className="runtime-card">
+                <div className="runtime-card-head">
+                  <span>
+                    <GitBranch size={14} />
+                    Graph Diff
+                  </span>
+                  <Badge>{recentDeltaCards.length}</Badge>
+                </div>
+                <div className="runtime-list">
+                  {recentDeltaCards.map((delta: WorkflowDeltaRecord) => (
+                    <div className={`delta-card-mini ${delta.applied ? "delta-applied" : delta.policy_result.allowed ? "delta-noop" : "delta-rejected"}`} key={delta.delta_id}>
+                      <div>
+                        <Badge>{delta.action}</Badge>
+                        <small>{delta.node_id || delta.target || delta.source || delta.delta_id}</small>
+                      </div>
+                      <span>{delta.reason || delta.policy_result.reason || "no reason"}</span>
+                      <pre>{jsonPreview(delta.graph_diff, 260)}</pre>
+                    </div>
+                  ))}
+                  {!recentDeltaCards.length && <p className="muted">No graph deltas yet.</p>}
+                </div>
+              </section>
+            </div>
             <div className="flow-shell">
               <div className={`flow-canvas-toolbar ${canvasToolsCollapsed ? "flow-canvas-toolbar-collapsed" : ""}`} aria-label="Flow canvas actions">
                 <Button
@@ -1535,23 +2114,9 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                     <Cpu size={15} />
                     Agent
                   </Button>
-                  <Button variant="secondary" onClick={() => addNode("sub_agent")} type="button" title="SubAgent">
-                    <Plus size={15} />
-                    SubAgent
-                  </Button>
                   <Button variant="secondary" onClick={() => addNode("human_gate")} type="button" title="Gate">
                     <ClipboardCheck size={15} />
                     Gate
-                  </Button>
-                  <Button
-                    variant="secondary"
-                    onClick={openTeamDialog}
-                    disabled={!teamConfigs.data?.length}
-                    type="button"
-                    title={teamConfigs.data?.length ? "Insert Team" : "Create a Team on the SubAgents page first"}
-                  >
-                    <UsersRound size={15} />
-                    Team
                   </Button>
                   {selectedEdge && (
                     <Button variant="secondary" onClick={() => removeEdges([selectedEdge.id])} type="button" title="Remove selected edge">
@@ -1584,7 +2149,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                   </Button>
                   <Button
                     variant="destructive"
-                    onClick={handleDeleteWorkflow}
+                    onClick={() => handleDeleteWorkflow()}
                     disabled={deleteWorkflow.isPending}
                     type="button"
                     title="Delete"
@@ -1634,9 +2199,14 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                 nodes={canvasNodes}
                 edges={flowEdges}
                 nodeTypes={workflowNodeTypes}
+                edgeTypes={workflowEdgeTypes}
                 onNodesChange={onNodesChange}
                 onEdgesChange={onEdgesChange}
+                onInit={(instance) => {
+                  flowInstanceRef.current = instance
+                }}
                 fitView
+                fitViewOptions={{ padding: 0.16 }}
                 deleteKeyCode={["Backspace", "Delete"]}
                 elementsSelectable
                 nodesConnectable
@@ -1667,14 +2237,75 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                 <Controls />
               </ReactFlow>
             </div>
-            <div className="workflow-log" ref={workflowLogRef}>
-              {events.map((event, index) => (
-                <div className={`term-line term-${event.event_type}`} key={`${event.timestamp}-${index}`}>
-                  <span>{event.timestamp.slice(11, 19)}</span>
-                  <b>{event.node_id ?? event.event_type}</b>
-                  <p>{event.message}</p>
+            <div className="workflow-terminal">
+              <div className="workflow-terminal-head">
+                <div className="workflow-terminal-title">
+                  <Terminal size={14} />
+                  <strong>Terminal</strong>
+                  {draft?.status && <span className={statusClass(draft.status)}>{draft.status}</span>}
+                  <span className={statusClass(executionState)}>{executionStateLabel(executionState)}</span>
                 </div>
-              ))}
+                <div className="workflow-terminal-filters" aria-label="Terminal event filters">
+                  {workflowEventFilterOptions.map((option) => (
+                    <button
+                      className={`terminal-filter ${workflowEventFilter === option.value ? "terminal-filter-active" : ""}`}
+                      key={option.value}
+                      onClick={() => setWorkflowEventFilter(option.value)}
+                      type="button"
+                    >
+                      <span>{option.label}</span>
+                      <b>{workflowTerminalCounts[option.value].toLocaleString()}</b>
+                    </button>
+                  ))}
+                </div>
+                <div className="workflow-terminal-meta">
+                  <button
+                    className={`terminal-filter ${showFullWorkflowLog ? "terminal-filter-active" : ""}`}
+                    onClick={() => setShowFullWorkflowLog((current) => !current)}
+                    type="button"
+                  >
+                    <span>{showFullWorkflowLog ? "Full log" : "Compact"}</span>
+                  </button>
+                  <span>{workflowTerminalStats.aris.toLocaleString()} ARIS</span>
+                  <span>{workflowTerminalStats.total.toLocaleString()} events</span>
+                </div>
+              </div>
+              <div className="workflow-log" ref={workflowLogRef}>
+                {displayedWorkflowEvents.map((event, index) => {
+                  const metaItems = workflowEventMetaItems(event)
+                  const payloadText = workflowEventPayloadText(event)
+                  return (
+                    <div
+                      className={`term-line term-${event.event_type} ${showFullWorkflowLog ? "term-line-full" : ""}`}
+                      key={`${event.timestamp}-${index}`}
+                    >
+                      <span className="term-time">{event.timestamp.slice(11, 19)}</span>
+                      <b title={workflowEventTitle(event)}>{workflowEventLabel(event)}</b>
+                      <div className="term-body">
+                        <p>{event.message}</p>
+                        {showFullWorkflowLog && metaItems.length > 0 && (
+                          <div className="term-meta-list">
+                            {metaItems.map((item) => (
+                              <span key={`${event.timestamp}-${index}-${item.key}`}>
+                                {item.key}: <strong>{item.value}</strong>
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                        {showFullWorkflowLog && payloadText && (
+                          <details className="term-payload-details">
+                            <summary>payload</summary>
+                            <pre>{payloadText}</pre>
+                          </details>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
+                {displayedWorkflowEvents.length === 0 && (
+                  <div className="terminal-empty">No events in this category.</div>
+                )}
+              </div>
             </div>
           </>
         ) : (
@@ -1685,77 +2316,6 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
           </div>
         )}
       </section>
-
-      <Dialog open={teamDialogOpen} title="Insert Team" onClose={() => setTeamDialogOpen(false)}>
-        <div className="dialog-body config-form">
-          {teamConfigs.data?.length ? (
-            <>
-              <div className="two-col">
-                <div>
-                  <label>Team</label>
-                  <Select
-                    value={selectedTeam?.id ?? ""}
-                    onChange={(event) => {
-                      const nextTeam = teamConfigs.data?.find((team) => team.id === event.target.value)
-                      setSelectedTeamId(event.target.value)
-                      if (draft && nextTeam) {
-                        setTeamPrefix(uniqueTeamPrefix(nextTeam.id, draft.graph_json.nodes))
-                      }
-                    }}
-                  >
-                    {(teamConfigs.data ?? []).map((team) => (
-                      <option key={team.id} value={team.id}>
-                        {team.name} ({team.roles.length} roles)
-                      </option>
-                    ))}
-                  </Select>
-                </div>
-                <div>
-                  <label>Instance prefix</label>
-                  <Input
-                    value={teamPrefix}
-                    onChange={(event) => setTeamPrefix(event.target.value)}
-                    placeholder={selectedTeam ? uniqueTeamPrefix(selectedTeam.id, draft?.graph_json.nodes ?? []) : "team"}
-                  />
-                </div>
-              </div>
-              {selectedTeam && (
-                <div className="role-preview">
-                  <div className="role-preview-head">
-                    <span className="role-pill">
-                      <UsersRound size={11} />
-                      {selectedTeam.name}
-                    </span>
-                    <small>{selectedTeam.roles.length} roles</small>
-                    <small>{selectedTeam.default_edges.length} edges</small>
-                  </div>
-                  <p>{selectedTeam.description || "This Team will expand into editable SubAgent nodes."}</p>
-                </div>
-              )}
-              <p className="muted">
-                {selectedNode
-                  ? `Entry roles will depend on "${selectedNode.id}".`
-                  : "Insert without an upstream dependency, then connect edges on the canvas."}
-              </p>
-              {expandTeam.error && <p className="error-text">{expandTeam.error.message}</p>}
-              <div className="console-actions">
-                <Button variant="secondary" onClick={() => setTeamDialogOpen(false)} type="button">
-                  Cancel
-                </Button>
-                <Button onClick={handleInsertTeam} disabled={!draft || !selectedTeam || expandTeam.isPending} type="button">
-                  <UsersRound size={15} />
-                  Insert Team
-                </Button>
-              </div>
-            </>
-          ) : (
-            <div className="empty-state compact-empty-state">
-              <UsersRound size={24} />
-              <p className="muted">Create a Team on the SubAgents page first, then insert it into this Flow.</p>
-            </div>
-          )}
-        </div>
-      </Dialog>
 
       <aside className="orchestrator-right side-panel">
         <h2>{selectedEdge ? "Edge Editor" : "Node Editor"}</h2>
@@ -1774,8 +2334,33 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
               </span>
             </div>
             <p className="muted">
-              This edge means the target Agent, SubAgent, or Gate waits for the source node to finish.
+              This edge means the target Agent or Gate waits for the source node to finish.
             </p>
+            <div className="handoff-preview-box">
+              <div className="handoff-preview-head">
+                <span>Handoff preview</span>
+                <Badge>{selectedHandoff?.content_type ?? "none"}</Badge>
+              </div>
+              {selectedHandoff ? (
+                <>
+                  <div className="runtime-kv">
+                    <span>source</span>
+                    <b>{selectedHandoff.source_name || selectedHandoff.source}</b>
+                    <span>target</span>
+                    <b>{selectedHandoff.target_name || selectedHandoff.target}</b>
+                    {selectedHandoff.output_path && (
+                      <>
+                        <span>output</span>
+                        <b>{selectedHandoff.output_path}</b>
+                      </>
+                    )}
+                  </div>
+                  <pre>{selectedHandoff.preview || "No upstream content is available yet."}</pre>
+                </>
+              ) : (
+                <p className="muted">No handoff preview has been recorded for this dependency yet.</p>
+              )}
+            </div>
             <Button variant="destructive" onClick={() => removeEdges([selectedEdge.id])} type="button">
               <XCircle size={15} />
               Remove edge
@@ -1785,8 +2370,8 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
           <>
             <div className="selected-skill">
               <div className="node-editor-title">
-                <span className={`node-kind node-kind-${selectedNode.type}`}>
-                  {selectedNode.type === "human_gate" ? <ClipboardCheck size={13} /> : selectedNode.type === "sub_agent" ? <Bot size={13} /> : <Cpu size={13} />}
+                <span className={`node-kind node-kind-${selectedNode.skill === "research-lit" && selectedNode.dynamic_parent_id ? "research" : selectedNode.type}`}>
+                  {selectedNode.type === "human_gate" ? <ClipboardCheck size={13} /> : <Cpu size={13} />}
                   {nodeKindLabel(selectedNode)}
                 </span>
                 <strong>{selectedNode.id}</strong>
@@ -1799,10 +2384,123 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                 </span>
               )}
             </div>
-            <NodeResultPanel workflow={draft} node={selectedNode} />
+            {(selectedNode.session_path || selectedNode.dynamic_parent_id || selectedNode.status === "waiting_dynamic_dependency") && (
+              <div className="dynamic-node-box">
+                {selectedNode.session_path && <p>session {selectedNode.session_path}</p>}
+                {selectedNode.dynamic_parent_id && <p>planned from {selectedNode.dynamic_parent_id}</p>}
+                {selectedNode.status === "waiting_dynamic_dependency" && <p>waiting for literature</p>}
+                {selectedNode.dynamic_reason && <p>{selectedNode.dynamic_reason}</p>}
+                {selectedNode.research_request && <pre>{jsonPreview(selectedNode.research_request, 900)}</pre>}
+              </div>
+            )}
+            <div className="session-inspector">
+              <div className="runtime-card-head">
+                <span>
+                  <Terminal size={14} />
+                  Session Inspector
+                </span>
+                <Badge>{selectedSession.data?.kind ?? "node"}</Badge>
+              </div>
+              <div className="runtime-kv">
+                <span>session</span>
+                <b>{selectedSession.data?.session_id ?? selectedRuntimeSessionId ?? "none"}</b>
+                <span>events</span>
+                <b>{selectedSession.data?.events.length ?? 0}</b>
+                <span>artifacts</span>
+                <b>{selectedSession.data?.artifact_refs.length ?? selectedNodeRuntimeArtifacts.length}</b>
+              </div>
+              {selectedBlockedSession && (
+                <div className="blocked-session-box">
+                  <strong>blocked by dynamic dependency</strong>
+                  <span>{String(selectedBlockedSession["reason"] ?? "waiting for literature")}</span>
+                  <small>{jsonPreview(selectedBlockedSession["blocked_by"] ?? [], 220)}</small>
+                </div>
+              )}
+              {(selectedSession.data?.artifact_refs.length ? selectedSession.data.artifact_refs : selectedNodeRuntimeArtifacts).slice(0, 4).map((artifact) => (
+                <button
+                  className="session-artifact-row"
+                  key={artifact.path}
+                  onClick={() =>
+                    setArtifactPreview({
+                      workspace: draft.workspace,
+                      path: artifact.path,
+                      nodeId: selectedNode.id,
+                      nodeName: selectedNode.name,
+                      artifact: artifactsByPath.get(artifact.path),
+                    })
+                  }
+                  type="button"
+                >
+                  <FileText size={13} />
+                  <span>{artifact.path}</span>
+                </button>
+              ))}
+            </div>
+            <div className="node-editor-actions">
+              <Button
+                variant="secondary"
+                onClick={() => runNode.mutate({ workflow: draft, nodeId: selectedNode.id })}
+                disabled={!isExecutableNode(selectedNode) || runNode.isPending || rerunNode.isPending}
+                type="button"
+                title="Save current node settings, then run only this node"
+              >
+                <Play size={15} />
+                Save & run
+              </Button>
+              <Button
+                variant="secondary"
+                onClick={() => rerunNode.mutate({ workflow: draft, nodeId: selectedNode.id })}
+                disabled={!isExecutableNode(selectedNode) || runNode.isPending || rerunNode.isPending}
+                type="button"
+                title="Save current node settings, then rerun this node and reset downstream nodes"
+              >
+                <RefreshCcw size={15} />
+                Save & rerun
+              </Button>
+              <Button
+                variant="secondary"
+                onClick={() => approveNode.mutate({ workflow: draft, nodeId: selectedNode.id })}
+                disabled={selectedNode.status !== "waiting_approval" || approveNode.isPending}
+                type="button"
+              >
+                <CheckCircle2 size={15} />
+                Approve
+              </Button>
+              <Button
+                variant="secondary"
+                onClick={() => skipNode.mutate({ workflow: draft, nodeId: selectedNode.id })}
+                disabled={skipNode.isPending}
+                type="button"
+              >
+                Skip
+              </Button>
+            </div>
+            {isExecutableNode(selectedNode) && (
+              <div className="node-run-settings">
+                <div>
+                  <label>Run model</label>
+                  <Select
+                    value={selectedNode.model ?? ""}
+                    onChange={(event) =>
+                      updateNode(selectedNode.id, (node) => {
+                        node.model = event.target.value || null
+                      })
+                    }
+                  >
+                    <option value="">{nodeModelDefaultLabel}</option>
+                    {nodeModelOptions.map((modelOption) => (
+                      <option key={modelOption} value={modelOption}>
+                        {modelOption}
+                      </option>
+                    ))}
+                  </Select>
+                </div>
+                <p className="muted">This value is saved before Save & run / Save & rerun starts the node.</p>
+              </div>
+            )}
             <label>Type</label>
             <Select
-              value={selectedNode.type}
+              value={selectedNode.type === "sub_agent" ? "agent" : selectedNode.type}
               onChange={(event) =>
                 updateNode(selectedNode.id, (node) => {
                   const nextType = event.target.value as WorkflowNodeInfo["type"]
@@ -1834,7 +2532,6 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
               }
             >
               <option value="agent">Agent</option>
-              <option value="sub_agent">SubAgent</option>
               <option value="human_gate">Gate</option>
             </Select>
             <label>Name</label>
@@ -1844,8 +2541,8 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
             {selectedNode.type === "sub_agent" && (
               <>
                 <label>
-                  SubAgent Profile
-                  <small className="inline-hint"> independent executor profile</small>
+                  Agent Profile
+                  <small className="inline-hint"> executor defaults</small>
                 </label>
                 <Select
                   value={selectedNode.config_file ?? ""}
@@ -1855,7 +2552,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                     })
                   }
                 >
-                  <option value="">Generic SubAgent (no profile)</option>
+                  <option value="">Default agent (no profile)</option>
                   {(agentConfigs.data ?? []).map((config) => (
                     <option key={config.id} value={config.path}>
                       {config.name}
@@ -1904,7 +2601,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                   <option value="">
                     {selectedNodeConfig?.skill
                       ? `Use profile default (/${selectedNodeConfig.skill})`
-                      : "Ad-hoc SubAgent"}
+                      : "Ad-hoc agent"}
                   </option>
                   {(skills.data ?? []).map((skill) => (
                     <option key={skill.id} value={skill.id}>
@@ -1914,12 +2611,63 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                 </Select>
               </>
             )}
-            <label>{selectedNode.type === "human_gate" ? "Gate instructions" : "Prompt"}</label>
+            <div className="field-head">
+              <label>{selectedNode.type === "human_gate" ? "Gate instructions" : "Prompt"}</label>
+              <Button
+                variant="secondary"
+                onClick={() =>
+                  optimizeNodePrompt.mutate({
+                    workflow: draft,
+                    nodeId: selectedNode.id,
+                    instructions: promptOptimizationNote,
+                  })
+                }
+                disabled={!selectedNode.prompt.trim() || optimizeNodePrompt.isPending}
+                type="button"
+                title="Ask the configured LLM to improve this node prompt"
+              >
+                <Wand2 size={14} />
+                {optimizeNodePrompt.isPending ? "Optimizing" : "Optimize prompt"}
+              </Button>
+            </div>
             <Textarea
               rows={selectedNode.type === "human_gate" ? 5 : 8}
               value={selectedNode.prompt}
               onChange={(event) => updateNode(selectedNode.id, (node) => (node.prompt = event.target.value))}
             />
+            <div className="prompt-optimizer-row">
+              <Input
+                value={promptOptimizationNote}
+                onChange={(event) => setPromptOptimizationNote(event.target.value)}
+                placeholder="Optional focus, e.g. stricter output format, shorter prompt, add success criteria"
+              />
+            </div>
+            {optimizeNodePrompt.error && <p className="error-text">{optimizeNodePrompt.error.message}</p>}
+            {promptSuggestion?.nodeId === selectedNode.id && (
+              <div className="prompt-suggestion">
+                <div className="prompt-suggestion-head">
+                  <strong>Optimized prompt suggestion</strong>
+                  <div>
+                    <Button
+                      variant="secondary"
+                      onClick={() => {
+                        updateNode(selectedNode.id, (node) => {
+                          node.prompt = promptSuggestion.prompt
+                        })
+                        setPromptSuggestion(null)
+                      }}
+                      type="button"
+                    >
+                      Apply
+                    </Button>
+                    <Button variant="ghost" onClick={() => setPromptSuggestion(null)} type="button">
+                      Discard
+                    </Button>
+                  </div>
+                </div>
+                <pre>{promptSuggestion.prompt}</pre>
+              </div>
+            )}
             {selectedNode.type === "sub_agent" && (
               <>
                 <label>Gate</label>
@@ -1947,20 +2695,6 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                   Advanced node settings
                 </summary>
                 <div className="two-col">
-                  <div>
-                    <label>Model</label>
-                    <Input
-                      value={selectedNode.model ?? ""}
-                      onChange={(event) =>
-                        updateNode(selectedNode.id, (node) => {
-                          node.model = event.target.value || null
-                        })
-                      }
-                      placeholder={
-                        selectedNodeConfig?.model ? `Profile default: ${selectedNodeConfig.model}` : "Default"
-                      }
-                    />
-                  </div>
                   <div>
                     <label>Effort</label>
                     <Input
@@ -2180,46 +2914,10 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                     </div>
                   </>
                 )}
-                <label>Inputs</label>
-                <Input
-                  value={joinList(selectedNode.inputs)}
-                  onChange={(event) => updateNode(selectedNode.id, (node) => (node.inputs = splitList(event.target.value)))}
-                />
-                <label>Outputs</label>
-                <Input
-                  value={joinList(selectedNode.outputs)}
-                  onChange={(event) => updateNode(selectedNode.id, (node) => (node.outputs = splitList(event.target.value)))}
-                />
               </details>
             )}
             {selectedNode.error && <p className="error-text">{selectedNode.error}</p>}
-            <div className="node-action-grid">
-              <Button
-                variant="secondary"
-                onClick={() => approveNode.mutate({ workflow: draft, nodeId: selectedNode.id })}
-                disabled={selectedNode.status !== "waiting_approval" || approveNode.isPending}
-                type="button"
-              >
-                <CheckCircle2 size={15} />
-                Approve
-              </Button>
-              <Button
-                variant="secondary"
-                onClick={() => rerunNode.mutate({ workflow: draft, nodeId: selectedNode.id })}
-                disabled={rerunNode.isPending}
-                type="button"
-              >
-                <RefreshCcw size={15} />
-                Rerun
-              </Button>
-              <Button
-                variant="secondary"
-                onClick={() => skipNode.mutate({ workflow: draft, nodeId: selectedNode.id })}
-                disabled={skipNode.isPending}
-                type="button"
-              >
-                Skip
-              </Button>
+            <div className="node-editor-danger-zone">
               <Button variant="destructive" onClick={() => removeNode(selectedNode.id)} type="button">
                 Remove
               </Button>
@@ -2379,8 +3077,8 @@ function RunsPage({ workspace }: { workspace: string }) {
   const visibleRuns = (runs.data ?? []).filter((run) => !workspace || run.workspace === workspace)
 
   return (
-    <div className="page-grid">
-      <section className="panel">
+    <div className="page-grid runs-grid">
+      <section className="panel runs-list-panel">
         <div className="panel-head">
           <div>
             <h1>Runs</h1>
@@ -2414,7 +3112,7 @@ function RunsPage({ workspace }: { workspace: string }) {
           )}
         </div>
       </section>
-      <aside className="console-panel">
+      <aside className="console-panel runs-console-panel">
         {selected ? <RunConsole run={selected} /> : <p className="muted">No runs yet.</p>}
       </aside>
     </div>
@@ -2602,6 +3300,29 @@ function detectApiPreset(
   return match?.id ?? "manual"
 }
 
+function uniqueModelOptions(...groups: Array<string | null | undefined | readonly string[]>): string[] {
+  const seen = new Set<string>()
+  const options: string[] = []
+  groups.forEach((group) => {
+    const values = Array.isArray(group) ? group : [group]
+    values.forEach((value) => {
+      const item = typeof value === "string" ? value.trim() : ""
+      if (!item || seen.has(item)) return
+      seen.add(item)
+      options.push(item)
+    })
+  })
+  return options
+}
+
+function splitModelCatalog(value: string) {
+  return uniqueModelOptions(value.split(/[\n,]/))
+}
+
+function joinModelCatalog(models?: readonly string[]) {
+  return (models ?? []).join("\n")
+}
+
 function SettingsPage() {
   const queryClient = useQueryClient()
   const settings = useQuery({ queryKey: ["settings"], queryFn: api.settings })
@@ -2610,6 +3331,7 @@ function SettingsPage() {
   const [apiKey, setApiKey] = useState("")
   const [baseUrl, setBaseUrl] = useState("")
   const [model, setModel] = useState("")
+  const [modelsText, setModelsText] = useState("")
   const [effort, setEffort] = useState("")
   const updateSettings = useMutation({
     mutationFn: api.updateSettings,
@@ -2625,6 +3347,7 @@ function SettingsPage() {
     setProvider(settings.data.provider)
     setBaseUrl(settings.data.base_url ?? "")
     setModel(settings.data.model ?? "")
+    setModelsText(joinModelCatalog(settings.data.models))
     setEffort(settings.data.effort ?? "")
     setApiPreset(
       detectApiPreset(
@@ -2643,6 +3366,7 @@ function SettingsPage() {
     setProvider(preset.provider)
     setBaseUrl(preset.baseUrl)
     setModel(preset.model)
+    setModelsText((current) => joinModelCatalog(uniqueModelOptions(splitModelCatalog(current), preset.model)))
     setEffort(preset.effort)
   }
 
@@ -2653,99 +3377,236 @@ function SettingsPage() {
       clear_api_key: clearApiKey,
       base_url: baseUrl || null,
       model: model || null,
+      models: splitModelCatalog(modelsText),
       effort: effort || null,
     })
   }
 
   const selectedProvider = providerOptions.find((item) => item.value === provider)
   const selectedPreset = apiPresets.find((item) => item.id === apiPreset)
+  const settingsModelOptions = uniqueModelOptions(model, splitModelCatalog(modelsText))
+  const modelCatalog = splitModelCatalog(modelsText)
+  const keyStatusLabel = settings.data?.api_key_set
+    ? `${settings.data.provider} ${settings.data.api_key_masked ?? ""}`.trim()
+    : "Not configured"
+  const endpointLabel = baseUrl.trim() || "Provider default"
+  const modelLabel = model.trim() || "Provider default"
+  const effortLabel = effort.trim() || "Default"
 
   return (
-    <section className="panel full-panel">
-      <div className="panel-head">
-        <div>
-          <h1>Global Settings</h1>
-          <p>Configure the API key that every Web-launched ARIS run inherits.</p>
-        </div>
-        <KeyRound size={22} />
-      </div>
-      <div className="settings-grid">
-        <Card className="settings-card">
-          <div className="selected-skill">
-            <strong>Executor API key</strong>
-            <span>
-              {settings.data?.api_key_set
-                ? `${settings.data.provider} ${settings.data.api_key_masked ?? ""}`
-                : "No key configured"}
-            </span>
+    <section className="settings-page">
+      <div className="settings-hero">
+        <div className="settings-hero-main">
+          <div className="settings-hero-icon">
+            <KeyRound size={22} />
           </div>
-          <label>API preset</label>
-          <Select value={apiPreset} onChange={(event) => applyApiPreset(event.target.value as (typeof apiPresets)[number]["id"])}>
-            {apiPresets.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.label}
-              </option>
-            ))}
-          </Select>
-          <p className="muted">{selectedPreset?.hint}</p>
-          <label>Provider</label>
-          <Select
-            value={provider}
-            onChange={(event) => {
-              setApiPreset("manual")
-              setProvider(event.target.value as GlobalApiProvider)
-            }}
-          >
-            {providerOptions.map((item) => (
-              <option key={item.value} value={item.value}>
-                {item.label}
-              </option>
-            ))}
-          </Select>
-          <p className="muted">{selectedProvider?.hint}</p>
-          <label>API key</label>
-          <Input
-            type="password"
-            value={apiKey}
-            onChange={(event) => setApiKey(event.target.value)}
-            placeholder={settings.data?.api_key_set ? "Leave blank to keep existing key" : "Paste API key"}
-          />
-          <label>Base URL</label>
-          <Input
-            value={baseUrl}
-            onChange={(event) => {
-              setApiPreset("manual")
-              setBaseUrl(event.target.value)
-            }}
-            placeholder="Optional, e.g. https://api.openai.com/v1"
-          />
-          <label>Reviewer model</label>
-          <Input
-            value={model}
-            onChange={(event) => {
-              setApiPreset("manual")
-              setModel(event.target.value)
-            }}
-            placeholder="Optional ARIS_REVIEWER_MODEL"
-          />
-          <label>Reasoning effort</label>
-          <Select
-            value={effort}
-            onChange={(event) => {
-              setApiPreset("manual")
-              setEffort(event.target.value)
-            }}
-          >
-            <option value="">Default</option>
-            <option value="none">none</option>
-            <option value="minimal">minimal</option>
-            <option value="low">low</option>
-            <option value="medium">medium</option>
-            <option value="high">high</option>
-            <option value="xhigh">xhigh</option>
-          </Select>
+          <div>
+            <h1>API Configuration</h1>
+            <p>Provider credentials and defaults for Web-launched ARIS runs.</p>
+          </div>
+        </div>
+        <div className={`settings-status-pill ${settings.data?.api_key_set ? "is-ok" : "is-missing"}`}>
+          {settings.data?.api_key_set ? <CheckCircle2 size={18} /> : <XCircle size={18} />}
+          <div>
+            <span>API key</span>
+            <strong>{keyStatusLabel}</strong>
+          </div>
+        </div>
+      </div>
+
+      <form
+        className="settings-form"
+        onSubmit={(event) => {
+          event.preventDefault()
+          save(false)
+        }}
+      >
+        <div className="settings-main">
+          <section className="settings-section">
+            <div className="settings-section-head">
+              <div>
+                <h2>Provider</h2>
+                <p>{selectedPreset?.hint}</p>
+              </div>
+              <Badge>{apiPreset === "manual" ? "Manual" : "Preset"}</Badge>
+            </div>
+            <div className="settings-field-grid">
+              <div className="settings-field">
+                <label>Preset</label>
+                <Select
+                  value={apiPreset}
+                  onChange={(event) => applyApiPreset(event.target.value as (typeof apiPresets)[number]["id"])}
+                >
+                  {apiPresets.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.label}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+              <div className="settings-field">
+                <label>Provider</label>
+                <Select
+                  value={provider}
+                  onChange={(event) => {
+                    setApiPreset("manual")
+                    setProvider(event.target.value as GlobalApiProvider)
+                  }}
+                >
+                  {providerOptions.map((item) => (
+                    <option key={item.value} value={item.value}>
+                      {item.label}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+            </div>
+            <div className="settings-note">
+              <SlidersHorizontal size={15} />
+              <span>{selectedProvider?.hint}</span>
+            </div>
+          </section>
+
+          <section className="settings-section">
+            <div className="settings-section-head">
+              <div>
+                <h2>Connection</h2>
+                <p>Key, endpoint, and default model used by the runner.</p>
+              </div>
+            </div>
+            <div className="settings-field-grid">
+              <div className="settings-field settings-field-full">
+                <label>API key</label>
+                <Input
+                  type="password"
+                  value={apiKey}
+                  onChange={(event) => setApiKey(event.target.value)}
+                  placeholder={settings.data?.api_key_set ? "Leave blank to keep existing key" : "Paste API key"}
+                />
+              </div>
+              <div className="settings-field settings-field-full">
+                <label>Base URL</label>
+                <Input
+                  value={baseUrl}
+                  onChange={(event) => {
+                    setApiPreset("manual")
+                    setBaseUrl(event.target.value)
+                  }}
+                  placeholder="Optional, e.g. https://api.openai.com/v1"
+                />
+              </div>
+              <div className="settings-field">
+                <label>Default reviewer model</label>
+                <Select
+                  value={model}
+                  onChange={(event) => {
+                    setApiPreset("manual")
+                    setModel(event.target.value)
+                  }}
+                >
+                  <option value="">Provider default</option>
+                  {settingsModelOptions.map((modelOption) => (
+                    <option key={modelOption} value={modelOption}>
+                      {modelOption}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+              <div className="settings-field">
+                <label>Reasoning effort</label>
+                <Select
+                  value={effort}
+                  onChange={(event) => {
+                    setApiPreset("manual")
+                    setEffort(event.target.value)
+                  }}
+                >
+                  <option value="">Default</option>
+                  <option value="none">none</option>
+                  <option value="minimal">minimal</option>
+                  <option value="low">low</option>
+                  <option value="medium">medium</option>
+                  <option value="high">high</option>
+                  <option value="xhigh">xhigh</option>
+                </Select>
+              </div>
+            </div>
+          </section>
+
+          <section className="settings-section">
+            <div className="settings-section-head">
+              <div>
+                <h2>Model Catalog</h2>
+                <p>Models shown in node-level model selectors.</p>
+              </div>
+              <Badge>{modelCatalog.length} models</Badge>
+            </div>
+            <Textarea
+              className="model-catalog-textarea"
+              rows={6}
+              value={modelsText}
+              onChange={(event) => {
+                setApiPreset("manual")
+                setModelsText(event.target.value)
+              }}
+              placeholder="One model per line"
+            />
+          </section>
+        </div>
+
+        <aside className="settings-side">
+          <section className="settings-summary">
+            <div className="settings-summary-head">
+              <h2>Runtime Preview</h2>
+              <Badge>{provider}</Badge>
+            </div>
+            <dl className="settings-summary-grid">
+              <div className="settings-summary-row">
+                <dt>Endpoint</dt>
+                <dd title={endpointLabel}>{endpointLabel}</dd>
+              </div>
+              <div className="settings-summary-row">
+                <dt>Model</dt>
+                <dd title={modelLabel}>{modelLabel}</dd>
+              </div>
+              <div className="settings-summary-row">
+                <dt>Effort</dt>
+                <dd>{effortLabel}</dd>
+              </div>
+            </dl>
+          </section>
+
+          <section className="settings-summary">
+            <div className="settings-summary-head">
+              <h2>Injected Variables</h2>
+              <Badge>{settings.data?.applies_to?.length ?? 0}</Badge>
+            </div>
+            <div className="env-list settings-env-list">
+              {(settings.data?.applies_to ?? []).map((item) => (
+                <Badge key={item}>{item}</Badge>
+              ))}
+              {!settings.data?.applies_to?.length && <span className="muted">No runtime variables active.</span>}
+            </div>
+          </section>
+
+          <section className="settings-summary">
+            <div className="settings-summary-head">
+              <h2>Storage</h2>
+            </div>
+            <div className="settings-code-line" title={settings.data?.config_path ?? ""}>
+              {settings.data?.config_path ?? "Loading settings path..."}
+            </div>
+          </section>
+        </aside>
+
+        <div className="settings-footer">
+          <div className="settings-save-state">
+            {updateSettings.error && <span className="error-text">{updateSettings.error.message}</span>}
+            {updateSettings.isSuccess && !updateSettings.error && <span>Settings saved.</span>}
+            {!updateSettings.isSuccess && !updateSettings.error && <span>API keys are stored locally and are not returned by the API.</span>}
+          </div>
           <div className="console-actions">
-            <Button onClick={() => save(false)} disabled={updateSettings.isPending} type="button">
+            <Button disabled={updateSettings.isPending || settings.isLoading} type="submit">
               <Save size={15} />
               Save settings
             </Button>
@@ -2759,23 +3620,8 @@ function SettingsPage() {
               Clear key
             </Button>
           </div>
-          {updateSettings.error && <p className="error-text">{updateSettings.error.message}</p>}
-        </Card>
-
-        <Card className="settings-card">
-          <h2>Runtime Injection</h2>
-          <p className="muted">The backend injects these variables only into child ARIS processes. The API key is never returned in API responses.</p>
-          <div className="env-list">
-            {(settings.data?.applies_to ?? []).map((item) => (
-              <Badge key={item}>{item}</Badge>
-            ))}
-            {!settings.data?.applies_to?.length && <span className="muted">No runtime variables are active yet.</span>}
-          </div>
-          <label>Local settings file</label>
-          <Input value={settings.data?.config_path ?? ""} readOnly />
-          <p className="muted">This is local-only state for the single-user console.</p>
-        </Card>
-      </div>
+        </div>
+      </form>
     </section>
   )
 }

@@ -15,6 +15,7 @@ from .models import CreateRunRequest, RunEvent, RunRecord
 from .skills import SkillInfo
 from .storage import (
     events_path,
+    get_run,
     insert_run,
     last_message_path,
     node_output_path,
@@ -75,6 +76,7 @@ def _command_available(command: str, env: dict[str, str]) -> bool:
 
 
 def build_aris_prompt(skill: SkillInfo, request: CreateRunRequest) -> str:
+    workflow_artifact_dir = (request.env_overrides or {}).get("ARIS_SUBAGENT_DIR")
     parts = [
         "You are running ARIS-Code from the local web console.",
         "",
@@ -104,6 +106,15 @@ def build_aris_prompt(skill: SkillInfo, request: CreateRunRequest) -> str:
                 "- Do not store API keys or credentials in files.",
             ]
         )
+        if workflow_artifact_dir:
+            parts.extend(
+                [
+                    "- This is a workflow node run. Put node-generated reports, plans, notes, datasets, matrices, drafts, and other deliverable artifacts under ARIS_SUBAGENT_DIR.",
+                    f"- ARIS_SUBAGENT_DIR={workflow_artifact_dir}",
+                    "- Do not create new workflow artifact files in the workspace root.",
+                    "- Only edit files outside ARIS_SUBAGENT_DIR when the node task explicitly requires changing existing project source files.",
+                ]
+            )
     if request.effort:
         parts.append(f"- Effort: {request.effort}")
     if request.assurance:
@@ -121,6 +132,7 @@ def build_aris_command(
     workspace: Path,
     prompt: str,
     model: str | None = None,
+    session_path: str | None = None,
 ) -> list[str]:
     aris_bin = resolve_aris_binary()
     if aris_bin:
@@ -146,6 +158,8 @@ def build_aris_command(
     ])
     if model:
         command.extend(["--model", model])
+    if session_path:
+        command.extend(["--session-path", session_path])
     command.extend(["prompt", prompt])
     return command
 
@@ -195,7 +209,8 @@ class RunManager:
                 request = request.copy(update={"effort": effective_effort_override()})
         prompt = build_aris_prompt(skill, request)
         effective_model = request.model or effective_model_override()
-        command = build_aris_command(workspace, prompt, effective_model)
+        model_label = effective_model or "runtime default"
+        command = build_aris_command(workspace, prompt, effective_model, request.session_path)
         now = utc_now()
         record = RunRecord(
             id=run_id,
@@ -218,8 +233,13 @@ class RunManager:
                 run_id=run_id,
                 timestamp=utc_now(),
                 stream="system",
-                message="Run queued",
-                payload={"command": redact_command_for_event(command)},
+                message=f"Run queued (model: {model_label})",
+                payload={
+                    "command": redact_command_for_event(command),
+                    "model": model_label,
+                    "skill": skill.id,
+                    "effort": request.effort,
+                },
             ),
         )
         await self._write_last_message_from_events(workspace, run_id)
@@ -269,19 +289,35 @@ class RunManager:
         env = build_runtime_env()
         if env_overrides:
             env.update({key: value for key, value in env_overrides.items() if value is not None})
+        run_record = get_run(workspace, run_id)
+        run_model = (run_record.model if run_record else None) or "runtime default"
+        run_skill = run_record.skill if run_record else None
+        run_effort = run_record.effort if run_record else None
         if Path(command[0]).name.lower() in {"aris", "aris.exe"} and not _command_available(command[0], env):
             message = "Neither aris nor cargo was found; install ARIS-Code or Rust/Cargo first"
             update_run(workspace, run_id, status="failed", finished_at=utc_now(), error=message)
             await self._append_event(
                 workspace,
-                RunEvent(run_id=run_id, timestamp=utc_now(), stream="system", message=message),
+                RunEvent(
+                    run_id=run_id,
+                    timestamp=utc_now(),
+                    stream="system",
+                    message=message,
+                    payload={"model": run_model, "skill": run_skill, "effort": run_effort},
+                ),
             )
             return
 
         update_run(workspace, run_id, status="running", started_at=utc_now())
         await self._append_event(
             workspace,
-            RunEvent(run_id=run_id, timestamp=utc_now(), stream="system", message="Run started"),
+            RunEvent(
+                run_id=run_id,
+                timestamp=utc_now(),
+                stream="system",
+                message=f"Run started (model: {run_model})",
+                payload={"model": run_model, "skill": run_skill, "effort": run_effort},
+            ),
         )
         try:
             process = await asyncio.create_subprocess_exec(
@@ -319,8 +355,8 @@ class RunManager:
                 run_id=run_id,
                 timestamp=utc_now(),
                 stream="system",
-                message=f"Run {status} with exit code {exit_code}",
-                payload={"exit_code": exit_code, "status": status},
+                message=f"Run {status} with exit code {exit_code} (model: {run_model})",
+                payload={"exit_code": exit_code, "status": status, "model": run_model, "skill": run_skill, "effort": run_effort},
             ),
         )
         await self._write_last_message_from_events(workspace, run_id)

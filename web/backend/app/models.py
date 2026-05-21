@@ -11,6 +11,7 @@ WorkflowStatus = Literal["draft", "running", "paused", "succeeded", "failed", "c
 WorkflowNodeStatus = Literal[
     "queued",
     "blocked",
+    "waiting_dynamic_dependency",
     "waiting_approval",
     "running",
     "succeeded",
@@ -62,6 +63,7 @@ class CreateRunRequest(BaseModel):
     model: str | None = None
     effort: str | None = None
     assurance: str | None = None
+    session_path: str | None = None
     env_overrides: dict[str, str] = Field(default_factory=dict)
 
 
@@ -124,6 +126,7 @@ class GlobalSettings(BaseModel):
     api_key_masked: str | None = None
     base_url: str | None = None
     model: str | None = None
+    models: list[str] = Field(default_factory=list)
     effort: str | None = None
     updated_at: str | None = None
     config_path: str
@@ -136,6 +139,7 @@ class UpdateGlobalSettingsRequest(BaseModel):
     clear_api_key: bool = False
     base_url: str | None = None
     model: str | None = None
+    models: list[str] | None = None
     effort: str | None = None
 
 
@@ -276,6 +280,7 @@ class WorkflowNode(BaseModel):
     outputs: list[PortSpec] = Field(default_factory=list)
     status: WorkflowNodeStatus = "queued"
     run_id: str | None = None
+    session_path: str | None = None
     error: str | None = None
     approved_before: bool = False
     approved_after: bool = False
@@ -289,6 +294,10 @@ class WorkflowNode(BaseModel):
     fanout: FanOutSpec | None = None
     fanout_parent_id: str | None = None
     fanout_item: Any | None = None
+    dynamic_parent_id: str | None = None
+    dynamic_reason: str | None = None
+    auto_approve_after: bool = False
+    research_request: dict[str, Any] | None = None
     team_id: str | None = None
     team_instance_id: str | None = None
     team_role_id: str | None = None
@@ -310,6 +319,178 @@ class WorkflowEdge(BaseModel):
     id: str
     source: str
     target: str
+
+
+WorkflowDeltaAction = Literal[
+    "add_node",
+    "add_edge",
+    "block_node",
+    "resume_node",
+    "complete",
+    "mark_noop",
+    "mark_policy_rejected",
+]
+PlannerDecisionType = Literal["noop", "mutate", "resume", "fail"]
+
+
+class WorkflowDelta(BaseModel):
+    action: WorkflowDeltaAction
+    node: WorkflowNode | None = None
+    source: str | None = None
+    target: str | None = None
+    node_id: str | None = None
+    reason: str = ""
+    wait_for: list[str] = Field(default_factory=list)
+    research_request: dict[str, Any] | None = None
+    refresh: bool = False
+    gap_type: str | None = None
+    gap_evidence_refs: list[str] = Field(default_factory=list)
+    affected_session_ids: list[str] = Field(default_factory=list)
+    blocked_node_ids: list[str] = Field(default_factory=list)
+    expected_artifacts: list[str] = Field(default_factory=list)
+    resume_plan: str | None = None
+    source_event_refs: list[str] = Field(default_factory=list)
+    source_artifact_refs: list[str] = Field(default_factory=list)
+    before_graph_hash: str | None = None
+    after_graph_hash: str | None = None
+    policy_result: dict[str, Any] | None = None
+
+
+class PlannerDecision(BaseModel):
+    tick_id: str | None = None
+    rationale: str = ""
+    decision_type: PlannerDecisionType | None = None
+    confidence: float | None = None
+    gap_type: str | None = None
+    gap_evidence_refs: list[str] = Field(default_factory=list)
+    dynamic_reason: str | None = None
+    affected_session_ids: list[str] = Field(default_factory=list)
+    blocked_node_ids: list[str] = Field(default_factory=list)
+    expected_artifacts: list[str] = Field(default_factory=list)
+    resume_plan: str | None = None
+    deltas: list[WorkflowDelta] = Field(default_factory=list)
+    complete: bool = False
+
+
+class RuntimePolicy(BaseModel):
+    max_dynamic_nodes_per_caller: int = 3
+    max_dynamic_nodes_total: int = 20
+    allowed_dynamic_skills: list[str] = Field(default_factory=lambda: ["research-lit"])
+    require_gap_evidence: bool = True
+    allow_static_node_rewrite: bool = False
+    allow_delete_static_nodes: bool = False
+    allow_human_gate_bypass: bool = False
+    auto_approve_literature: bool = True
+
+
+class PolicyResult(BaseModel):
+    allowed: bool
+    reason: str = ""
+
+
+class PlannerDecisionRecord(BaseModel):
+    tick_id: str
+    workflow_id: str
+    timestamp: str
+    trigger: str
+    decision: PlannerDecision
+    decision_type: PlannerDecisionType
+    rationale: str = ""
+    confidence: float | None = None
+    policy_result: PolicyResult
+    applied: bool = False
+    before_graph_hash: str
+    after_graph_hash: str
+    source_event_refs: list[str] = Field(default_factory=list)
+    source_artifact_refs: list[str] = Field(default_factory=list)
+
+
+class WorkflowDeltaRecord(BaseModel):
+    delta_id: str
+    tick_id: str
+    workflow_id: str
+    timestamp: str
+    action: WorkflowDeltaAction
+    delta: WorkflowDelta | None = None
+    node_id: str | None = None
+    source: str | None = None
+    target: str | None = None
+    reason: str = ""
+    gap_type: str | None = None
+    gap_evidence_refs: list[str] = Field(default_factory=list)
+    before_graph_hash: str
+    after_graph_hash: str
+    before_graph_json: dict[str, Any] | None = None
+    after_graph_json: dict[str, Any] | None = None
+    policy_result: PolicyResult
+    applied: bool = False
+    rejected_reason: str | None = None
+    source_event_refs: list[str] = Field(default_factory=list)
+    source_artifact_refs: list[str] = Field(default_factory=list)
+    affected_session_ids: list[str] = Field(default_factory=list)
+    blocked_node_ids: list[str] = Field(default_factory=list)
+    expected_artifacts: list[str] = Field(default_factory=list)
+    resume_plan: str | None = None
+    graph_diff: dict[str, Any] = Field(default_factory=dict)
+
+
+class ArtifactIndexEntry(BaseModel):
+    id: str
+    path: str
+    name: str
+    kind: str = "file"
+    producer_node_id: str | None = None
+    run_id: str | None = None
+    session_id: str | None = None
+    size: int = 0
+    modified_at: str = ""
+    sha256: str | None = None
+    summary: str = ""
+    refs: list[str] = Field(default_factory=list)
+
+
+class RuntimeSummary(BaseModel):
+    planner_session_id: str
+    planner_session_path: str
+    execution_state: str = "idle"
+    next_action: str = ""
+    planner_active: bool = False
+    latest_tick_id: str | None = None
+    latest_decision_type: PlannerDecisionType | None = None
+    latest_rationale: str = ""
+    active_node_count: int = 0
+    active_node_ids: list[str] = Field(default_factory=list)
+    waiting_approval_count: int = 0
+    waiting_approval_node_ids: list[str] = Field(default_factory=list)
+    waiting_dynamic_dependency_count: int = 0
+    waiting_dynamic_dependency_node_ids: list[str] = Field(default_factory=list)
+    queued_node_count: int = 0
+    ready_node_count: int = 0
+    ready_node_ids: list[str] = Field(default_factory=list)
+    failed_node_count: int = 0
+    failed_node_ids: list[str] = Field(default_factory=list)
+    terminal_node_count: int = 0
+    dynamic_node_count: int = 0
+    blocked_session_count: int = 0
+    artifact_count: int = 0
+    delta_count: int = 0
+    decision_count: int = 0
+    policy_rejection_count: int = 0
+    last_event_at: str | None = None
+
+
+class WorkflowHandoff(BaseModel):
+    source: str
+    target: str
+    source_name: str = ""
+    target_name: str = ""
+    source_run_id: str | None = None
+    target_run_id: str | None = None
+    source_status: WorkflowNodeStatus | None = None
+    content_type: Literal["json", "text", "status", "none"] = "none"
+    preview: str = ""
+    output_path: str | None = None
+    has_structured_output: bool = False
 
 
 class TeamEdge(BaseModel):
@@ -431,11 +612,57 @@ class WorkflowRecord(BaseModel):
 class WorkflowEvent(BaseModel):
     workflow_id: str
     timestamp: str
-    event_type: Literal["workflow", "node", "run", "stdout", "stderr", "aris", "thinking", "tool", "result"]
+    event_type: Literal[
+        "workflow",
+        "node",
+        "run",
+        "stdout",
+        "stderr",
+        "aris",
+        "thinking",
+        "tool",
+        "result",
+        "planner",
+        "delta",
+        "session",
+        "approval",
+    ]
     message: str
     node_id: str | None = None
     run_id: str | None = None
     payload: dict[str, Any] | None = None
+
+
+class PlanSnapshot(BaseModel):
+    graph: WorkflowGraph
+    graph_hash: str
+    node_count: int
+    edge_count: int
+    dynamic_node_count: int
+    blocked_node_count: int
+
+
+class WorkflowRuntimeResponse(BaseModel):
+    workflow_id: str
+    runtime_policy: RuntimePolicy
+    runtime_summary: RuntimeSummary
+    plan_snapshot: PlanSnapshot
+    latest_decision: PlannerDecisionRecord | None = None
+    blocked_sessions: list[dict[str, Any]] = Field(default_factory=list)
+    dynamic_nodes: list[WorkflowNode] = Field(default_factory=list)
+    artifact_index: list[ArtifactIndexEntry] = Field(default_factory=list)
+    handoffs: list[WorkflowHandoff] = Field(default_factory=list)
+
+
+class SessionRuntimeView(BaseModel):
+    session_id: str
+    workflow_id: str
+    node_id: str | None = None
+    kind: Literal["planner", "node"]
+    session_path: str | None = None
+    events: list[WorkflowEvent] = Field(default_factory=list)
+    artifact_refs: list[ArtifactIndexEntry] = Field(default_factory=list)
+    resume_turns: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class GenerateWorkflowRequest(BaseModel):
@@ -448,6 +675,15 @@ class RefineWorkflowRequest(BaseModel):
     instructions: str
     title: str | None = None
     graph_json: WorkflowGraph | None = None
+
+
+class OptimizeNodePromptRequest(BaseModel):
+    graph_json: WorkflowGraph | None = None
+    instructions: str | None = None
+
+
+class OptimizeNodePromptResponse(BaseModel):
+    prompt: str
 
 
 class CreateWorkflowRequest(BaseModel):

@@ -33,10 +33,14 @@ from .models import (
     HealthItem,
     HealthResponse,
     NodeActionRequest,
+    OptimizeNodePromptRequest,
+    OptimizeNodePromptResponse,
+    PlannerDecisionRecord,
     RefineWorkflowRequest,
     RenderHtmlRequest,
     RunRecord,
     RunOutput,
+    SessionRuntimeView,
     SkillInfo,
     TeamConfig,
     TeamConfigRequest,
@@ -44,7 +48,9 @@ from .models import (
     UpdateWorkflowRequest,
     UpdateAgentConfigRequest,
     UpdateTeamConfigRequest,
+    WorkflowDeltaRecord,
     WorkflowRecord,
+    WorkflowRuntimeResponse,
     WorkspaceInfo,
 )
 from .runner import RunManager, resolve_aris_binary
@@ -371,6 +377,40 @@ async def get_workflow_endpoint(workflow_id: str, workspace: str = Query(...)) -
     return record
 
 
+@app.get("/api/workflows/{workflow_id}/runtime", response_model=WorkflowRuntimeResponse)
+async def workflow_runtime(workflow_id: str, workspace: str = Query(...)) -> WorkflowRuntimeResponse:
+    workspace_path = _workspace_or_404(workspace)
+    try:
+        return workflow_manager.runtime(workspace_path, workflow_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/workflows/{workflow_id}/decisions", response_model=list[PlannerDecisionRecord])
+async def workflow_decisions(workflow_id: str, workspace: str = Query(...)) -> list[PlannerDecisionRecord]:
+    workspace_path = _workspace_or_404(workspace)
+    if workflow_manager.get(workspace_path, workflow_id) is None:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    return workflow_manager.decisions(workspace_path, workflow_id)
+
+
+@app.get("/api/workflows/{workflow_id}/deltas", response_model=list[WorkflowDeltaRecord])
+async def workflow_deltas(workflow_id: str, workspace: str = Query(...)) -> list[WorkflowDeltaRecord]:
+    workspace_path = _workspace_or_404(workspace)
+    if workflow_manager.get(workspace_path, workflow_id) is None:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    return workflow_manager.deltas(workspace_path, workflow_id)
+
+
+@app.get("/api/workflows/{workflow_id}/sessions/{session_id:path}", response_model=SessionRuntimeView)
+async def workflow_session(workflow_id: str, session_id: str, workspace: str = Query(...)) -> SessionRuntimeView:
+    workspace_path = _workspace_or_404(workspace)
+    try:
+        return workflow_manager.session_view(workspace_path, workflow_id, session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @app.patch("/api/workflows/{workflow_id}", response_model=WorkflowRecord)
 async def update_workflow_endpoint(
     workflow_id: str,
@@ -487,6 +527,27 @@ async def skip_workflow_node(workflow_id: str, node_id: str, workspace: str = Qu
         return await workflow_manager.skip_node(workspace_path, workflow_id, node_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/workflows/{workflow_id}/nodes/{node_id}/optimize-prompt", response_model=OptimizeNodePromptResponse)
+async def optimize_workflow_node_prompt(
+    workflow_id: str,
+    node_id: str,
+    request: OptimizeNodePromptRequest,
+    workspace: str = Query(...),
+) -> OptimizeNodePromptResponse:
+    workspace_path = _workspace_or_404(workspace)
+    try:
+        prompt = await workflow_manager.optimize_node_prompt(
+            workspace_path,
+            workflow_id,
+            node_id,
+            graph=request.graph_json,
+            instructions=request.instructions,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return OptimizeNodePromptResponse(prompt=prompt)
 
 
 @app.post("/api/workflows/{workflow_id}/nodes/{node_id}/rerun", response_model=WorkflowRecord)

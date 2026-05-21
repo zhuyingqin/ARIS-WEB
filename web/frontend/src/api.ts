@@ -9,13 +9,19 @@ import type {
   RefineWorkflowPayload,
   GlobalSettings,
   HealthResponse,
+  OptimizeNodePromptPayload,
+  OptimizeNodePromptResponse,
+  PlannerDecisionRecord,
   RunOutput,
   RunRecord,
+  SessionRuntimeView,
   SkillInfo,
   TeamConfig,
   TeamConfigPayload,
   UpdateGlobalSettingsPayload,
+  WorkflowDeltaRecord,
   WorkflowRecord,
+  WorkflowRuntimeResponse,
   WorkspaceInfo,
 } from "./types"
 
@@ -131,6 +137,22 @@ export const api = {
     request<RunOutput>(`/api/runs/${runId}/output?workspace=${encodeURIComponent(workspace)}`),
   workflows: (workspace?: string) =>
     request<WorkflowRecord[]>(`/api/workflows${workspace ? `?workspace=${encodeURIComponent(workspace)}` : ""}`),
+  workflowRuntime: (workflow: WorkflowRecord) =>
+    request<WorkflowRuntimeResponse>(
+      `/api/workflows/${workflow.id}/runtime?workspace=${encodeURIComponent(workflow.workspace)}`,
+    ),
+  workflowDecisions: (workflow: WorkflowRecord) =>
+    request<PlannerDecisionRecord[]>(
+      `/api/workflows/${workflow.id}/decisions?workspace=${encodeURIComponent(workflow.workspace)}`,
+    ),
+  workflowDeltas: (workflow: WorkflowRecord) =>
+    request<WorkflowDeltaRecord[]>(
+      `/api/workflows/${workflow.id}/deltas?workspace=${encodeURIComponent(workflow.workspace)}`,
+    ),
+  workflowSession: (workflow: WorkflowRecord, sessionId: string) =>
+    request<SessionRuntimeView>(
+      `/api/workflows/${workflow.id}/sessions/${encodeURIComponent(sessionId)}?workspace=${encodeURIComponent(workflow.workspace)}`,
+    ),
   createWorkflow: (payload: CreateWorkflowPayload) =>
     request<WorkflowRecord>("/api/workflows", {
       method: "POST",
@@ -189,6 +211,14 @@ export const api = {
     request<WorkflowRecord>(
       `/api/workflows/${workflow.id}/nodes/${nodeId}/skip?workspace=${encodeURIComponent(workflow.workspace)}`,
       { method: "POST" },
+    ),
+  optimizeWorkflowNodePrompt: (workflow: WorkflowRecord, nodeId: string, payload: OptimizeNodePromptPayload) =>
+    request<OptimizeNodePromptResponse>(
+      `/api/workflows/${workflow.id}/nodes/${nodeId}/optimize-prompt?workspace=${encodeURIComponent(workflow.workspace)}`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
     ),
   rerunWorkflowNode: (workflow: WorkflowRecord, nodeId: string, resetDownstream = false) =>
     request<WorkflowRecord>(

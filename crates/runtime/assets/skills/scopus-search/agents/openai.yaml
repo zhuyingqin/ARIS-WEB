@@ -1,0 +1,4 @@
+interface:
+  display_name: "Scopus Search"
+  short_description: "执行精确 Scopus 检索并返回结构化结果"
+  default_prompt: "使用 $scopus-search 时，先给出 Planning & Check-in 计划确认；如果用户已经提供稳定 query，默认直接执行全量检索并导出全部结果（脚本默认 --view COMPLETE，搜索响应直接携带摘要与作者关键词，不必再做 AbsDoc 二次抓取；8000+ 条规模一般 10 分钟内完成）。只有在用户明确要求预览、抽查或小样本验证时，才使用 --count 小批量返回；只有在用户明确不要摘要或受配额限制时，才加 --no-abstracts；只有在 key 没有 COMPLETE 权限时才降级 --view STANDARD。【硬约束】任何 Scopus 调用只能通过 CLI 命令 `python skills/scopus-search/scripts/scopus_search.py ...`；严禁在对话中内联 Python、import elsapy、手写 HTTP 或另写脚本；即使觉得脚本慢或想自己按年份/批次拆分，也禁止写外壳 Python——用内置 flag 或报错停下让用户处理，不要自己实现替代版本。脚本启动失败（import/路径/key 问题）同样向用户原样报错并停下。路径规范：以仓库根为 CWD，脚本写相对路径 skills/scopus-search/scripts/scopus_search.py，导出落 ./.codex/<task>/；禁止硬编码含中文或平台前缀（F:\\论文\\... / /Users/...）的绝对路径，Windows 下会出现编码解析问题。每个关键阶段回报结果与下一步。"

@@ -81,14 +81,21 @@ def guess_media_type(path: Path) -> str:
 
 def list_artifacts(workspace: Path, limit: int = 500) -> list[ArtifactInfo]:
     workspace = workspace.resolve()
+    aris_web = workspace / ".aris" / "web"
+    aris_workflows = aris_web / "workflows"
     artifacts: list[ArtifactInfo] = []
     for root, dirs, files in os.walk(workspace):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         root_path = Path(root)
-        if root_path.name == "web" and root_path.parent.name == ".aris":
-            dirs[:] = []
-            continue
+        if root_path == aris_web:
+            dirs[:] = [d for d in dirs if d == "workflows"]
+        elif root_path.parent == aris_web:
+            dirs[:] = [d for d in dirs if root_path == aris_workflows]
         for file_name in files:
+            if root_path == aris_web or root_path == aris_workflows:
+                continue
+            if root_path.parent == aris_workflows and file_name == "events.jsonl":
+                continue
             path = root_path / file_name
             if path.suffix.lower() not in ARTIFACT_SUFFIXES:
                 continue

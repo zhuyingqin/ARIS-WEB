@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .models import WorkflowEvent, WorkflowGraph, WorkflowRecord, WorkflowStatus
+from .models import ArtifactIndexEntry, PlannerDecisionRecord, WorkflowDeltaRecord, WorkflowEvent, WorkflowGraph, WorkflowRecord, WorkflowStatus
 from .storage import utc_now, web_dir
 
 
@@ -30,6 +30,22 @@ def workflow_path(workspace: Path, workflow_id: str) -> Path:
 
 def workflow_events_path(workspace: Path, workflow_id: str) -> Path:
     return workflow_path(workspace, workflow_id) / "events.jsonl"
+
+
+def workflow_runtime_dir(workspace: Path, workflow_id: str) -> Path:
+    return workflow_path(workspace, workflow_id) / "runtime"
+
+
+def workflow_decisions_path(workspace: Path, workflow_id: str) -> Path:
+    return workflow_runtime_dir(workspace, workflow_id) / "decisions.jsonl"
+
+
+def workflow_deltas_path(workspace: Path, workflow_id: str) -> Path:
+    return workflow_runtime_dir(workspace, workflow_id) / "deltas.jsonl"
+
+
+def workflow_artifact_index_path(workspace: Path, workflow_id: str) -> Path:
+    return workflow_runtime_dir(workspace, workflow_id) / "artifact_index.json"
 
 
 def ensure_workflow_state(workspace: Path) -> None:
@@ -176,6 +192,67 @@ def append_workflow_event(workspace: Path, event: WorkflowEvent) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(dump_model(event), ensure_ascii=False) + "\n")
+
+
+def _append_jsonl(path: Path, item: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(dump_model(item), ensure_ascii=False) + "\n")
+
+
+def _read_jsonl(path: Path, model_type: Any) -> list[Any]:
+    if not path.exists():
+        return []
+    items: list[Any] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            items.append(model_type(**json.loads(line)))
+        except Exception:
+            continue
+    return items
+
+
+def append_planner_decision(workspace: Path, record: PlannerDecisionRecord) -> None:
+    _append_jsonl(workflow_decisions_path(workspace, record.workflow_id), record)
+
+
+def list_planner_decisions(workspace: Path, workflow_id: str) -> list[PlannerDecisionRecord]:
+    return _read_jsonl(workflow_decisions_path(workspace, workflow_id), PlannerDecisionRecord)
+
+
+def append_workflow_delta(workspace: Path, record: WorkflowDeltaRecord) -> None:
+    _append_jsonl(workflow_deltas_path(workspace, record.workflow_id), record)
+
+
+def list_workflow_deltas(workspace: Path, workflow_id: str) -> list[WorkflowDeltaRecord]:
+    return _read_jsonl(workflow_deltas_path(workspace, workflow_id), WorkflowDeltaRecord)
+
+
+def write_artifact_index(workspace: Path, workflow_id: str, entries: list[ArtifactIndexEntry]) -> None:
+    path = workflow_artifact_index_path(workspace, workflow_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps([dump_model(item) for item in entries], ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def read_artifact_index(workspace: Path, workflow_id: str) -> list[ArtifactIndexEntry]:
+    path = workflow_artifact_index_path(workspace, workflow_id)
+    if not path.exists():
+        return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(raw, list):
+        return []
+    entries: list[ArtifactIndexEntry] = []
+    for item in raw:
+        try:
+            entries.append(ArtifactIndexEntry(**item))
+        except Exception:
+            continue
+    return entries
 
 
 def replay_workflow_events(workspace: Path, workflow_id: str) -> list[WorkflowEvent]:

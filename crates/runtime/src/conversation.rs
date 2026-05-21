@@ -11,7 +11,8 @@ use crate::permissions::{PermissionOutcome, PermissionPolicy, PermissionPrompter
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 use crate::usage::{TokenUsage, UsageTracker};
 
-const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 200_000;
+const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
+const AUTO_COMPACTION_ESTIMATED_TOKENS_THRESHOLD: usize = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,6 +216,7 @@ where
 
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
+        let mut auto_compaction = None;
         let mut iterations = 0;
 
         loop {
@@ -229,6 +231,10 @@ where
                     "conversation loop exceeded the maximum number of iterations",
                 ));
             }
+            merge_auto_compaction(
+                &mut auto_compaction,
+                self.maybe_auto_compact_by_estimate(),
+            );
 
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
@@ -357,7 +363,7 @@ where
             }
         }
 
-        let auto_compaction = self.maybe_auto_compact();
+        merge_auto_compaction(&mut auto_compaction, self.maybe_auto_compact());
 
         Ok(TurnSummary {
             assistant_messages,
@@ -420,6 +426,45 @@ where
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
         })
+    }
+
+    fn maybe_auto_compact_by_estimate(&mut self) -> Option<AutoCompactionEvent> {
+        if estimate_session_tokens(&self.session) < AUTO_COMPACTION_ESTIMATED_TOKENS_THRESHOLD {
+            return None;
+        }
+
+        let result = compact_session(
+            &self.session,
+            CompactionConfig {
+                max_estimated_tokens: AUTO_COMPACTION_ESTIMATED_TOKENS_THRESHOLD,
+                ..CompactionConfig::default()
+            },
+        );
+
+        if result.removed_message_count == 0 {
+            return None;
+        }
+
+        self.session = result.compacted_session;
+        self.api_client
+            .on_session_compacted(result.removed_message_count);
+        Some(AutoCompactionEvent {
+            removed_message_count: result.removed_message_count,
+        })
+    }
+}
+
+fn merge_auto_compaction(
+    current: &mut Option<AutoCompactionEvent>,
+    next: Option<AutoCompactionEvent>,
+) {
+    let Some(next_event) = next else {
+        return;
+    };
+    if let Some(current_event) = current {
+        current_event.removed_message_count += next_event.removed_message_count;
+    } else {
+        *current = Some(next_event);
     }
 }
 

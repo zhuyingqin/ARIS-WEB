@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import re
 import ssl
 import urllib.error
@@ -13,15 +15,36 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .agent_configs import get_agent_config
-from .global_settings import build_runtime_env, effective_effort_override, effective_model_override, openai_compatible_settings
+from .artifacts import artifact_kind, list_artifacts
+from .global_settings import (
+    build_runtime_env,
+    effective_effort_override,
+    effective_model_override,
+    get_planner_llm_settings,
+    planner_llm_summary,
+    openai_compatible_settings,
+)
 from .models import (
+    ArtifactIndexEntry,
     CreateRunRequest,
     NodeUsage,
+    PlanSnapshot,
+    PlannerDecision,
+    PlannerDecisionRecord,
+    PlannerDecisionType,
+    PolicyResult,
+    RuntimePolicy,
+    RuntimeSummary,
+    SessionRuntimeView,
+    WorkflowHandoff,
     WorkflowEdge,
+    WorkflowDelta,
+    WorkflowDeltaRecord,
     WorkflowEvent,
     WorkflowGraph,
     WorkflowNode,
     WorkflowRecord,
+    WorkflowRuntimeResponse,
 )
 from .pricing import (
     estimate_cost_usd,
@@ -34,12 +57,18 @@ from .storage import get_run, last_message_path, node_output_path, utc_now
 from .team_configs import get_team_config
 from .workflow_storage import (
     append_workflow_event,
+    append_planner_decision,
+    append_workflow_delta,
     delete_workflow,
     get_workflow,
     insert_workflow,
+    list_planner_decisions,
     list_workflows,
+    list_workflow_deltas,
+    read_artifact_index,
     replay_workflow_events,
     update_workflow,
+    write_artifact_index,
 )
 
 try:
@@ -51,6 +80,7 @@ except Exception:  # pragma: no cover - certifi may be unavailable in minimal in
 TERMINAL_NODE_STATUSES = {"succeeded", "skipped", "cancelled", "failed"}
 SUCCESS_NODE_STATUSES = {"succeeded", "skipped"}
 EXECUTABLE_NODE_TYPES = {"agent", "sub_agent"}
+HANDOFF_PREVIEW_CHARS = 900
 
 
 @dataclass
@@ -62,12 +92,25 @@ class NodeRunResult:
 
 
 NodeRunner = Callable[[Path, WorkflowRecord, WorkflowNode], Awaitable[NodeRunResult]]
+PlannerRunner = Callable[[Path, WorkflowRecord, str], Awaitable[PlannerDecision | dict[str, Any] | None]]
 
 
 def model_dict(value):
     if hasattr(value, "model_dump"):
         return value.model_dump()
     return value.dict()
+
+
+def prompt_context_data(value):
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if hasattr(value, "dict"):
+        return value.dict()
+    if isinstance(value, list):
+        return [prompt_context_data(item) for item in value]
+    if isinstance(value, dict):
+        return {key: prompt_context_data(item) for key, item in value.items()}
+    return value
 
 
 def _slug(value: str) -> str:
@@ -137,6 +180,506 @@ def concrete_output_paths(outputs) -> list[Path]:
     return paths
 
 
+def node_attempt_dir(workspace: Path, workflow_id: str, node: WorkflowNode) -> Path:
+    return workspace / ".aris" / "web" / "workflows" / workflow_id / "nodes" / node.id / f"attempt-{node.attempt + 1}"
+
+
+def workflow_output_path(workspace: Path, workflow_id: str, node: WorkflowNode, output_path: Path) -> Path:
+    if output_path.is_absolute():
+        return output_path
+    if output_path.parts and output_path.parts[0] == ".aris":
+        return workspace / output_path
+    return node_attempt_dir(workspace, workflow_id, node) / output_path
+
+
+def workflow_output_relative_path(workspace: Path, workflow_id: str, node: WorkflowNode, output_path: Path) -> str:
+    try:
+        return workflow_output_path(workspace, workflow_id, node, output_path).resolve().relative_to(workspace.resolve()).as_posix()
+    except ValueError:
+        return output_path.as_posix()
+
+
+def workflow_node_session_path(workspace: Path, workflow_id: str, node_id: str) -> Path:
+    return workspace / ".aris" / "web" / "workflows" / workflow_id / "nodes" / node_id / "session.json"
+
+
+def planner_session_path(workspace: Path, workflow_id: str) -> Path:
+    return workspace / ".aris" / "web" / "workflows" / workflow_id / "planner" / "session.json"
+
+
+def ensure_research_wiki(workspace: Path) -> Path:
+    root = workspace / "research-wiki"
+    for child in ("papers", "ideas", "experiments", "claims", "graph"):
+        (root / child).mkdir(parents=True, exist_ok=True)
+    log_path = root / "log.md"
+    if not log_path.exists():
+        log_path.write_text("# Research Wiki Log\n", encoding="utf-8")
+    return root
+
+
+def compact_research_wiki_pack(workspace: Path, *, limit: int = 8000) -> str:
+    root = workspace / "research-wiki"
+    if not root.exists():
+        return "(research-wiki not initialized)"
+    parts: list[str] = []
+    for rel in ("README.md", "query_pack.md", "log.md"):
+        path = root / rel
+        if path.exists():
+            try:
+                parts.append(f"## {rel}\n{path.read_text(encoding='utf-8', errors='replace')[-limit // 3:]}")
+            except OSError:
+                continue
+    paper_dir = root / "papers"
+    if paper_dir.exists():
+        papers = []
+        for path in sorted(paper_dir.glob("*.md"), key=lambda item: item.stat().st_mtime if item.exists() else 0, reverse=True)[:12]:
+            try:
+                papers.append(f"### papers/{path.name}\n{path.read_text(encoding='utf-8', errors='replace')[:900]}")
+            except OSError:
+                continue
+        if papers:
+            parts.append("## Recent papers\n" + "\n\n".join(papers))
+    text = "\n\n".join(parts).strip()
+    return text[-limit:] if text else "(research-wiki empty)"
+
+
+def compact_recent_artifact_pack(workspace: Path, workflow_id: str, *, limit: int = 10000) -> str:
+    suffixes = {".md", ".markdown", ".json", ".txt", ".tex"}
+    candidates: list[Path] = []
+    try:
+        for path in workspace.iterdir():
+            if path.is_file() and path.suffix.lower() in suffixes:
+                candidates.append(path)
+    except OSError:
+        pass
+
+    node_root = workspace / ".aris" / "web" / "workflows" / workflow_id / "nodes"
+    if node_root.exists():
+        try:
+            for path in node_root.rglob("*"):
+                if path.is_file() and path.suffix.lower() in suffixes and path.name != "session.json":
+                    candidates.append(path)
+        except OSError:
+            pass
+
+    def mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    parts: list[str] = []
+    seen: set[Path] = set()
+    for path in sorted(candidates, key=mtime, reverse=True):
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if len(parts) >= 14:
+            break
+        try:
+            if path.stat().st_size > 512_000:
+                continue
+            rel = resolved.relative_to(workspace.resolve()).as_posix()
+            text = path.read_text(encoding="utf-8", errors="replace").strip()
+        except (OSError, ValueError):
+            continue
+        if not text:
+            continue
+        parts.append(f"## {rel}\n{text[:1200]}")
+
+    text = "\n\n".join(parts).strip()
+    return text[-limit:] if text else "(no recent text artifacts found)"
+
+
+def sync_literature_result_to_wiki(workspace: Path, workflow_id: str, node: WorkflowNode) -> None:
+    if node.skill != "research-lit":
+        return
+    result_path = workflow_output_path(workspace, workflow_id, node, Path("literature_result.json"))
+    if not result_path.exists():
+        return
+    try:
+        raw = json.loads(result_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+    wiki = ensure_research_wiki(workspace)
+    query = str(raw.get("query") or research_query_from_request(node.research_request) or node.name).strip()
+    findings = raw.get("findings")
+    gaps = raw.get("gaps")
+    papers = raw.get("papers")
+    entry = {
+        "node_id": node.id,
+        "query": query,
+        "result": result_path.resolve().relative_to(workspace.resolve()).as_posix(),
+        "paper_count": len(papers) if isinstance(papers, list) else None,
+    }
+    with (wiki / "log.md").open("a", encoding="utf-8") as fh:
+        fh.write("\n")
+        fh.write(f"## Literature update: {node.id}\n")
+        fh.write(json.dumps(entry, ensure_ascii=False, indent=2))
+        fh.write("\n")
+    pack_lines = [f"# Latest Literature Query Pack\n", f"## Query\n{query}\n"]
+    if findings is not None:
+        pack_lines.append(f"## Findings\n{_template_value_to_text(findings)}\n")
+    if gaps is not None:
+        pack_lines.append(f"## Gaps\n{_template_value_to_text(gaps)}\n")
+    if papers is not None:
+        pack_lines.append(f"## Papers\n{_template_value_to_text(papers)}\n")
+    (wiki / "query_pack.md").write_text("\n".join(pack_lines), encoding="utf-8")
+
+
+def dynamic_literature_node_id(caller_id: str | None, query: str) -> str:
+    caller = _safe_node_slug(caller_id or "workflow", "workflow")
+    query_slug = _safe_node_slug(query, "research")
+    digest = hashlib.sha1(f"{caller_id or ''}\n{query}".encode("utf-8")).hexdigest()[:8]
+    return f"lit-{caller}-{query_slug[:30]}-{digest}"
+
+
+def research_query_from_request(request: dict[str, Any] | None) -> str:
+    if not request:
+        return ""
+    for key in ("query", "topic", "question", "keywords"):
+        value = request.get(key)
+        if isinstance(value, list):
+            text = ", ".join(str(item) for item in value if str(item).strip())
+        else:
+            text = str(value or "").strip()
+        if text:
+            return text
+    return json.dumps(request, ensure_ascii=False, sort_keys=True)
+
+
+def stable_graph_hash(graph: WorkflowGraph) -> str:
+    payload = json.dumps(model_dict(graph), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def plan_snapshot(graph: WorkflowGraph) -> PlanSnapshot:
+    dynamic_nodes = [node for node in graph.nodes if node.dynamic_parent_id or node.auto_approve_after]
+    blocked_nodes = [node for node in graph.nodes if node.status == "waiting_dynamic_dependency"]
+    return PlanSnapshot(
+        graph=graph,
+        graph_hash=stable_graph_hash(graph),
+        node_count=len(graph.nodes),
+        edge_count=len(graph.edges),
+        dynamic_node_count=len(dynamic_nodes),
+        blocked_node_count=len(blocked_nodes),
+    )
+
+
+def planner_decision_type(decision: PlannerDecision) -> PlannerDecisionType:
+    if decision.decision_type:
+        return decision.decision_type
+    if decision.complete:
+        return "fail" if any(delta.action == "mark_policy_rejected" for delta in decision.deltas) else "noop"
+    actions = {delta.action for delta in decision.deltas}
+    if not actions or actions == {"mark_noop"}:
+        return "noop"
+    if "resume_node" in actions and actions <= {"resume_node", "mark_noop"}:
+        return "resume"
+    if "mark_policy_rejected" in actions:
+        return "fail"
+    return "mutate"
+
+
+def _evidence_refs(decision: PlannerDecision, delta: WorkflowDelta) -> list[str]:
+    refs: list[str] = []
+    refs.extend(decision.gap_evidence_refs)
+    refs.extend(delta.gap_evidence_refs)
+    refs.extend(delta.source_event_refs)
+    refs.extend(delta.source_artifact_refs)
+    if isinstance(delta.research_request, dict):
+        for key in ("gap_evidence_refs", "evidence_refs", "source_event_refs", "source_artifact_refs"):
+            value = delta.research_request.get(key)
+            if isinstance(value, list):
+                refs.extend(str(item) for item in value if str(item).strip())
+            elif isinstance(value, str) and value.strip():
+                refs.append(value.strip())
+    seen: set[str] = set()
+    clean: list[str] = []
+    for ref in refs:
+        ref = str(ref).strip()
+        if not ref or ref in seen:
+            continue
+        clean.append(ref)
+        seen.add(ref)
+    return clean
+
+
+def _decision_refs(decision: PlannerDecision, delta: WorkflowDelta) -> tuple[list[str], list[str]]:
+    event_refs = list(dict.fromkeys([*delta.source_event_refs]))
+    artifact_refs = list(dict.fromkeys([*delta.source_artifact_refs]))
+    for ref in decision.gap_evidence_refs:
+        if ref.startswith("event:") and ref not in event_refs:
+            event_refs.append(ref)
+        elif ref.startswith("artifact:") and ref not in artifact_refs:
+            artifact_refs.append(ref)
+    return event_refs, artifact_refs
+
+
+def graph_runtime_diff(before: WorkflowGraph, after: WorkflowGraph) -> dict[str, Any]:
+    before_nodes = {node.id: node for node in before.nodes}
+    after_nodes = {node.id: node for node in after.nodes}
+    before_edges = {(edge.source, edge.target) for edge in before.edges}
+    after_edges = {(edge.source, edge.target) for edge in after.edges}
+    status_changes = []
+    dependency_changes = []
+    for node_id, node in after_nodes.items():
+        previous = before_nodes.get(node_id)
+        if previous is None:
+            continue
+        if previous.status != node.status:
+            status_changes.append({"node_id": node_id, "before": previous.status, "after": node.status})
+        if sorted(previous.depends_on) != sorted(node.depends_on):
+            dependency_changes.append(
+                {
+                    "node_id": node_id,
+                    "before": sorted(previous.depends_on),
+                    "after": sorted(node.depends_on),
+                }
+            )
+    return {
+        "added_nodes": sorted(set(after_nodes) - set(before_nodes)),
+        "removed_nodes": sorted(set(before_nodes) - set(after_nodes)),
+        "added_edges": [f"{source}->{target}" for source, target in sorted(after_edges - before_edges)],
+        "removed_edges": [f"{source}->{target}" for source, target in sorted(before_edges - after_edges)],
+        "status_changes": status_changes,
+        "dependency_changes": dependency_changes,
+    }
+
+
+def _session_id_for_node(workflow_id: str, node: WorkflowNode) -> str:
+    return f"node:{workflow_id}:{node.id}"
+
+
+def _planner_session_id(workflow_id: str) -> str:
+    return f"planner:{workflow_id}"
+
+
+def _safe_relative(workspace: Path, path: Path) -> str:
+    try:
+        return path.resolve().relative_to(workspace.resolve()).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _truncate_handoff_preview(value: str, limit: int = HANDOFF_PREVIEW_CHARS) -> str:
+    value = re.sub(r"\s+", " ", value.strip())
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _latest_completed_node_run_id(workspace: Path, workflow_id: str, node_id: str) -> str | None:
+    seen: set[str] = set()
+    for event in reversed(replay_workflow_events(workspace, workflow_id)):
+        if event.node_id != node_id or not event.run_id or event.run_id in seen:
+            continue
+        seen.add(event.run_id)
+        run = get_run(workspace, event.run_id)
+        if run and run.status == "succeeded" and (
+            node_output_path(workspace, event.run_id).exists()
+            or last_message_path(workspace, event.run_id).exists()
+        ):
+            return event.run_id
+    return None
+
+
+def _read_run_output_preview(workspace: Path, run_id: str) -> tuple[str, str, str | None, bool] | None:
+    output_json_path = node_output_path(workspace, run_id)
+    if output_json_path.exists():
+        try:
+            parsed = json.loads(output_json_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            parsed = None
+        if isinstance(parsed, dict):
+            structured = parsed.get("json")
+            text = parsed.get("text")
+            if structured is not None:
+                preview = json.dumps(structured, ensure_ascii=False, indent=2)
+                return _truncate_handoff_preview(preview), "json", _safe_relative(workspace, output_json_path), True
+            if isinstance(text, str) and text.strip():
+                return _truncate_handoff_preview(text), "text", _safe_relative(workspace, output_json_path), False
+
+    message_path = last_message_path(workspace, run_id)
+    if message_path.exists():
+        try:
+            text = message_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        if text.strip():
+            return _truncate_handoff_preview(text), "text", _safe_relative(workspace, message_path), False
+
+    return None
+
+
+def _extract_node_output_preview(workspace: Path, workflow_id: str, node: WorkflowNode) -> tuple[str, str, str | None, bool, str | None]:
+    run_ids = [node.run_id] if node.run_id else []
+    fallback_run_id = _latest_completed_node_run_id(workspace, workflow_id, node.id)
+    if fallback_run_id and fallback_run_id not in run_ids:
+        run_ids.append(fallback_run_id)
+
+    for run_id in run_ids:
+        if not run_id:
+            continue
+        preview = _read_run_output_preview(workspace, run_id)
+        if preview:
+            return (*preview, run_id)
+
+    if not run_ids:
+        if node.status in {"queued", "blocked", "waiting_dynamic_dependency", "waiting_approval", "running"}:
+            return f"{node.name} is {node.status}; no completed output is available yet.", "status", None, False, None
+        return f"{node.name} has no run output.", "none", None, False, None
+
+    return f"{node.name} is {node.status}; output has not been written.", "status", None, False, run_ids[0]
+
+
+def build_handoff_index(workspace: Path, record: WorkflowRecord) -> list[WorkflowHandoff]:
+    nodes_by_id = {node.id: node for node in record.graph_json.nodes}
+    edge_pairs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_pair(source: str | None, target: str | None) -> None:
+        if not source or not target or source == target:
+            return
+        pair = (source, target)
+        if pair in seen or source not in nodes_by_id or target not in nodes_by_id:
+            return
+        seen.add(pair)
+        edge_pairs.append(pair)
+
+    for edge in record.graph_json.edges:
+        add_pair(edge.source, edge.target)
+    for target in record.graph_json.nodes:
+        for source in target.depends_on:
+            add_pair(source, target.id)
+
+    handoffs: list[WorkflowHandoff] = []
+    for source_id, target_id in edge_pairs:
+        source = nodes_by_id[source_id]
+        target = nodes_by_id[target_id]
+        preview, content_type, output_path, has_structured, source_run_id = _extract_node_output_preview(workspace, record.id, source)
+        handoffs.append(
+            WorkflowHandoff(
+                source=source_id,
+                target=target_id,
+                source_name=source.name,
+                target_name=target.name,
+                source_run_id=source_run_id,
+                target_run_id=target.run_id,
+                source_status=source.status,
+                content_type=content_type,  # type: ignore[arg-type]
+                preview=preview,
+                output_path=output_path,
+                has_structured_output=has_structured,
+            )
+        )
+    return handoffs
+
+
+def _hash_file(path: Path, *, limit: int = 2_000_000) -> str | None:
+    try:
+        if path.stat().st_size > limit:
+            return None
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _artifact_summary(path: Path) -> str:
+    if path.suffix.lower() not in {".md", ".markdown", ".json", ".jsonl", ".txt", ".tex", ".bib", ".csv", ".tsv", ".log"}:
+        return ""
+    try:
+        if path.stat().st_size > 512_000:
+            return ""
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    if not text:
+        return ""
+    return text[:480]
+
+
+def build_artifact_index(workspace: Path, record: WorkflowRecord) -> list[ArtifactIndexEntry]:
+    nodes = {node.id: node for node in record.graph_json.nodes}
+    entries_by_path: dict[str, ArtifactIndexEntry] = {}
+    workflow_node_root = workspace / ".aris" / "web" / "workflows" / record.id / "nodes"
+
+    def infer_producer(path: Path) -> WorkflowNode | None:
+        try:
+            rel = path.resolve().relative_to(workflow_node_root.resolve())
+        except ValueError:
+            return None
+        if len(rel.parts) < 3:
+            return None
+        node_id = rel.parts[0]
+        return nodes.get(node_id)
+
+    try:
+        candidates = list_artifacts(workspace, limit=1200)
+    except Exception:
+        candidates = []
+    for artifact in candidates:
+        norm_path = artifact.path.replace("\\", "/")
+        if norm_path.startswith(f".aris/web/workflows/{record.id}/runtime/"):
+            continue
+        if norm_path.endswith("/session.json") or norm_path.endswith("/events.jsonl"):
+            continue
+        if norm_path.startswith(".aris/web/workflows/") and f"/{record.id}/nodes/" not in norm_path:
+            continue
+        path = workspace / artifact.path
+        if ".aris/web/workflows/" not in norm_path and artifact.path.startswith(".aris/"):
+            continue
+        producer = infer_producer(path)
+        session_id = _session_id_for_node(record.id, producer) if producer else None
+        entries_by_path[artifact.path] = ArtifactIndexEntry(
+            id=artifact.id,
+            path=artifact.path,
+            name=artifact.name,
+            kind=artifact.kind,
+            producer_node_id=producer.id if producer else None,
+            run_id=producer.run_id if producer else None,
+            session_id=session_id,
+            size=artifact.size,
+            modified_at=artifact.modified_at,
+            sha256=_hash_file(path),
+            summary=_artifact_summary(path),
+        )
+
+    # Include declared node outputs even when they live under hidden workflow dirs
+    # that the general artifact browser normally suppresses.
+    for node in record.graph_json.nodes:
+        for output_path in concrete_output_paths(node.outputs):
+            path = workflow_output_path(workspace, record.id, node, output_path)
+            if not path.exists() or not path.is_file():
+                continue
+            try:
+                rel = path.resolve().relative_to(workspace.resolve()).as_posix()
+                stat = path.stat()
+            except (OSError, ValueError):
+                continue
+            entries_by_path[rel] = ArtifactIndexEntry(
+                id=hashlib.sha1(rel.encode("utf-8")).hexdigest()[:16],
+                path=rel,
+                name=path.name,
+                kind=artifact_kind(path),
+                producer_node_id=node.id,
+                run_id=node.run_id,
+                session_id=_session_id_for_node(record.id, node),
+                size=stat.st_size,
+                modified_at=time_from_stat(stat.st_mtime),
+                sha256=_hash_file(path),
+                summary=_artifact_summary(path),
+            )
+    return sorted(entries_by_path.values(), key=lambda item: item.modified_at, reverse=True)
+
+
+def time_from_stat(value: float) -> str:
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(value, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _render_port_summary(ports, *, kind: str) -> str:
     """Render a port list as a bulleted summary for the agent prompt.
 
@@ -165,15 +708,18 @@ def _render_port_summary(ports, *, kind: str) -> str:
     return "\n".join(lines)
 
 
-def missing_concrete_outputs(workspace: Path, node: WorkflowNode) -> list[str]:
+def missing_concrete_outputs(workspace: Path, workflow_id: str | WorkflowNode, node: WorkflowNode | None = None) -> list[str]:
+    if node is None:
+        node = workflow_id  # type: ignore[assignment]
+        workflow_id = ""
     missing: list[str] = []
     for output_path in concrete_output_paths(node.outputs):
-        resolved = (workspace / output_path).resolve()
+        resolved = (workflow_output_path(workspace, str(workflow_id), node, output_path) if workflow_id else workspace / output_path).resolve()
         if workspace.resolve() not in [resolved, *resolved.parents]:
             missing.append(output_path.as_posix())
             continue
         if not resolved.exists():
-            missing.append(output_path.as_posix())
+            missing.append(workflow_output_relative_path(workspace, str(workflow_id), node, output_path) if workflow_id else output_path.as_posix())
     return missing
 
 
@@ -546,6 +1092,7 @@ User goal:
 WORKFLOW_PROMPT_RUNTIME_FIELDS = {
     "status",
     "run_id",
+    "session_path",
     "error",
     "approved_before",
     "approved_after",
@@ -553,6 +1100,8 @@ WORKFLOW_PROMPT_RUNTIME_FIELDS = {
     "usage",
     "fanout_parent_id",
     "fanout_item",
+    "dynamic_parent_id",
+    "dynamic_reason",
 }
 
 WORKFLOW_NODE_EXECUTION_FIELDS = [
@@ -573,6 +1122,10 @@ WORKFLOW_NODE_EXECUTION_FIELDS = [
     "failure_policy",
     "concurrency_class",
     "fanout",
+    "dynamic_parent_id",
+    "dynamic_reason",
+    "auto_approve_after",
+    "research_request",
     "team_id",
     "team_instance_id",
     "team_role_id",
@@ -581,6 +1134,7 @@ WORKFLOW_NODE_EXECUTION_FIELDS = [
 WORKFLOW_NODE_PRESERVED_RUNTIME_FIELDS = [
     "status",
     "run_id",
+    "session_path",
     "error",
     "approved_before",
     "approved_after",
@@ -588,6 +1142,8 @@ WORKFLOW_NODE_PRESERVED_RUNTIME_FIELDS = [
     "usage",
     "fanout_parent_id",
     "fanout_item",
+    "dynamic_parent_id",
+    "dynamic_reason",
 ]
 
 
@@ -782,6 +1338,204 @@ def _extract_json_blob(text: str) -> str | None:
     if start == -1 or end == -1 or end <= start:
         return None
     return text[start : end + 1]
+
+
+def parse_optimized_prompt_text(text: str) -> str:
+    raw = _extract_json_blob(text)
+    if raw is not None:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict):
+            for key in ("prompt", "optimized_prompt", "result"):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            for key in ("last_message", "message", "content"):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    try:
+                        return parse_optimized_prompt_text(value)
+                    except ValueError:
+                        return value.strip()
+    cleaned = re.sub(r"^```(?:markdown|text)?\s*|\s*```$", "", text.strip(), flags=re.IGNORECASE | re.DOTALL).strip()
+    if not cleaned:
+        raise ValueError("Prompt optimizer returned an empty response")
+    return cleaned
+
+
+def parse_planner_decision_text(text: str) -> PlannerDecision:
+    candidates: list[str] = []
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and isinstance(parsed.get("message"), str):
+            candidates.append(parsed["message"])
+        if isinstance(parsed, dict):
+            candidates.append(stripped)
+    candidates.append(text)
+    for candidate in candidates:
+        raw = _extract_json_blob(candidate) or candidate
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return PlannerDecision(**data)
+    raise ValueError("Planner did not return a parseable PlannerDecision JSON object")
+
+
+def responses_api_url(base_url: str) -> str:
+    base = base_url.strip().rstrip("/")
+    if base.endswith("/responses"):
+        return base
+    if base.endswith("/v1"):
+        return f"{base}/responses"
+    return f"{base}/v1/responses"
+
+
+def extract_responses_text(payload: dict[str, Any]) -> str:
+    output_text = payload.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+    chunks: list[str] = []
+    output = payload.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if isinstance(content, str):
+                chunks.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    text = block.get("text") or block.get("content")
+                    if isinstance(text, str):
+                        chunks.append(text)
+    choices = payload.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message")
+            if isinstance(message, dict) and isinstance(message.get("content"), str):
+                chunks.append(message["content"])
+    return "\n".join(chunk for chunk in chunks if chunk).strip()
+
+
+def append_planner_llm_session(workspace: Path, workflow_id: str, turn: dict[str, Any]) -> None:
+    path = workspace / ".aris" / "web" / "workflows" / workflow_id / "planner" / "responses-session.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    current: dict[str, Any] = {"kind": "openai_responses_planner", "turns": []}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict) and isinstance(loaded.get("turns"), list):
+                current = loaded
+        except (OSError, json.JSONDecodeError):
+            pass
+    current.setdefault("kind", "openai_responses_planner")
+    current.setdefault("turns", [])
+    current["turns"].append(turn)
+    path.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def build_node_prompt_optimization_prompt(
+    record: WorkflowRecord,
+    graph: WorkflowGraph,
+    node: WorkflowNode,
+    instructions: str | None = None,
+) -> str:
+    config = get_agent_config(Path(record.workspace), node.config_file) if node.type == "sub_agent" and node.config_file else None
+    nodes_context = [
+        {
+            "id": item.id,
+            "type": item.type,
+            "name": item.name,
+            "role": item.role,
+            "skill": item.skill,
+            "depends_on": item.depends_on,
+            "inputs": prompt_context_data(item.inputs),
+            "outputs": prompt_context_data(item.outputs),
+        }
+        for item in graph.nodes
+    ]
+    target = {
+        "id": node.id,
+        "type": node.type,
+        "name": node.name,
+        "role": node.role,
+        "skill": node.skill,
+        "profile": prompt_context_data(config) if config else None,
+        "model": node.model,
+        "effort": node.effort,
+        "depends_on": node.depends_on,
+        "inputs": prompt_context_data(node.inputs),
+        "outputs": prompt_context_data(node.outputs),
+        "current_prompt": node.prompt,
+    }
+    focus = instructions.strip() if instructions else ""
+    return "\n".join(
+        [
+            "You are optimizing a single workflow node prompt for ARIS Web.",
+            "Return only valid JSON with this exact shape: {\"prompt\":\"...\"}.",
+            "",
+            "Optimization rules:",
+            "- Preserve the node's intent, role, skill contract, dependencies, and required outputs.",
+            "- Make the prompt concrete, executable, and self-contained for the assigned agent.",
+            "- Include clear success criteria and expected artifacts when outputs imply files or reports.",
+            "- Do not execute the task, do not invent completed results, and do not change the workflow graph.",
+            "- Keep the prompt in the same natural language as the current prompt unless the user asks otherwise.",
+            "- Avoid vague wording; make inputs, constraints, and deliverables explicit.",
+            "",
+            f"Workflow title: {record.title}",
+            f"Workflow goal: {record.goal}",
+            f"User optimization focus: {focus or 'Improve clarity, completeness, and execution reliability.'}",
+            "",
+            "Workflow nodes:",
+            json.dumps(nodes_context, ensure_ascii=False, indent=2),
+            "",
+            "Target node:",
+            json.dumps(target, ensure_ascii=False, indent=2),
+        ]
+    )
+
+
+async def optimize_node_prompt_with_aris(
+    workspace: Path,
+    record: WorkflowRecord,
+    graph: WorkflowGraph,
+    node: WorkflowNode,
+    instructions: str | None = None,
+) -> str:
+    prompt = build_node_prompt_optimization_prompt(record, graph, node, instructions)
+    settings = openai_compatible_settings()
+    if settings is not None:
+        raw = await asyncio.to_thread(_request_openai_compatible_workflow_json, settings, prompt)
+        return parse_optimized_prompt_text(raw)
+
+    command = build_aris_command(workspace, prompt, node.model or effective_model_override())
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        cwd=str(workspace),
+        env=build_runtime_env(),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+    output = stdout.decode("utf-8", errors="replace")
+    if process.returncode != 0:
+        detail = (stderr or stdout).decode("utf-8", errors="replace")[-2000:]
+        raise ValueError(detail or f"ARIS exited with code {process.returncode}")
+    return parse_optimized_prompt_text(output)
 
 
 def _request_openai_compatible_workflow_json(settings: dict[str, str], prompt: str) -> str:
@@ -1077,18 +1831,192 @@ class WorkflowManager:
         *,
         max_concurrency: int = 2,
         node_runner: NodeRunner | None = None,
+        planner_runner: PlannerRunner | None = None,
     ) -> None:
         self.run_manager = run_manager
         self.max_concurrency = max_concurrency
         self.node_runner = node_runner
+        self.planner_runner = planner_runner
         self.bus = WorkflowEventBus()
         self._active: dict[str, set[str]] = {}
+        self._planning: set[str] = set()
 
     def list(self, workspaces: list[object]) -> list[WorkflowRecord]:
         return list_workflows(workspaces)
 
     def get(self, workspace: Path, workflow_id: str) -> WorkflowRecord | None:
         return get_workflow(workspace, workflow_id)
+
+    def runtime_policy(self, _workspace: Path, _workflow_id: str) -> RuntimePolicy:
+        return RuntimePolicy()
+
+    def decisions(self, workspace: Path, workflow_id: str) -> list[PlannerDecisionRecord]:
+        return list_planner_decisions(workspace, workflow_id)
+
+    def deltas(self, workspace: Path, workflow_id: str) -> list[WorkflowDeltaRecord]:
+        return list_workflow_deltas(workspace, workflow_id)
+
+    def artifact_index(self, workspace: Path, workflow_id: str) -> list[ArtifactIndexEntry]:
+        record = self._require(workspace, workflow_id)
+        entries = build_artifact_index(workspace, record)
+        write_artifact_index(workspace, workflow_id, entries)
+        return entries
+
+    def runtime(self, workspace: Path, workflow_id: str) -> WorkflowRuntimeResponse:
+        record = self._require(workspace, workflow_id)
+        decisions = list_planner_decisions(workspace, workflow_id)
+        deltas = list_workflow_deltas(workspace, workflow_id)
+        artifacts = build_artifact_index(workspace, record)
+        write_artifact_index(workspace, workflow_id, artifacts)
+        handoffs = build_handoff_index(workspace, record)
+        events = replay_workflow_events(workspace, workflow_id)
+        latest = decisions[-1] if decisions else None
+        nodes_by_id = {node.id: node for node in record.graph_json.nodes}
+        dynamic_nodes = [node for node in record.graph_json.nodes if node.dynamic_parent_id or node.auto_approve_after]
+        planner_active = workflow_id in self._planning
+        active_ids = sorted(
+            node_id
+            for node_id in {
+                *self._active.get(workflow_id, set()),
+                *[node.id for node in record.graph_json.nodes if node.status == "running"],
+            }
+            if node_id in nodes_by_id
+        )
+        waiting_approval_nodes = [node for node in record.graph_json.nodes if node.status == "waiting_approval"]
+        waiting_dynamic_nodes = [node for node in record.graph_json.nodes if node.status == "waiting_dynamic_dependency"]
+        queued_nodes = [node for node in record.graph_json.nodes if node.status == "queued"]
+        failed_nodes = [node for node in record.graph_json.nodes if node.status == "failed"]
+        terminal_nodes = [node for node in record.graph_json.nodes if node.status in TERMINAL_NODE_STATUSES]
+        ready_nodes = [
+            node
+            for node in queued_nodes
+            if all(
+                dep in nodes_by_id and nodes_by_id[dep].status in SUCCESS_NODE_STATUSES
+                for dep in node.depends_on
+            )
+        ]
+        blocked_sessions = [
+            {
+                "node_id": node.id,
+                "session_id": _session_id_for_node(workflow_id, node),
+                "session_path": node.session_path,
+                "blocked_by": [dep for dep in node.depends_on if any(item.id == dep and item.dynamic_parent_id for item in record.graph_json.nodes)],
+                "reason": node.dynamic_reason or node.error or "waiting for dynamic dependency",
+            }
+            for node in record.graph_json.nodes
+            if node.status == "waiting_dynamic_dependency"
+        ]
+        rejection_count = sum(1 for delta in deltas if not delta.policy_result.allowed)
+        if planner_active:
+            execution_state = "planning"
+            next_action = "Planner is checking the current plan snapshot."
+        elif record.status == "draft":
+            execution_state = "draft"
+            next_action = "Run the workflow to start execution."
+        elif active_ids:
+            execution_state = "running"
+            next_action = f"Waiting for {len(active_ids)} active node(s) to finish."
+        elif waiting_dynamic_nodes:
+            execution_state = "waiting_dynamic_dependency"
+            next_action = "Waiting for dynamic literature dependencies before resuming blocked sessions."
+        elif waiting_approval_nodes:
+            execution_state = "waiting_approval"
+            next_action = "Human approval is required before downstream execution can continue."
+        elif record.status in {"succeeded", "failed", "cancelled"}:
+            execution_state = record.status
+            next_action = f"Workflow is {record.status}."
+        elif ready_nodes:
+            execution_state = "ready"
+            next_action = f"{len(ready_nodes)} queued node(s) are ready for the scheduler."
+        elif queued_nodes and record.status == "running":
+            execution_state = "scheduled"
+            next_action = "Queued nodes are waiting for upstream dependencies or the next scheduler tick."
+        elif record.status == "paused":
+            execution_state = "paused"
+            next_action = "Workflow is paused. Resume or approve the waiting item to continue."
+        else:
+            execution_state = "idle"
+            next_action = "No active runtime work is currently scheduled."
+        summary = RuntimeSummary(
+            planner_session_id=_planner_session_id(workflow_id),
+            planner_session_path=_safe_relative(workspace, planner_session_path(workspace, workflow_id)),
+            execution_state=execution_state,
+            next_action=next_action,
+            planner_active=planner_active,
+            latest_tick_id=latest.tick_id if latest else None,
+            latest_decision_type=latest.decision_type if latest else None,
+            latest_rationale=latest.rationale if latest else "",
+            active_node_count=len(active_ids),
+            active_node_ids=active_ids,
+            waiting_approval_count=len(waiting_approval_nodes),
+            waiting_approval_node_ids=[node.id for node in waiting_approval_nodes],
+            waiting_dynamic_dependency_count=len(waiting_dynamic_nodes),
+            waiting_dynamic_dependency_node_ids=[node.id for node in waiting_dynamic_nodes],
+            queued_node_count=len(queued_nodes),
+            ready_node_count=len(ready_nodes),
+            ready_node_ids=[node.id for node in ready_nodes],
+            failed_node_count=len(failed_nodes),
+            failed_node_ids=[node.id for node in failed_nodes],
+            terminal_node_count=len(terminal_nodes),
+            dynamic_node_count=len(dynamic_nodes),
+            blocked_session_count=len(blocked_sessions),
+            artifact_count=len(artifacts),
+            delta_count=len(deltas),
+            decision_count=len(decisions),
+            policy_rejection_count=rejection_count,
+            last_event_at=events[-1].timestamp if events else None,
+        )
+        return WorkflowRuntimeResponse(
+            workflow_id=workflow_id,
+            runtime_policy=self.runtime_policy(workspace, workflow_id),
+            runtime_summary=summary,
+            plan_snapshot=plan_snapshot(record.graph_json),
+            latest_decision=latest,
+            blocked_sessions=blocked_sessions,
+            dynamic_nodes=dynamic_nodes,
+            artifact_index=artifacts,
+            handoffs=handoffs,
+        )
+
+    def session_view(self, workspace: Path, workflow_id: str, session_id: str) -> SessionRuntimeView:
+        record = self._require(workspace, workflow_id)
+        artifacts = read_artifact_index(workspace, workflow_id) or build_artifact_index(workspace, record)
+        events = replay_workflow_events(workspace, workflow_id)
+        if session_id == _planner_session_id(workflow_id) or session_id == "planner":
+            filtered = [event for event in events if event.event_type in {"planner", "delta"}]
+            return SessionRuntimeView(
+                session_id=_planner_session_id(workflow_id),
+                workflow_id=workflow_id,
+                kind="planner",
+                session_path=_safe_relative(workspace, planner_session_path(workspace, workflow_id)),
+                events=filtered,
+                artifact_refs=[],
+                resume_turns=[],
+            )
+        prefix = f"node:{workflow_id}:"
+        node_id = session_id[len(prefix):] if session_id.startswith(prefix) else session_id
+        node = self._find_node(record.graph_json, node_id)
+        filtered = [event for event in events if event.node_id == node_id or (event.payload or {}).get("node_id") == node_id]
+        node_artifacts = [artifact for artifact in artifacts if artifact.producer_node_id == node_id or artifact.session_id == _session_id_for_node(workflow_id, node)]
+        resume_turns = [
+            {
+                "timestamp": event.timestamp,
+                "message": event.message,
+                "payload": event.payload,
+            }
+            for event in events
+            if event.event_type in {"planner", "session", "delta"} and node_id in json.dumps(event.payload or {}, ensure_ascii=False)
+        ]
+        return SessionRuntimeView(
+            session_id=_session_id_for_node(workflow_id, node),
+            workflow_id=workflow_id,
+            node_id=node_id,
+            kind="node",
+            session_path=node.session_path,
+            events=filtered,
+            artifact_refs=node_artifacts,
+            resume_turns=resume_turns,
+        )
 
     async def create(
         self,
@@ -1210,6 +2138,22 @@ class WorkflowManager:
             ),
         )
         return updated
+
+    async def optimize_node_prompt(
+        self,
+        workspace: Path,
+        workflow_id: str,
+        node_id: str,
+        *,
+        graph: WorkflowGraph | None = None,
+        instructions: str | None = None,
+    ) -> str:
+        record = self._require(workspace, workflow_id)
+        normalized = normalize_workflow_graph(graph or record.graph_json, {skill.id for skill in scan_skills()})
+        node = self._find_node(normalized, node_id)
+        if not node.prompt.strip():
+            raise ValueError("Node prompt is empty")
+        return await optimize_node_prompt_with_aris(workspace, record, normalized, node, instructions)
 
     async def expand_team(
         self,
@@ -1342,6 +2286,7 @@ class WorkflowManager:
 
     async def execute(self, workspace: Path, workflow_id: str) -> WorkflowRecord:
         record = self._require(workspace, workflow_id)
+        ensure_research_wiki(workspace)
         started_at = record.started_at or utc_now()
         update_workflow(workspace, workflow_id, status="running", started_at=started_at, finished_at=None, clear_error=True)
         await self._append_event(
@@ -1376,7 +2321,7 @@ class WorkflowManager:
         for node in graph.nodes:
             if node.status == "running" and node.run_id:
                 await self.run_manager.cancel(workspace, node.run_id)
-            if node.status in {"queued", "blocked", "waiting_approval", "running"}:
+            if node.status in {"queued", "blocked", "waiting_dynamic_dependency", "waiting_approval", "running"}:
                 node.status = "cancelled"
         update_workflow(workspace, workflow_id, status="cancelled", graph_json=graph, finished_at=utc_now())
         await self._append_event(
@@ -1649,6 +2594,839 @@ class WorkflowManager:
         )
         return True
 
+    def _build_planner_prompt(self, workspace: Path, record: WorkflowRecord, trigger: str) -> str:
+        nodes = [
+            {
+                "id": node.id,
+                "type": node.type,
+                "name": node.name,
+                "role": node.role,
+                "skill": node.skill,
+                "status": node.status,
+                "depends_on": node.depends_on,
+                "run_id": node.run_id,
+                "error": node.error,
+                "dynamic_parent_id": node.dynamic_parent_id,
+                "dynamic_reason": node.dynamic_reason,
+                "research_request": node.research_request,
+                "auto_approve_after": node.auto_approve_after,
+            }
+            for node in record.graph_json.nodes
+        ]
+        recent_events = [
+            {
+                "event_type": event.event_type,
+                "node_id": event.node_id,
+                "message": event.message[-1000:],
+            }
+            for event in replay_workflow_events(workspace, record.id)[-30:]
+        ]
+        return "\n".join(
+            [
+                "You are the persistent Planner/Orchestrator Agent for an ARIS Web workflow.",
+                "Return ONLY valid JSON. Do not include Markdown fences or prose.",
+                "",
+                "Your job is to inspect the current materialized DAG and decide whether to dynamically add literature research workers, block nodes, resume nodes, or do nothing.",
+                "Rules:",
+                "- Keep the graph acyclic.",
+                "- Only the planner may change the DAG.",
+                "- Literature workers are stateless sub_agent nodes with skill research-lit.",
+                "- DAG is only the current PlanSnapshot; history belongs to the EventLog and DeltaHistory.",
+                "- Every tick must produce a Decision Card. Use decision_type=noop when no mutation is justified.",
+                "- Dynamic add_node requests must cite gap_evidence_refs or source_artifact_refs; without evidence choose noop.",
+                "- Use add_node plus block_node when a node needs literature before it can continue.",
+                "- Use resume_node only when a waiting_dynamic_dependency node has all needed research complete.",
+                "- If a waiting_approval planning/writing/review node produced artifacts that explicitly mention evidence gaps, citation gaps, missing citations, literature needs, [EVIDENCE_NEEDED], or unsupported claims, insert a focused literature worker and block that caller before human approval.",
+                "- Do not add literature work only because a node is waiting for ordinary approval; require a concrete gap from events, artifacts, or the Research Wiki.",
+                "- Do not delete static nodes, rewrite user static definitions, or bypass human gates.",
+                "- Prefer no deltas when the current DAG can proceed.",
+                "",
+                "JSON schema:",
+                "{",
+                '  "decision_type": "noop|mutate|resume|fail",',
+                '  "rationale": "short reason",',
+                '  "confidence": 0.0,',
+                '  "gap_type": "citation_gap|evidence_gap|literature_gap|method_gap|null",',
+                '  "gap_evidence_refs": ["artifact:path.md", "event:node-id"],',
+                '  "dynamic_reason": "why a dynamic worker is needed, when applicable",',
+                '  "affected_session_ids": ["node:<workflow>:<caller>"],',
+                '  "blocked_node_ids": ["caller"],',
+                '  "expected_artifacts": ["literature_result.json"],',
+                '  "resume_plan": "how the caller session should continue after research",',
+                '  "complete": false,',
+                '  "deltas": [',
+                '    {"action":"add_node","node":{...},"research_request":{"query":"..."},"gap_evidence_refs":["artifact:..."],"expected_artifacts":["literature_result.json"],"refresh":false},',
+                '    {"action":"add_edge","source":"node-a","target":"node-b"},',
+                '    {"action":"block_node","node_id":"caller","wait_for":["lit-node"],"reason":"...","resume_plan":"..."},',
+                '    {"action":"resume_node","node_id":"caller","reason":"..."},',
+                '    {"action":"mark_noop","reason":"existing literature node already covers the gap"}',
+                "  ]",
+                "}",
+                "",
+                f"Trigger: {trigger}",
+                f"Workflow title: {record.title}",
+                f"Workflow goal: {record.goal}",
+                "",
+                "Current nodes:",
+                json.dumps(nodes, ensure_ascii=False, indent=2),
+                "",
+                "Recent events:",
+                json.dumps(recent_events, ensure_ascii=False, indent=2),
+                "",
+                "Recent artifacts compact pack:",
+                compact_recent_artifact_pack(workspace, record.id),
+                "",
+                "Research Wiki compact pack:",
+                compact_research_wiki_pack(workspace),
+                "",
+                "Runtime policy:",
+                json.dumps(model_dict(self.runtime_policy(workspace, record.id)), ensure_ascii=False, indent=2),
+            ]
+        )
+
+    async def _run_planner(self, workspace: Path, record: WorkflowRecord, trigger: str) -> PlannerDecision | None:
+        if self.planner_runner is not None:
+            raw = await self.planner_runner(workspace, record, trigger)
+            if raw is None:
+                return None
+            return raw if isinstance(raw, PlannerDecision) else PlannerDecision(**raw)
+
+        planner_settings = get_planner_llm_settings() if self.node_runner is None else None
+        if planner_settings and planner_settings.get("wire_api") == "responses":
+            return await asyncio.to_thread(
+                self._run_responses_planner,
+                workspace,
+                record,
+                trigger,
+                planner_settings,
+            )
+
+        if os.environ.get("ARIS_WEB_DYNAMIC_PLANNER") != "1":
+            return None
+        session_path = planner_session_path(workspace, record.id)
+        command = build_aris_command(
+            workspace,
+            self._build_planner_prompt(workspace, record, trigger),
+            effective_model_override(),
+            session_path=str(session_path),
+        )
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=str(workspace),
+            env=build_runtime_env(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            detail = (stderr or stdout).decode("utf-8", errors="replace")[-2000:]
+            raise ValueError(detail or f"Planner exited with code {process.returncode}")
+        return parse_planner_decision_text(stdout.decode("utf-8", errors="replace"))
+
+    def _run_responses_planner(
+        self,
+        workspace: Path,
+        record: WorkflowRecord,
+        trigger: str,
+        settings: dict[str, str],
+    ) -> PlannerDecision:
+        prompt = self._build_planner_prompt(workspace, record, trigger)
+        body: dict[str, Any] = {
+            "model": settings["model"],
+            "input": prompt,
+            "stream": False,
+        }
+        request = urllib.request.Request(
+            responses_api_url(settings["base_url"]),
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "authorization": f"Bearer {settings['api_key']}",
+                "content-type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=180) as response:
+                response_body = response.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[-2000:]
+            raise ValueError(f"Planner Responses API error {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise ValueError(f"Planner Responses API request failed: {exc.reason}") from exc
+
+        try:
+            parsed = json.loads(response_body)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Planner Responses API returned non-JSON response") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("Planner Responses API returned an unexpected response shape")
+        text = extract_responses_text(parsed)
+        if not text:
+            raise ValueError("Planner Responses API returned no output text")
+        decision = parse_planner_decision_text(text)
+        append_planner_llm_session(
+            workspace,
+            record.id,
+            {
+                "timestamp": utc_now(),
+                "trigger": trigger,
+                "provider": settings.get("provider", "openai"),
+                "model": settings["model"],
+                "base_url": settings["base_url"],
+                "wire_api": settings["wire_api"],
+                "response_id": str(parsed.get("id") or ""),
+                "output_text": text,
+                "decision": model_dict(decision),
+            },
+        )
+        return decision
+
+    def _prepare_dynamic_literature_node(
+        self,
+        node: WorkflowNode | None,
+        delta: WorkflowDelta,
+        graph: WorkflowGraph,
+    ) -> WorkflowNode:
+        request = delta.research_request or (node.research_request if node else None) or {}
+        caller_id = (
+            (node.dynamic_parent_id if node else None)
+            or delta.node_id
+            or str(request.get("caller_id") or request.get("caller") or "").strip()
+            or None
+        )
+        query = research_query_from_request(request) or delta.reason or "literature research"
+        node_id = (node.id if node and node.id else "") or dynamic_literature_node_id(caller_id, query)
+        existing_ids = {item.id for item in graph.nodes}
+        if node_id in existing_ids and delta.refresh:
+            base = node_id
+            suffix = 2
+            while node_id in existing_ids:
+                node_id = f"{base}-{suffix}"
+                suffix += 1
+
+        prompt = (node.prompt if node and node.prompt.strip() else "").strip()
+        if not prompt:
+            prompt = "\n".join(
+                [
+                    "Run a focused, stateless literature research task for the workflow.",
+                    f"Research query: {query}",
+                    "",
+                    "Deliverables:",
+                    "- Save literature_result.json with keys: query, papers, findings, gaps, sources, wiki_refs, artifact_refs.",
+                    "- If research-wiki/ exists, upsert the relevant paper metadata and findings into it.",
+                    "- Return concise citations and source URLs where available. Do not invent citations.",
+                ]
+            )
+        if request and "Research request JSON:" not in prompt:
+            prompt = f"{prompt}\n\nResearch request JSON:\n{json.dumps(request, ensure_ascii=False, indent=2)}"
+
+        update = {
+            "id": node_id,
+            "type": "sub_agent",
+            "name": (node.name if node and node.name.strip() else f"Literature research: {query[:48]}"),
+            "role": (node.role if node and node.role.strip() else "literature scout"),
+            "skill": "research-lit",
+            "prompt": prompt,
+            "depends_on": list(node.depends_on if node else []),
+            "outputs": [{"name": "literature_result.json", "type": "file", "required": True}],
+            "auto_approve_after": True,
+            "dynamic_parent_id": caller_id,
+            "dynamic_reason": delta.reason or (node.dynamic_reason if node else None) or "Planner requested literature research",
+            "research_request": request or {"query": query},
+            "concurrency_class": "literature",
+            "failure_policy": "continue",
+            "position": (node.position if node and node.position else {"x": 120, "y": 320}),
+        }
+        if node is None:
+            return WorkflowNode(**update)
+        data = model_dict(node)
+        data.update(update)
+        return WorkflowNode(**data)
+
+    def _find_duplicate_literature_node(self, graph: WorkflowGraph, node: WorkflowNode) -> WorkflowNode | None:
+        query = research_query_from_request(node.research_request)
+        if not query:
+            return None
+        for item in graph.nodes:
+            if item.id == node.id:
+                continue
+            if item.skill != "research-lit":
+                continue
+            if item.dynamic_parent_id != node.dynamic_parent_id:
+                continue
+            if research_query_from_request(item.research_request) == query:
+                return item
+        return None
+
+    def _normalize_planner_decision(self, workflow_id: str, decision: PlannerDecision) -> PlannerDecision:
+        if not decision.tick_id:
+            decision.tick_id = f"tick-{uuid.uuid4().hex[:10]}"
+        if not decision.decision_type:
+            decision.decision_type = planner_decision_type(decision)
+        if decision.confidence is not None:
+            decision.confidence = max(0.0, min(1.0, float(decision.confidence)))
+        return decision
+
+    def _policy_validate_delta(
+        self,
+        graph: WorkflowGraph,
+        decision: PlannerDecision,
+        delta: WorkflowDelta,
+        prepared_node: WorkflowNode | None,
+        policy: RuntimePolicy,
+    ) -> PolicyResult:
+        if delta.action in {"mark_noop", "complete", "resume_node"}:
+            return PolicyResult(allowed=True, reason="allowed")
+        nodes_by_id = {node.id: node for node in graph.nodes}
+        dynamic_research_nodes = [node for node in graph.nodes if node.dynamic_parent_id and node.skill == "research-lit"]
+        if delta.action == "add_node":
+            node = prepared_node or delta.node
+            if node is None:
+                return PolicyResult(allowed=False, reason="add_node requires a node or research_request")
+            if node.id in nodes_by_id and not delta.refresh:
+                return PolicyResult(allowed=True, reason="deduplicated existing node id")
+            if node.type != "sub_agent":
+                return PolicyResult(allowed=False, reason="Planner may only insert sub_agent nodes")
+            if node.skill not in policy.allowed_dynamic_skills:
+                return PolicyResult(allowed=False, reason=f"Planner may only insert skills: {', '.join(policy.allowed_dynamic_skills)}")
+            if policy.require_gap_evidence and not _evidence_refs(decision, delta):
+                return PolicyResult(allowed=False, reason="dynamic literature insertion requires gap evidence refs")
+            if len(dynamic_research_nodes) >= policy.max_dynamic_nodes_total:
+                return PolicyResult(allowed=False, reason="workflow dynamic research node cap reached")
+            caller = node.dynamic_parent_id or str((node.research_request or {}).get("caller_id") or "").strip()
+            if caller:
+                caller_count = sum(1 for item in dynamic_research_nodes if item.dynamic_parent_id == caller)
+                if caller_count >= policy.max_dynamic_nodes_per_caller:
+                    return PolicyResult(allowed=False, reason=f"dynamic research node cap reached for caller {caller}")
+            if delta.refresh and not (delta.reason or decision.rationale):
+                return PolicyResult(allowed=False, reason="refresh requires an explicit rationale")
+            return PolicyResult(allowed=True, reason="allowed")
+        if delta.action == "add_edge":
+            if not delta.source or not delta.target:
+                return PolicyResult(allowed=False, reason="add_edge requires source and target")
+            if delta.source not in nodes_by_id or delta.target not in nodes_by_id:
+                return PolicyResult(allowed=False, reason="add_edge references an unknown node")
+            return PolicyResult(allowed=True, reason="allowed")
+        if delta.action == "block_node":
+            if not delta.node_id or delta.node_id not in nodes_by_id:
+                return PolicyResult(allowed=False, reason="block_node references an unknown node")
+            node = nodes_by_id[delta.node_id]
+            if node.type == "human_gate" and not policy.allow_human_gate_bypass:
+                return PolicyResult(allowed=False, reason="Planner may not block or bypass a human gate")
+            unknown = [dep for dep in delta.wait_for if dep not in nodes_by_id]
+            if unknown:
+                return PolicyResult(allowed=False, reason=f"block_node waits for unknown node(s): {', '.join(unknown)}")
+            return PolicyResult(allowed=True, reason="allowed")
+        return PolicyResult(allowed=False, reason=f"unsupported planner delta action: {delta.action}")
+
+    def _delta_record(
+        self,
+        *,
+        workflow_id: str,
+        tick_id: str,
+        index: int,
+        decision: PlannerDecision,
+        delta: WorkflowDelta,
+        before_graph: WorkflowGraph,
+        after_graph: WorkflowGraph,
+        policy_result: PolicyResult,
+        applied: bool,
+        rejected_reason: str | None,
+        prepared_node: WorkflowNode | None = None,
+    ) -> WorkflowDeltaRecord:
+        node_id = delta.node_id or (prepared_node.id if prepared_node else None) or (delta.node.id if delta.node else None)
+        event_refs, artifact_refs = _decision_refs(decision, delta)
+        return WorkflowDeltaRecord(
+            delta_id=f"{tick_id}-{index:03d}",
+            tick_id=tick_id,
+            workflow_id=workflow_id,
+            timestamp=utc_now(),
+            action=delta.action,
+            delta=delta,
+            node_id=node_id,
+            source=delta.source,
+            target=delta.target,
+            reason=delta.reason,
+            gap_type=delta.gap_type,
+            gap_evidence_refs=_evidence_refs(decision, delta),
+            before_graph_hash=stable_graph_hash(before_graph),
+            after_graph_hash=stable_graph_hash(after_graph),
+            before_graph_json=model_dict(before_graph),
+            after_graph_json=model_dict(after_graph),
+            policy_result=policy_result,
+            applied=applied,
+            rejected_reason=rejected_reason,
+            source_event_refs=event_refs,
+            source_artifact_refs=artifact_refs,
+            affected_session_ids=delta.affected_session_ids,
+            blocked_node_ids=delta.blocked_node_ids or ([delta.node_id] if delta.action == "block_node" and delta.node_id else []),
+            expected_artifacts=delta.expected_artifacts,
+            resume_plan=delta.resume_plan,
+            graph_diff=graph_runtime_diff(before_graph, after_graph),
+        )
+
+    async def _record_delta_event(
+        self,
+        workspace: Path,
+        record: WorkflowDeltaRecord,
+        *,
+        rationale: str,
+    ) -> None:
+        append_workflow_delta(workspace, record)
+        message = "PlannerDeltaApplied" if record.applied else (
+            "PlannerDeltaRejected" if not record.policy_result.allowed else "PlannerDeltaNoop"
+        )
+        await self._append_event(
+            workspace,
+            WorkflowEvent(
+                workflow_id=record.workflow_id,
+                timestamp=record.timestamp,
+                event_type="delta",
+                node_id=record.node_id,
+                message=message,
+                payload={
+                    "tick_id": record.tick_id,
+                    "delta_id": record.delta_id,
+                    "action": record.action,
+                    "policy_result": model_dict(record.policy_result),
+                    "rejected_reason": record.rejected_reason,
+                    "rationale": rationale,
+                    "graph_diff": record.graph_diff,
+                },
+            ),
+        )
+
+    async def _record_planner_decision(
+        self,
+        workspace: Path,
+        workflow_id: str,
+        *,
+        trigger: str,
+        decision: PlannerDecision,
+        before_graph_hash: str,
+        after_graph_hash: str,
+        applied: bool,
+        policy_result: PolicyResult,
+    ) -> PlannerDecisionRecord:
+        record = PlannerDecisionRecord(
+            tick_id=decision.tick_id or f"tick-{uuid.uuid4().hex[:10]}",
+            workflow_id=workflow_id,
+            timestamp=utc_now(),
+            trigger=trigger,
+            decision=decision,
+            decision_type=decision.decision_type or planner_decision_type(decision),
+            rationale=decision.rationale,
+            confidence=decision.confidence,
+            policy_result=policy_result,
+            applied=applied,
+            before_graph_hash=before_graph_hash,
+            after_graph_hash=after_graph_hash,
+            source_event_refs=[],
+            source_artifact_refs=decision.gap_evidence_refs,
+        )
+        append_planner_decision(workspace, record)
+        event_message = "PlannerNoop" if record.decision_type == "noop" else "PlannerDecisionRecorded"
+        await self._append_event(
+            workspace,
+            WorkflowEvent(
+                workflow_id=workflow_id,
+                timestamp=record.timestamp,
+                event_type="planner",
+                message=event_message,
+                payload={
+                    "tick_id": record.tick_id,
+                    "trigger": trigger,
+                    "decision_type": record.decision_type,
+                    "rationale": record.rationale,
+                    "confidence": record.confidence,
+                    "policy_result": model_dict(policy_result),
+                    "applied": applied,
+                    "before_graph_hash": before_graph_hash,
+                    "after_graph_hash": after_graph_hash,
+                },
+            ),
+        )
+        return record
+
+    async def _apply_planner_decision(
+        self,
+        workspace: Path,
+        workflow_id: str,
+        graph: WorkflowGraph,
+        decision: PlannerDecision,
+    ) -> bool:
+        if not decision.deltas and not decision.complete:
+            return False
+        policy = self.runtime_policy(workspace, workflow_id)
+        changed = False
+        applied_count = 0
+        working = WorkflowGraph(**model_dict(graph))
+        nodes_by_id = {node.id: node for node in working.nodes}
+        for index, delta in enumerate(decision.deltas, start=1):
+            if delta.action == "complete":
+                continue
+            before_graph = WorkflowGraph(**model_dict(working))
+            prepared_node: WorkflowNode | None = None
+            if delta.action == "add_node":
+                raw_node = delta.node
+                if raw_node is None and delta.research_request is None:
+                    policy_result = PolicyResult(allowed=False, reason="add_node requires a node or research_request")
+                    record = self._delta_record(
+                        workflow_id=workflow_id,
+                        tick_id=decision.tick_id or "tick-unknown",
+                        index=index,
+                        decision=decision,
+                        delta=delta,
+                        before_graph=before_graph,
+                        after_graph=before_graph,
+                        policy_result=policy_result,
+                        applied=False,
+                        rejected_reason=policy_result.reason,
+                    )
+                    await self._record_delta_event(workspace, record, rationale=decision.rationale)
+                    continue
+                if raw_node is None or raw_node.skill == "research-lit" or delta.research_request is not None:
+                    prepared_node = self._prepare_dynamic_literature_node(raw_node, delta, working)
+                else:
+                    prepared_node = raw_node
+            policy_result = self._policy_validate_delta(working, decision, delta, prepared_node, policy)
+            if not policy_result.allowed:
+                record = self._delta_record(
+                    workflow_id=workflow_id,
+                    tick_id=decision.tick_id or "tick-unknown",
+                    index=index,
+                    decision=decision,
+                    delta=delta,
+                    before_graph=before_graph,
+                    after_graph=before_graph,
+                    policy_result=policy_result,
+                    applied=False,
+                    rejected_reason=policy_result.reason,
+                    prepared_node=prepared_node,
+                )
+                await self._record_delta_event(workspace, record, rationale=decision.rationale)
+                continue
+            delta_changed = False
+            if delta.action == "add_node":
+                new_node = prepared_node
+                if new_node is None:
+                    continue
+                if new_node.id in nodes_by_id:
+                    if delta.refresh:
+                        new_node = self._prepare_dynamic_literature_node(new_node, delta, working)
+                    else:
+                        record = self._delta_record(
+                            workflow_id=workflow_id,
+                            tick_id=decision.tick_id or "tick-unknown",
+                            index=index,
+                            decision=decision,
+                            delta=delta,
+                            before_graph=before_graph,
+                            after_graph=before_graph,
+                            policy_result=PolicyResult(allowed=True, reason="deduplicated existing node id"),
+                            applied=False,
+                            rejected_reason=None,
+                            prepared_node=new_node,
+                        )
+                        await self._record_delta_event(workspace, record, rationale=decision.rationale)
+                        continue
+                duplicate = self._find_duplicate_literature_node(working, new_node)
+                if duplicate is not None and not delta.refresh:
+                    record = self._delta_record(
+                        workflow_id=workflow_id,
+                        tick_id=decision.tick_id or "tick-unknown",
+                        index=index,
+                        decision=decision,
+                        delta=delta,
+                        before_graph=before_graph,
+                        after_graph=before_graph,
+                        policy_result=PolicyResult(allowed=True, reason=f"deduplicated existing literature node {duplicate.id}"),
+                        applied=False,
+                        rejected_reason=None,
+                        prepared_node=duplicate,
+                    )
+                    await self._record_delta_event(workspace, record, rationale=decision.rationale)
+                    continue
+                working.nodes.append(new_node)
+                nodes_by_id[new_node.id] = new_node
+                delta_changed = True
+            elif delta.action == "add_edge":
+                if not delta.source or not delta.target or delta.target not in nodes_by_id or delta.source not in nodes_by_id:
+                    continue
+                target = nodes_by_id[delta.target]
+                if delta.source not in target.depends_on:
+                    target.depends_on.append(delta.source)
+                    delta_changed = True
+            elif delta.action == "block_node":
+                if not delta.node_id or delta.node_id not in nodes_by_id:
+                    continue
+                node = nodes_by_id[delta.node_id]
+                for dep in delta.wait_for:
+                    if dep in nodes_by_id and dep not in node.depends_on:
+                        node.depends_on.append(dep)
+                        delta_changed = True
+                if node.status != "waiting_dynamic_dependency":
+                    node.status = "waiting_dynamic_dependency"
+                    delta_changed = True
+                reason = delta.reason or "Waiting for dynamic dependency"
+                if node.dynamic_reason != reason:
+                    node.dynamic_reason = reason
+                    delta_changed = True
+                node.error = reason
+            elif delta.action == "resume_node":
+                if not delta.node_id or delta.node_id not in nodes_by_id:
+                    continue
+                node = nodes_by_id[delta.node_id]
+                if node.status == "waiting_dynamic_dependency":
+                    deps_ready = all(nodes_by_id[dep].status in SUCCESS_NODE_STATUSES for dep in node.depends_on if dep in nodes_by_id)
+                    if deps_ready:
+                        node.status = "queued"
+                        node.error = None
+                        node.approved_after = False
+                        delta_changed = True
+            if not delta_changed:
+                record = self._delta_record(
+                    workflow_id=workflow_id,
+                    tick_id=decision.tick_id or "tick-unknown",
+                    index=index,
+                    decision=decision,
+                    delta=delta,
+                    before_graph=before_graph,
+                    after_graph=before_graph,
+                    policy_result=policy_result,
+                    applied=False,
+                    rejected_reason=None,
+                    prepared_node=prepared_node,
+                )
+                await self._record_delta_event(workspace, record, rationale=decision.rationale)
+                continue
+            try:
+                normalized = normalize_workflow_graph(
+                    WorkflowGraph(
+                        schema_version=2,
+                        nodes=working.nodes,
+                        edges=[],
+                        max_concurrency=working.max_concurrency,
+                        class_limits=working.class_limits,
+                    ),
+                    {skill.id for skill in scan_skills()},
+                )
+            except ValueError as exc:
+                working = before_graph
+                nodes_by_id = {node.id: node for node in working.nodes}
+                policy_result = PolicyResult(allowed=False, reason=f"graph validation rejected delta: {exc}")
+                record = self._delta_record(
+                    workflow_id=workflow_id,
+                    tick_id=decision.tick_id or "tick-unknown",
+                    index=index,
+                    decision=decision,
+                    delta=delta,
+                    before_graph=before_graph,
+                    after_graph=before_graph,
+                    policy_result=policy_result,
+                    applied=False,
+                    rejected_reason=policy_result.reason,
+                    prepared_node=prepared_node,
+                )
+                await self._record_delta_event(workspace, record, rationale=decision.rationale)
+                continue
+            working = normalized
+            nodes_by_id = {node.id: node for node in working.nodes}
+            changed = True
+            applied_count += 1
+            record = self._delta_record(
+                workflow_id=workflow_id,
+                tick_id=decision.tick_id or "tick-unknown",
+                index=index,
+                decision=decision,
+                delta=delta,
+                before_graph=before_graph,
+                after_graph=working,
+                policy_result=policy_result,
+                applied=True,
+                rejected_reason=None,
+                prepared_node=prepared_node,
+            )
+            await self._record_delta_event(workspace, record, rationale=decision.rationale)
+        if not changed:
+            return False
+        update_workflow(workspace, workflow_id, graph_json=working)
+        await self._append_event(
+            workspace,
+            WorkflowEvent(
+                workflow_id=workflow_id,
+                timestamp=utc_now(),
+                event_type="planner",
+                message="Planner updated dynamic DAG",
+                payload={
+                    "tick_id": decision.tick_id,
+                    "rationale": decision.rationale,
+                    "applied_delta_count": applied_count,
+                    "deltas": [model_dict(delta) for delta in decision.deltas],
+                },
+            ),
+        )
+        return True
+
+    async def _planner_tick(self, workspace: Path, workflow_id: str, trigger: str) -> bool:
+        if workflow_id in self._planning:
+            return False
+        record = self._require(workspace, workflow_id)
+        if record.status != "running":
+            return False
+        external_planner_enabled = self.node_runner is None and get_planner_llm_settings() is not None
+        planner_enabled = (
+            self.planner_runner is not None
+            or external_planner_enabled
+            or os.environ.get("ARIS_WEB_DYNAMIC_PLANNER") == "1"
+        )
+        tick_id = f"tick-{uuid.uuid4().hex[:10]}"
+        before_hash = stable_graph_hash(record.graph_json)
+        self._planning.add(workflow_id)
+        try:
+            if planner_enabled:
+                await self._append_event(
+                    workspace,
+                    WorkflowEvent(
+                        workflow_id=workflow_id,
+                        timestamp=utc_now(),
+                        event_type="planner",
+                        message="PlannerTickStarted",
+                        payload={
+                            "tick_id": tick_id,
+                            "trigger": trigger,
+                            "plan_snapshot": model_dict(plan_snapshot(record.graph_json)),
+                            "policy": model_dict(self.runtime_policy(workspace, workflow_id)),
+                            "planner_llm": planner_llm_summary() or {"provider": "aris-runtime", "wire_api": "aris"},
+                        },
+                    ),
+                )
+            decision = await self._run_planner(workspace, record, trigger)
+            if decision is None:
+                if planner_enabled:
+                    noop_decision = PlannerDecision(
+                        tick_id=tick_id,
+                        rationale="Planner did not request a graph mutation for this tick.",
+                        decision_type="noop",
+                        confidence=1.0,
+                    )
+                    await self._record_planner_decision(
+                        workspace,
+                        workflow_id,
+                        trigger=trigger,
+                        decision=noop_decision,
+                        before_graph_hash=before_hash,
+                        after_graph_hash=before_hash,
+                        applied=False,
+                        policy_result=PolicyResult(allowed=True, reason="noop"),
+                    )
+                    await self._append_event(
+                        workspace,
+                        WorkflowEvent(
+                            workflow_id=workflow_id,
+                            timestamp=utc_now(),
+                            event_type="planner",
+                            message="Planner checked dynamic DAG: no changes",
+                            payload={"tick_id": tick_id, "trigger": trigger, "rationale": noop_decision.rationale},
+                        ),
+                    )
+                return False
+            decision.tick_id = tick_id
+            decision = self._normalize_planner_decision(workflow_id, decision)
+            latest = self._require(workspace, workflow_id)
+            before_hash = stable_graph_hash(latest.graph_json)
+            changed = await self._apply_planner_decision(workspace, workflow_id, latest.graph_json, decision)
+            after = self._require(workspace, workflow_id)
+            after_hash = stable_graph_hash(after.graph_json)
+            tick_deltas = [delta for delta in list_workflow_deltas(workspace, workflow_id) if delta.tick_id == tick_id]
+            rejected = [delta for delta in tick_deltas if not delta.policy_result.allowed]
+            policy_result = (
+                PolicyResult(allowed=False, reason="; ".join(delta.policy_result.reason for delta in rejected if delta.policy_result.reason))
+                if rejected
+                else PolicyResult(allowed=True, reason="allowed")
+            )
+            await self._record_planner_decision(
+                workspace,
+                workflow_id,
+                trigger=trigger,
+                decision=decision,
+                before_graph_hash=before_hash,
+                after_graph_hash=after_hash,
+                applied=changed,
+                policy_result=policy_result,
+            )
+            if not changed:
+                await self._append_event(
+                    workspace,
+                    WorkflowEvent(
+                        workflow_id=workflow_id,
+                        timestamp=utc_now(),
+                        event_type="planner",
+                        message="Planner checked dynamic DAG: no applicable changes",
+                        payload={
+                            "tick_id": tick_id,
+                            "trigger": trigger,
+                            "rationale": decision.rationale,
+                            "deltas": [model_dict(delta) for delta in decision.deltas],
+                            "policy_result": model_dict(policy_result),
+                        },
+                    ),
+                )
+            return changed
+        except Exception as exc:
+            await self._append_event(
+                workspace,
+                WorkflowEvent(
+                    workflow_id=workflow_id,
+                    timestamp=utc_now(),
+                    event_type="planner",
+                    message=f"Planner skipped: {exc}",
+                    payload={"tick_id": tick_id, "error": str(exc)},
+                ),
+            )
+            return False
+        finally:
+            self._planning.discard(workflow_id)
+
+    async def _resume_dynamic_dependencies(self, workspace: Path, workflow_id: str, graph: WorkflowGraph) -> bool:
+        nodes_by_id = {node.id: node for node in graph.nodes}
+        resumed: list[str] = []
+        for node in graph.nodes:
+            if node.status != "waiting_dynamic_dependency":
+                continue
+            if not node.depends_on:
+                continue
+            if all(nodes_by_id[dep].status in SUCCESS_NODE_STATUSES for dep in node.depends_on if dep in nodes_by_id):
+                node.status = "queued"
+                node.error = None
+                node.approved_after = False
+                resumed.append(node.id)
+        if not resumed:
+            return False
+        update_workflow(workspace, workflow_id, graph_json=graph, clear_error=True)
+        await self._append_event(
+            workspace,
+            WorkflowEvent(
+                workflow_id=workflow_id,
+                timestamp=utc_now(),
+                event_type="session",
+                message=f"Resumed {len(resumed)} node(s) after dynamic dependencies completed",
+                payload={
+                    "nodes": resumed,
+                    "resume_events": [
+                        {
+                            "node_id": node_id,
+                            "session_id": _session_id_for_node(workflow_id, nodes_by_id[node_id]),
+                            "session_path": nodes_by_id[node_id].session_path,
+                            "resume_condition": "all dynamic dependencies succeeded or skipped",
+                        }
+                        for node_id in resumed
+                    ],
+                },
+            ),
+        )
+        return True
+
     async def _tick(self, workspace: Path, workflow_id: str) -> None:
         record = self._require(workspace, workflow_id)
         if record.status != "running":
@@ -1678,27 +3456,12 @@ class WorkflowManager:
         if active:
             return
 
-        batch_waiting = [
-            node
-            for node in graph.nodes
-            if node.type in EXECUTABLE_NODE_TYPES
-            and node.status == "waiting_approval"
-            and node.run_id
-            and not node.approved_after
-        ]
-        if batch_waiting:
-            if record.status != "paused":
-                update_workflow(workspace, workflow_id, status="paused", graph_json=graph)
-                await self._append_event(
-                    workspace,
-                    WorkflowEvent(
-                        workflow_id=workflow_id,
-                        timestamp=utc_now(),
-                        event_type="workflow",
-                        message=f"Execution batch waiting for approval: {len(batch_waiting)} node(s)",
-                        payload={"nodes": [node.id for node in batch_waiting]},
-                    ),
-                )
+        if await self._resume_dynamic_dependencies(workspace, workflow_id, graph):
+            await self._tick(workspace, workflow_id)
+            return
+
+        if await self._planner_tick(workspace, workflow_id, "scheduler_tick"):
+            await self._tick(workspace, workflow_id)
             return
 
         ready = []
@@ -1736,6 +3499,29 @@ class WorkflowManager:
                 active.add(node.id)
                 asyncio.create_task(self._run_node_task(workspace, workflow_id, node.id))
             update_workflow(workspace, workflow_id, graph_json=graph)
+            return
+
+        batch_waiting = [
+            node
+            for node in graph.nodes
+            if node.type in EXECUTABLE_NODE_TYPES
+            and node.status == "waiting_approval"
+            and node.run_id
+            and not node.approved_after
+        ]
+        if batch_waiting:
+            if record.status != "paused":
+                update_workflow(workspace, workflow_id, status="paused", graph_json=graph)
+                await self._append_event(
+                    workspace,
+                    WorkflowEvent(
+                        workflow_id=workflow_id,
+                        timestamp=utc_now(),
+                        event_type="workflow",
+                        message=f"Execution batch waiting for approval: {len(batch_waiting)} node(s)",
+                        payload={"nodes": [node.id for node in batch_waiting]},
+                    ),
+                )
             return
 
         # Deadlock detection: nothing scheduled this tick, nothing in flight,
@@ -1793,6 +3579,7 @@ class WorkflowManager:
                 # attempt counter and any concurrent graph edits.
                 record = self._require(workspace, workflow_id)
                 node = self._find_node(record.graph_json, node_id)
+                node = self._ensure_node_session_path(workspace, workflow_id, record.graph_json, node)
                 result = await self._run_node(workspace, record, node)
                 latest = self._require(workspace, workflow_id)
                 graph = latest.graph_json
@@ -1807,14 +3594,27 @@ class WorkflowManager:
                 if not result.succeeded:
                     failure_error = result.error or result.message or "Node failed"
                 else:
-                    missing_outputs = missing_concrete_outputs(workspace, node)
+                    missing_outputs = missing_concrete_outputs(workspace, workflow_id, node)
                     if missing_outputs:
                         failure_error = "Missing expected output file(s): " + ", ".join(missing_outputs)
 
                 if failure_error is None:
-                    node.status = "waiting_approval"
+                    if node.auto_approve_after:
+                        sync_literature_result_to_wiki(workspace, workflow_id, node)
+                        node.status = "succeeded"
+                        node.approved_after = True
+                    else:
+                        node.status = "waiting_approval"
                     node.error = None
                     update_workflow(workspace, workflow_id, graph_json=graph)
+                    refreshed = self._require(workspace, workflow_id)
+                    artifact_entries = build_artifact_index(workspace, refreshed)
+                    write_artifact_index(workspace, workflow_id, artifact_entries)
+                    message = (
+                        f"Node completed and auto-approved: {node.name}"
+                        if node.auto_approve_after
+                        else f"Node completed and waiting for batch approval: {node.name}"
+                    )
                     await self._append_event(
                         workspace,
                         WorkflowEvent(
@@ -1823,7 +3623,27 @@ class WorkflowManager:
                             event_type="node",
                             node_id=node_id,
                             run_id=node.run_id,
-                            message=f"Node completed and waiting for batch approval: {node.name}",
+                            message=message,
+                            payload={"auto_approve_after": node.auto_approve_after},
+                        ),
+                    )
+                    await self._append_event(
+                        workspace,
+                        WorkflowEvent(
+                            workflow_id=workflow_id,
+                            timestamp=utc_now(),
+                            event_type="session",
+                            node_id=node_id,
+                            run_id=node.run_id,
+                            message="SessionTurnCompleted",
+                            payload={
+                                "session_id": _session_id_for_node(workflow_id, node),
+                                "session_path": node.session_path,
+                                "artifact_refs": [
+                                    item.path for item in artifact_entries if item.producer_node_id == node_id
+                                ],
+                                "auto_approve_after": node.auto_approve_after,
+                            },
                         ),
                     )
                     return
@@ -1941,6 +3761,25 @@ class WorkflowManager:
             return await self.node_runner(workspace, record, node)
         return await self._run_node_with_aris(workspace, record, node)
 
+    def _ensure_node_session_path(
+        self,
+        workspace: Path,
+        workflow_id: str,
+        graph: WorkflowGraph,
+        node: WorkflowNode,
+    ) -> WorkflowNode:
+        if node.session_path:
+            return node
+        session_abs = workflow_node_session_path(workspace, workflow_id, node.id)
+        session_abs.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            session_rel = session_abs.resolve().relative_to(workspace.resolve()).as_posix()
+        except ValueError:
+            session_rel = str(session_abs)
+        node.session_path = session_rel
+        update_workflow(workspace, workflow_id, graph_json=graph)
+        return node
+
     async def _run_node_with_aris(self, workspace: Path, record: WorkflowRecord, node: WorkflowNode) -> NodeRunResult:
         config = get_agent_config(workspace, node.config_file) if node.type == "sub_agent" and node.config_file else None
         if node.type == "sub_agent" and node.config_file and config is None:
@@ -1964,17 +3803,32 @@ class WorkflowManager:
         attempt_number = node.attempt + 1
         subagent_dir = workspace / ".aris" / "web" / "workflows" / record.id / "nodes" / node.id / f"attempt-{attempt_number}"
         subagent_dir.mkdir(parents=True, exist_ok=True)
+        if node.session_path:
+            candidate = Path(node.session_path)
+            session_abs = candidate if candidate.is_absolute() else workspace / candidate
+        else:
+            session_abs = workflow_node_session_path(workspace, record.id, node.id)
+        session_abs.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            session_rel = session_abs.resolve().relative_to(workspace.resolve()).as_posix()
+        except ValueError:
+            session_rel = str(session_abs)
+        if node.session_path != session_rel:
+            node.session_path = session_rel
+            update_workflow(workspace, record.id, graph_json=record.graph_json)
         request = CreateRunRequest(
             workspace=str(workspace),
             skill=effective_skill_id or skill.id,
             arguments=prompt,
             model=effective_model,
             effort=effective_effort,
+            session_path=str(session_abs),
             env_overrides={
                 "ARIS_WORKFLOW_ID": record.id,
                 "ARIS_NODE_ID": node.id,
                 "ARIS_NODE_ATTEMPT": str(attempt_number),
                 "ARIS_SUBAGENT_DIR": str(subagent_dir),
+                "ARIS_NODE_SESSION": str(session_abs),
             },
         )
         # Effective timeout: node-level overrides config-level; None disables.
@@ -1985,6 +3839,7 @@ class WorkflowManager:
             effective_timeout = None
         run = await self.run_manager.create_run(request, skill, workspace)
         self._set_node_run_id(workspace, record.id, node.id, run.id)
+        run_model = run.model or effective_model or "runtime default"
         await self._append_event(
             workspace,
             WorkflowEvent(
@@ -1993,11 +3848,14 @@ class WorkflowManager:
                 event_type="node",
                 node_id=node.id,
                 run_id=run.id,
-                message=f"Node attached to run {run.id}",
+                message=f"Node attached to run {run.id} (model: {run_model})",
                 payload={
                     "timeout_seconds": effective_timeout,
                     "subagent_dir": subagent_dir.resolve().relative_to(workspace.resolve()).as_posix(),
                     "attempt": attempt_number,
+                    "model": run_model,
+                    "skill": skill.id,
+                    "effort": effective_effort,
                 },
             ),
         )
@@ -2115,6 +3973,11 @@ class WorkflowManager:
         outputs_text = _render_port_summary(node.outputs, kind="expected outputs")
         if not node.outputs:
             outputs_text = "workspace artifacts and a concise final summary"
+        concrete_outputs = concrete_output_paths(node.outputs)
+        concrete_outputs_text = "\n".join(
+            f"- {output_path.as_posix()} -> {workflow_output_relative_path(workspace, record.id, node, output_path)}"
+            for output_path in concrete_outputs
+        ) or "(no concrete file outputs declared)"
         inputs_text = _render_port_summary(node.inputs, kind="expected inputs")
         if not node.inputs:
             inputs_text = "(none declared)"
@@ -2159,11 +4022,21 @@ Expected inputs:
 Expected outputs:
 {outputs_text}
 
+Concrete output storage paths:
+{concrete_outputs_text}
+
 Sub-agent execution namespace:
 - ARIS_WORKFLOW_ID={record.id}
 - ARIS_NODE_ID={node.id}
 - ARIS_NODE_ATTEMPT={node.attempt + 1}
 - ARIS_SUBAGENT_DIR=.aris/web/workflows/{record.id}/nodes/{node.id}/attempt-{node.attempt + 1}
+- ARIS_NODE_SESSION={node.session_path or ".aris/web/workflows/" + record.id + "/nodes/" + node.id + "/session.json"}
+
+Dynamic planning context:
+- dynamic_parent_id={node.dynamic_parent_id or "(none)"}
+- dynamic_reason={node.dynamic_reason or "(none)"}
+- auto_approve_after={str(node.auto_approve_after).lower()}
+- research_request={json.dumps(node.research_request, ensure_ascii=False) if node.research_request else "(none)"}
 
 Agent configuration profile:
 {config_text}
@@ -2180,14 +4053,16 @@ Node task prompt:
 Execution requirements:
 - The subprocess current working directory is already the workspace.
 - Work only inside this workspace.
-- Treat this as a fresh run. Do not assume any prior conversation, memory, or hidden state exists.
-- Use ARIS_SUBAGENT_DIR for scratch files, intermediate notes, private analysis artifacts, and temporary per-agent state.
+- Use the provided ARIS_NODE_SESSION for conversation continuity when the runner resumes this node; otherwise rely only on this prompt, upstream outputs, and workspace artifacts.
+- Do not write workflow-generated files into the project root.
+- Use ARIS_SUBAGENT_DIR for all node-owned files: scratch files, intermediate notes, private analysis artifacts, temporary per-agent state, and final node deliverables.
 - Do not use Bash, shell scripts, PowerShell, REPL tools, or sub-agent spawning from the web runner.
 - Use the available workspace-safe tools directly: read/write/edit/glob/grep/WebSearch/WebFetch/Skill/LlmReview.
 - If a skill suggests a helper script that requires Bash, perform the equivalent search, reading, or writing with the safe tools instead.
-- Use relative paths such as `.` and `paper/...` for file operations; do not use absolute workspace paths in commands or tool inputs.
-- Produce every expected output that names a concrete file path. If the expected output is `INTRO_RELATED_WORK.md`, `INTRO_OUTLINE.md`, `INTRODUCTION_DRAFT.md`, `INTRO_REVIEW.md`, `INTRODUCTION_REVISED.md`, or `INTRO_REVISION_SUMMARY.md`, write that exact file before finishing.
-- Declared concrete outputs belong at their requested workspace-relative paths, not inside ARIS_SUBAGENT_DIR, unless the output itself is explicitly under `.aris/`.
+- Use relative paths for file operations; do not use absolute workspace paths in commands or tool inputs.
+- Produce every expected output that names a concrete file path at the mapped path shown in "Concrete output storage paths".
+- If a declared output is `INTRO_OUTLINE.md`, write it as `ARIS_SUBAGENT_DIR/INTRO_OUTLINE.md`, not `./INTRO_OUTLINE.md`.
+- If a declared output includes subdirectories, preserve that relative structure under ARIS_SUBAGENT_DIR unless the mapped path already starts with `.aris/`.
 - Treat upstream node outputs as read-only context. Do not rewrite upstream artifacts unless the current node explicitly declares that output path.
 - When a suggested skill label is present, treat that ARIS skill as the node's execution contract. Load its SKILL.md with the Skill tool when it is relevant to the node, especially for literature search or research review, while keeping this node prompt as the local scope and output contract.
 - Follow the agent configuration profile when present. Node fields override config defaults for skill/model/effort.
@@ -2249,7 +4124,14 @@ Execution requirements:
         # Resolve which model produced these tokens — node override > config
         # default. If we can't price it, surface counts with cost_usd=None.
         config = get_agent_config(workspace, node.config_file) if node.type == "sub_agent" and node.config_file else None
-        model_name = node.model or (config.model if config else None)
+        run_record = get_run(workspace, getattr(event, "run_id", ""))
+        model_name = (
+            usage_block.get("model")
+            or (run_record.model if run_record else None)
+            or node.model
+            or (config.model if config else None)
+            or effective_model_override()
+        )
         pricing = pricing_for_model(model_name)
         cost_usd: float | None = None
         if pricing is not None:

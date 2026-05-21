@@ -41,9 +41,15 @@ use tools::{execute_tool, mvp_tool_specs, ToolSpec};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-7";
 fn max_tokens_for_model(model: &str) -> u32 {
-    if model.contains("opus") {
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("minimax") || lower.contains("m2.7") || lower.contains("m2-7") {
+        // MiniMax-M2.x has a large context window, but its server validates
+        // input + requested output together. Reserving 64k output makes long
+        // agent sessions hit "context window exceeds limit" before compaction.
+        16_384
+    } else if lower.contains("opus") {
         32_000
-    } else if model.contains("gpt") || model.contains("o3") || model.contains("o4") {
+    } else if lower.contains("gpt") || lower.contains("o3") || lower.contains("o4") {
         16_384
     } else {
         // Works for Claude sonnet/haiku (64k), and most OpenAI-compat providers
@@ -232,7 +238,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             allowed_tools,
             permission_mode,
-        } => LiveCli::new(model, true, allowed_tools, permission_mode)?
+            session_path,
+        } => LiveCli::new_with_session(model, true, allowed_tools, permission_mode, session_path)?
             .run_turn_with_output(&prompt, output_format)?,
         CliAction::Login => run_login()?,
         CliAction::Logout => run_logout()?,
@@ -281,6 +288,7 @@ enum CliAction {
         output_format: CliOutputFormat,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        session_path: Option<PathBuf>,
     },
     Login,
     Logout,
@@ -319,6 +327,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut model = DEFAULT_MODEL.to_string();
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode = default_permission_mode();
+    let mut session_path: Option<PathBuf> = None;
     let mut wants_version = false;
     let mut allowed_tool_values = Vec::new();
     let mut rest = Vec::new();
@@ -355,12 +364,23 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 permission_mode = parse_permission_mode_arg(value)?;
                 index += 2;
             }
+            "--session-path" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --session-path".to_string())?;
+                session_path = Some(PathBuf::from(value));
+                index += 2;
+            }
             flag if flag.starts_with("--output-format=") => {
                 output_format = CliOutputFormat::parse(&flag[16..])?;
                 index += 1;
             }
             flag if flag.starts_with("--permission-mode=") => {
                 permission_mode = parse_permission_mode_arg(&flag[18..])?;
+                index += 1;
+            }
+            flag if flag.starts_with("--session-path=") => {
+                session_path = Some(PathBuf::from(&flag[15..]));
                 index += 1;
             }
             "--dangerously-skip-permissions" => {
@@ -379,6 +399,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     output_format,
                     allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
                     permission_mode,
+                    session_path,
                 });
             }
             "--print" => {
@@ -448,6 +469,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 output_format,
                 allowed_tools,
                 permission_mode,
+                session_path,
             })
         }
         other if !other.starts_with('/') => Ok(CliAction::Prompt {
@@ -456,6 +478,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_format,
             allowed_tools,
             permission_mode,
+            session_path,
         }),
         other => Err(format!("unknown subcommand: {other}")),
     }
@@ -1236,10 +1259,29 @@ impl LiveCli {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_session(model, enable_tools, allowed_tools, permission_mode, None)
+    }
+
+    fn new_with_session(
+        model: String,
+        enable_tools: bool,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+        session_path: Option<PathBuf>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt(Some(&model))?;
-        let session = create_managed_session_handle()?;
+        let session = if let Some(path) = session_path {
+            create_explicit_session_handle(path)?
+        } else {
+            create_managed_session_handle()?
+        };
+        let initial_session = if session.path.exists() {
+            Session::load_from_path(&session.path)?
+        } else {
+            Session::new()
+        };
         let runtime = build_runtime(
-            Session::new(),
+            initial_session,
             model.clone(),
             system_prompt.clone(),
             enable_tools,
@@ -2766,6 +2808,18 @@ fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
 fn create_managed_session_handle() -> Result<SessionHandle, Box<dyn std::error::Error>> {
     let id = generate_session_id();
     let path = sessions_dir()?.join(format!("{id}.json"));
+    Ok(SessionHandle { id, path })
+}
+
+fn create_explicit_session_handle(path: PathBuf) -> Result<SessionHandle, Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let id = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("session")
+        .to_string();
     Ok(SessionHandle { id, path })
 }
 
@@ -4757,6 +4811,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
+        "  --session-path PATH        Load/save a non-interactive prompt session at PATH"
+    )?;
+    writeln!(
+        out,
         "  --dangerously-skip-permissions  Skip all permission checks"
     )?;
     writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
@@ -5141,6 +5199,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                session_path: None,
             }
         );
     }
@@ -5162,6 +5221,29 @@ mod tests {
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                session_path: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_prompt_session_path_flag() {
+        let args = vec![
+            "--session-path".to_string(),
+            ".aris/web/node/session.json".to_string(),
+            "--output-format=json".to_string(),
+            "prompt".to_string(),
+            "continue".to_string(),
+        ];
+        assert_eq!(
+            parse_args(&args).expect("args should parse"),
+            CliAction::Prompt {
+                prompt: "continue".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Json,
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+                session_path: Some(PathBuf::from(".aris/web/node/session.json")),
             }
         );
     }
@@ -5182,6 +5264,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                session_path: None,
             }
         );
     }

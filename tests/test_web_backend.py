@@ -29,8 +29,11 @@ from app.global_settings import (  # noqa: E402
     build_runtime_env,
     effective_model_override,
     get_global_settings,
+    get_planner_llm_settings,
     openai_compatible_settings,
+    planner_llm_summary,
     update_global_settings,
+    update_planner_llm_settings,
 )
 from app.models import (  # noqa: E402
     AgentConfigRequest,
@@ -67,7 +70,7 @@ from app.storage import (  # noqa: E402
     node_output_path,
     utc_now,
 )
-from app.workflow_storage import get_workflow, workflow_path  # noqa: E402
+from app.workflow_storage import get_workflow, list_planner_decisions, list_workflow_deltas, workflow_path  # noqa: E402
 from app.workflows import (  # noqa: E402
     NodeRunResult,
     WorkflowManager,
@@ -79,6 +82,8 @@ from app.workflows import (  # noqa: E402
     paper_introduction_template_graph,
     parse_generated_workflow_text,
     research_template_graph,
+    responses_api_url,
+    extract_responses_text,
     workflow_event_type_for_run_stream,
 )
 
@@ -320,8 +325,48 @@ def test_global_settings_mask_and_runtime_env(tmp_path: Path) -> None:
     assert openai_compatible_settings(tmp_path) is None
 
 
+def test_planner_llm_settings_are_separate_and_masked(tmp_path: Path) -> None:
+    update_planner_llm_settings(
+        api_key="sk-planner-secret",
+        base_url="https://planner.example",
+        model="gpt-5.5",
+        wire_api="responses",
+        home=tmp_path,
+    )
+
+    settings = get_planner_llm_settings(tmp_path)
+    summary = planner_llm_summary(tmp_path)
+
+    assert settings is not None
+    assert settings["model"] == "gpt-5.5"
+    assert settings["base_url"] == "https://planner.example"
+    assert settings["wire_api"] == "responses"
+    assert summary is not None
+    assert summary["api_key"] == "sk-p...cret"
+    assert "sk-planner-secret" not in json.dumps(summary)
+    assert get_global_settings(tmp_path).api_key_set is False
+
+
+def test_responses_planner_helpers_extract_output_text() -> None:
+    assert responses_api_url("https://yybb.codes") == "https://yybb.codes/v1/responses"
+    assert responses_api_url("https://yybb.codes/v1") == "https://yybb.codes/v1/responses"
+    assert responses_api_url("https://yybb.codes/v1/responses") == "https://yybb.codes/v1/responses"
+    payload = {
+        "output": [
+            {
+                "type": "message",
+                "content": [
+                    {"type": "output_text", "text": "{\"decision_type\":\"noop\",\"rationale\":\"ok\"}"}
+                ],
+            }
+        ]
+    }
+    assert "decision_type" in extract_responses_text(payload)
+
+
 def test_build_aris_command_uses_exec_args_not_shell(tmp_path: Path) -> None:
-    command = build_aris_command(tmp_path, "hello", model="claude-opus")
+    session_path = tmp_path / ".aris" / "session.json"
+    command = build_aris_command(tmp_path, "hello", model="claude-opus", session_path=str(session_path))
 
     assert Path(command[0]).name in {"aris", "aris.exe", "cargo"}
     assert "--permission-mode=workspace-write" in command
@@ -329,6 +374,8 @@ def test_build_aris_command_uses_exec_args_not_shell(tmp_path: Path) -> None:
     assert "bash" not in command[command.index("--allowedTools") + 1].lower()
     assert "--output-format=json" in command
     assert "--model" in command
+    assert "--session-path" in command
+    assert command[command.index("--session-path") + 1] == str(session_path)
     assert command[-1] == "hello"
     assert all(";" not in part for part in command[:-1])
 
@@ -775,6 +822,137 @@ def test_paper_introduction_template_graph_targets_intro_writing() -> None:
     assert {edge.target for edge in graph.edges} >= {"draft-introduction", "review-introduction", "approve-introduction"}
 
 
+def test_paper_introduction_template_can_insert_dynamic_literature(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    def write_declared_outputs(workspace: Path, record: WorkflowRecord, node: WorkflowNode) -> None:
+        for output in node.outputs:
+            name = output.name if hasattr(output, "name") else str(output)
+            if not name:
+                continue
+            if not (name.endswith((".md", ".tex", ".html", ".pdf", ".json")) or name == "literature_result.json"):
+                continue
+            path = workspace / ".aris" / "web" / "workflows" / record.id / "nodes" / node.id / "attempt-1" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if name.endswith(".json"):
+                payload = {
+                    "query": "dynamic DAG citation needs for workflow orchestration",
+                    "papers": [{"title": "Dynamic workflow orchestration", "year": 2026}],
+                    "findings": ["The introduction needs one more citation anchor for adaptive DAG changes."],
+                    "gaps": ["Most static workflow systems do not model planner-inserted research dependencies."],
+                    "sources": [],
+                    "wiki_refs": [],
+                    "artifact_refs": [],
+                }
+                path.write_text(json.dumps(payload), encoding="utf-8")
+            else:
+                path.write_text(f"# {node.id}\nGenerated test artifact for {name}.\n", encoding="utf-8")
+
+    async def fake_runner(workspace: Path, record: WorkflowRecord, node: WorkflowNode) -> NodeRunResult:
+        calls.append(node.id)
+        write_declared_outputs(workspace, record, node)
+        return NodeRunResult(run_id=f"run-{node.id}-{calls.count(node.id)}", succeeded=True, message="ok")
+
+    async def fake_planner(workspace: Path, record: WorkflowRecord, trigger: str):
+        nodes = {node.id: node for node in record.graph_json.nodes}
+        if "lit-intro-outline-citation-gap" in nodes:
+            return None
+        outline = nodes.get("intro-outline")
+        if outline and outline.status == "waiting_approval":
+            return {
+                "decision_type": "mutate",
+                "rationale": "intro-outline marked a citation gap and needs fresh literature before drafting",
+                "gap_type": "citation_gap",
+                "gap_evidence_refs": ["artifact:.aris/web/workflows/intro-outline/INTRO_OUTLINE.md"],
+                "affected_session_ids": ["node:test:intro-outline"],
+                "blocked_node_ids": ["intro-outline"],
+                "expected_artifacts": ["literature_result.json"],
+                "resume_plan": "Resume intro-outline in the same session with the new citation findings.",
+                "deltas": [
+                    {
+                        "action": "add_node",
+                        "node": {
+                            "id": "lit-intro-outline-citation-gap",
+                            "name": "Literature: introduction citation gap",
+                            "type": "sub_agent",
+                            "skill": "research-lit",
+                            "dynamic_parent_id": "intro-outline",
+                        },
+                        "research_request": {
+                            "query": "dynamic DAG citation needs for workflow orchestration",
+                            "caller_id": "intro-outline",
+                        },
+                        "gap_type": "citation_gap",
+                        "gap_evidence_refs": ["artifact:.aris/web/workflows/intro-outline/INTRO_OUTLINE.md"],
+                        "expected_artifacts": ["literature_result.json"],
+                    },
+                    {
+                        "action": "block_node",
+                        "node_id": "intro-outline",
+                        "wait_for": ["lit-intro-outline-citation-gap"],
+                        "reason": "waiting for literature",
+                        "resume_plan": "Resume intro-outline after lit-intro-outline-citation-gap succeeds.",
+                    },
+                ],
+            }
+        return None
+
+    manager = WorkflowManager(type("R", (), {})(), node_runner=fake_runner, planner_runner=fake_planner)
+    graph = paper_introduction_template_graph(
+        "Write an introduction for a paper about planner-controlled dynamic DAG research workflows.",
+        {"paper-plan", "research-lit", "paper-write", "research-review"},
+    )
+
+    async def wait_until(predicate, *, timeout: float = 3.0) -> WorkflowRecord:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            current = get_workflow(tmp_path, workflow.id)
+            if current is not None and predicate(current):
+                return current
+            await asyncio.sleep(0.05)
+        current = get_workflow(tmp_path, workflow.id)
+        assert current is not None
+        return current
+
+    async def run() -> None:
+        nonlocal workflow
+        workflow = await manager.create(tmp_path, "Introduction dynamic DAG", "Goal", graph)
+        await manager.execute(tmp_path, workflow.id)
+
+        await wait_until(lambda current: {node.id: node for node in current.graph_json.nodes}["intro-context"].status == "waiting_approval")
+        await manager.approve_batch(tmp_path, workflow.id)
+        await wait_until(lambda current: {node.id: node for node in current.graph_json.nodes}["literature-positioning"].status == "waiting_approval")
+        await manager.approve_batch(tmp_path, workflow.id)
+
+        current = await wait_until(
+            lambda current: (
+                "lit-intro-outline-citation-gap" in {node.id: node for node in current.graph_json.nodes}
+                and {node.id: node for node in current.graph_json.nodes}["lit-intro-outline-citation-gap"].status == "succeeded"
+                and {node.id: node for node in current.graph_json.nodes}["intro-outline"].status == "waiting_approval"
+                and calls.count("intro-outline") == 2
+            )
+        )
+        nodes = {node.id: node for node in current.graph_json.nodes}
+        dynamic_lit = nodes["lit-intro-outline-citation-gap"]
+        outline = nodes["intro-outline"]
+
+        assert nodes["literature-positioning"].dynamic_parent_id is None
+        assert dynamic_lit.skill == "research-lit"
+        assert dynamic_lit.dynamic_parent_id == "intro-outline"
+        assert dynamic_lit.auto_approve_after is True
+        assert dynamic_lit.approved_after is True
+        assert dynamic_lit.status == "succeeded"
+        assert dynamic_lit.id in outline.depends_on
+        assert outline.session_path is not None
+        assert calls.count("intro-outline") == 2
+        assert "draft-introduction" not in calls
+        assert any(edge.source == dynamic_lit.id and edge.target == "intro-outline" for edge in current.graph_json.edges)
+        assert (tmp_path / "research-wiki" / "query_pack.md").exists()
+
+    workflow: WorkflowRecord
+    asyncio.run(run())
+
+
 def test_workflow_storage_roundtrip(tmp_path: Path) -> None:
     manager = WorkflowManager(type("R", (), {})())
 
@@ -1167,8 +1345,8 @@ def test_workflow_node_prompt_includes_agent_config(tmp_path: Path) -> None:
         assert "Write REVIEW.md with issues and fixes." in prompt
         assert "Use relative paths" in prompt
         assert "ARIS_SUBAGENT_DIR=.aris/web/workflows/" in prompt
-        assert "Use ARIS_SUBAGENT_DIR for scratch files" in prompt
-        assert "Declared concrete outputs belong at their requested workspace-relative paths" in prompt
+        assert "Use ARIS_SUBAGENT_DIR for all node-owned files" in prompt
+        assert "Concrete output storage paths:" in prompt
 
     asyncio.run(run())
 
@@ -1234,6 +1412,11 @@ def test_sub_agent_runs_use_isolated_attempt_directories(tmp_path: Path) -> None
         assert dir_b.exists()
         assert requests[0].env_overrides["ARIS_NODE_ID"] == "a"
         assert requests[1].env_overrides["ARIS_NODE_ID"] == "b"
+        assert requests[0].session_path is not None
+        assert requests[1].session_path is not None
+        assert Path(requests[0].session_path).name == "session.json"
+        assert Path(requests[0].session_path).parent.name == "a"
+        assert Path(requests[1].session_path).parent.name == "b"
 
     asyncio.run(run())
 
@@ -1342,6 +1525,70 @@ def test_workflow_manager_runs_ready_nodes_as_approval_batch(tmp_path: Path) -> 
         assert current.graph_json.nodes[-1].status == "waiting_approval"
         finished = await manager.approve_batch(tmp_path, workflow.id)
         assert finished.status == "succeeded"
+
+    asyncio.run(run())
+
+
+def test_workflow_resume_runs_ready_rerun_before_stale_batch_approval(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    async def fake_runner(workspace: Path, record, node) -> NodeRunResult:
+        calls.append(node.id)
+        return NodeRunResult(run_id=f"run-{node.id}", succeeded=True)
+
+    manager = WorkflowManager(type("R", (), {})(), node_runner=fake_runner)
+    graph = WorkflowGraph(
+        nodes=[
+            WorkflowNode(id="a", name="A", status="succeeded", run_id="run-a"),
+            WorkflowNode(id="b", name="B", depends_on=["a"], status="queued", run_id=None),
+            WorkflowNode(id="c", name="C", depends_on=["b"], status="waiting_approval", run_id="run-c"),
+        ]
+    )
+
+    async def run() -> None:
+        workflow = await manager.create(tmp_path, "Resume rerun", "Goal", graph)
+        await manager.update(tmp_path, workflow.id, status="paused")
+        await manager.resume(tmp_path, workflow.id)
+        for _ in range(40):
+            current = get_workflow(tmp_path, workflow.id)
+            nodes = {node.id: node for node in current.graph_json.nodes} if current else {}
+            if calls == ["b"] and nodes.get("b") and nodes["b"].status == "waiting_approval":
+                break
+            await asyncio.sleep(0.05)
+
+        current = get_workflow(tmp_path, workflow.id)
+        assert current is not None
+        nodes = {node.id: node for node in current.graph_json.nodes}
+        assert calls == ["b"]
+        assert nodes["b"].status == "waiting_approval"
+        assert nodes["c"].status == "waiting_approval"
+        assert current.status == "paused"
+
+    asyncio.run(run())
+
+
+def test_run_manager_system_events_include_model(tmp_path: Path) -> None:
+    manager = RunManager()
+    run_id = "model-run"
+    insert_run(
+        RunRecord(
+            id=run_id,
+            workspace=str(tmp_path),
+            skill="smoke",
+            model="gpt-test",
+            status="queued",
+            created_at=utc_now(),
+            updated_at=utc_now(),
+            command=[],
+        )
+    )
+
+    async def run() -> None:
+        await manager._run_process(run_id, tmp_path, [sys.executable, "-c", "print('ok')"])
+        events = await manager.replay_events(tmp_path, run_id)
+        system_events = [event for event in events if event.stream == "system"]
+        assert any(event.payload and event.payload.get("model") == "gpt-test" for event in system_events)
+        assert any("model: gpt-test" in event.message for event in system_events)
 
     asyncio.run(run())
 
@@ -1619,6 +1866,453 @@ def test_workflow_manager_reruns_fanout_rewires_downstream_dependencies(tmp_path
         nodes = {node.id: node for node in current.graph_json.nodes}
         assert generated_ids == {"literature-template-alpha", "literature-template-beta"}
         assert nodes["synthesis"].depends_on == sorted(generated_ids)
+
+    asyncio.run(run())
+
+
+def test_workflow_manager_planner_inserts_literature_and_resumes_caller(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    async def fake_runner(workspace: Path, record, node) -> NodeRunResult:
+        calls.append(node.id)
+        run_id = f"run-{node.id}-{calls.count(node.id)}"
+        if node.skill == "research-lit":
+            result_path = workspace / ".aris" / "web" / "workflows" / record.id / "nodes" / node.id / "attempt-1" / "literature_result.json"
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            result_path.write_text(
+                json.dumps({"query": "adaptive research agents", "papers": [], "findings": ["gap"], "gaps": []}),
+                encoding="utf-8",
+            )
+        return NodeRunResult(run_id=run_id, succeeded=True, message="ok")
+
+    async def fake_planner(workspace: Path, record, trigger: str):
+        nodes = {node.id: node for node in record.graph_json.nodes}
+        if "lit-caller-gap" in nodes:
+            return None
+        caller = nodes.get("caller")
+        if caller and caller.status == "waiting_approval":
+            return {
+                "decision_type": "mutate",
+                "rationale": "caller needs current literature before continuing",
+                "gap_type": "literature_gap",
+                "gap_evidence_refs": ["artifact:caller-output.md"],
+                "affected_session_ids": ["node:test:caller"],
+                "blocked_node_ids": ["caller"],
+                "expected_artifacts": ["literature_result.json"],
+                "resume_plan": "Resume caller with adaptive research agent findings.",
+                "deltas": [
+                    {
+                        "action": "add_node",
+                        "node": {
+                            "id": "lit-caller-gap",
+                            "name": "Literature: adaptive research agents",
+                            "type": "sub_agent",
+                            "skill": "research-lit",
+                            "dynamic_parent_id": "caller",
+                        },
+                        "research_request": {"query": "adaptive research agents", "caller_id": "caller"},
+                        "gap_type": "literature_gap",
+                        "gap_evidence_refs": ["artifact:caller-output.md"],
+                        "expected_artifacts": ["literature_result.json"],
+                    },
+                    {
+                        "action": "block_node",
+                        "node_id": "caller",
+                        "wait_for": ["lit-caller-gap"],
+                        "reason": "waiting for literature",
+                        "resume_plan": "Resume caller after lit-caller-gap succeeds.",
+                    },
+                ],
+            }
+        return None
+
+    manager = WorkflowManager(type("R", (), {})(), node_runner=fake_runner, planner_runner=fake_planner)
+    graph = WorkflowGraph(
+        nodes=[
+            WorkflowNode(id="caller", name="Caller", type="sub_agent"),
+            WorkflowNode(id="downstream", name="Downstream", type="sub_agent", depends_on=["caller"]),
+        ]
+    )
+
+    async def run() -> None:
+        workflow = await manager.create(tmp_path, "Dynamic literature", "Goal", graph)
+        await manager.execute(tmp_path, workflow.id)
+        for _ in range(100):
+            current = get_workflow(tmp_path, workflow.id)
+            if current:
+                nodes = {node.id: node for node in current.graph_json.nodes}
+                if (
+                    nodes.get("lit-caller-gap")
+                    and nodes["lit-caller-gap"].status == "succeeded"
+                    and nodes["caller"].status == "waiting_approval"
+                    and calls.count("caller") == 2
+                ):
+                    break
+            await asyncio.sleep(0.05)
+
+        current = get_workflow(tmp_path, workflow.id)
+        assert current is not None
+        nodes = {node.id: node for node in current.graph_json.nodes}
+        assert nodes["lit-caller-gap"].skill == "research-lit"
+        assert nodes["lit-caller-gap"].auto_approve_after is True
+        assert nodes["lit-caller-gap"].approved_after is True
+        assert nodes["lit-caller-gap"].dynamic_parent_id == "caller"
+        assert nodes["caller"].status == "waiting_approval"
+        assert nodes["caller"].session_path is not None
+        assert calls.count("caller") == 2
+        assert calls.count("lit-caller-gap") == 1
+        assert "downstream" not in calls
+        assert (tmp_path / "research-wiki" / "query_pack.md").exists()
+
+    asyncio.run(run())
+
+
+def test_workflow_manager_deduplicates_repeated_literature_requests(tmp_path: Path) -> None:
+    async def fake_planner(workspace: Path, record, trigger: str):
+        return {
+            "decision_type": "mutate",
+            "rationale": "repeat same request",
+            "gap_type": "literature_gap",
+            "gap_evidence_refs": ["artifact:caller-output.md"],
+            "deltas": [
+                {
+                    "action": "add_node",
+                    "node": {
+                        "id": "lit-repeat",
+                        "name": "Literature repeat",
+                        "type": "sub_agent",
+                        "skill": "research-lit",
+                        "dynamic_parent_id": "caller",
+                    },
+                    "research_request": {"query": "same query", "caller_id": "caller"},
+                    "gap_evidence_refs": ["artifact:caller-output.md"],
+                }
+            ],
+        }
+
+    manager = WorkflowManager(type("R", (), {})(), planner_runner=fake_planner)
+
+    async def run() -> None:
+        workflow = await manager.create(
+            tmp_path,
+            "Dedup",
+            "Goal",
+            WorkflowGraph(nodes=[WorkflowNode(id="caller", name="Caller", type="sub_agent")]),
+        )
+        first = await manager._planner_tick(tmp_path, workflow.id, "test")
+        assert first is False  # planner does not run while workflow is not running
+        await manager.update(tmp_path, workflow.id, status="running")
+        assert await manager._planner_tick(tmp_path, workflow.id, "test") is True
+        assert await manager._planner_tick(tmp_path, workflow.id, "test") is False
+        current = get_workflow(tmp_path, workflow.id)
+        assert current is not None
+        lit_nodes = [node for node in current.graph_json.nodes if node.skill == "research-lit"]
+        assert len(lit_nodes) == 1
+
+    asyncio.run(run())
+
+
+def test_workflow_planner_noop_records_decision_card(tmp_path: Path) -> None:
+    async def fake_planner(workspace: Path, record, trigger: str):
+        return {
+            "decision_type": "noop",
+            "rationale": "existing literature node already covers the citation gap",
+            "confidence": 0.91,
+            "deltas": [{"action": "mark_noop", "reason": "covered by existing literature node"}],
+        }
+
+    manager = WorkflowManager(type("R", (), {})(), planner_runner=fake_planner)
+
+    async def run() -> None:
+        workflow = await manager.create(
+            tmp_path,
+            "Noop decision",
+            "Goal",
+            WorkflowGraph(nodes=[WorkflowNode(id="caller", name="Caller", type="sub_agent")]),
+        )
+        await manager.update(tmp_path, workflow.id, status="running")
+        assert await manager._planner_tick(tmp_path, workflow.id, "test-noop") is False
+
+        decisions = list_planner_decisions(tmp_path, workflow.id)
+        deltas = list_workflow_deltas(tmp_path, workflow.id)
+        assert decisions[-1].decision_type == "noop"
+        assert "already covers" in decisions[-1].rationale
+        assert deltas[-1].action == "mark_noop"
+        assert deltas[-1].policy_result.allowed is True
+
+    asyncio.run(run())
+
+
+def test_runtime_policy_rejects_dynamic_literature_without_gap_evidence(tmp_path: Path) -> None:
+    async def fake_planner(workspace: Path, record, trigger: str):
+        return {
+            "decision_type": "mutate",
+            "rationale": "add literature without evidence",
+            "deltas": [
+                {
+                    "action": "add_node",
+                    "node": {
+                        "id": "lit-no-evidence",
+                        "name": "Literature no evidence",
+                        "type": "sub_agent",
+                        "skill": "research-lit",
+                        "dynamic_parent_id": "caller",
+                    },
+                    "research_request": {"query": "unsupported query", "caller_id": "caller"},
+                }
+            ],
+        }
+
+    manager = WorkflowManager(type("R", (), {})(), planner_runner=fake_planner)
+
+    async def run() -> None:
+        workflow = await manager.create(
+            tmp_path,
+            "Policy reject",
+            "Goal",
+            WorkflowGraph(nodes=[WorkflowNode(id="caller", name="Caller", type="sub_agent")]),
+        )
+        await manager.update(tmp_path, workflow.id, status="running")
+        assert await manager._planner_tick(tmp_path, workflow.id, "test-policy") is False
+        current = get_workflow(tmp_path, workflow.id)
+        assert current is not None
+        assert "lit-no-evidence" not in {node.id for node in current.graph_json.nodes}
+        rejected = list_workflow_deltas(tmp_path, workflow.id)[-1]
+        assert rejected.applied is False
+        assert rejected.policy_result.allowed is False
+        assert "gap evidence" in rejected.policy_result.reason
+
+    asyncio.run(run())
+
+
+def test_runtime_policy_enforces_per_caller_dynamic_cap(tmp_path: Path) -> None:
+    async def fake_planner(workspace: Path, record, trigger: str):
+        return {
+            "decision_type": "mutate",
+            "rationale": "caller needs yet another literature node",
+            "gap_type": "literature_gap",
+            "gap_evidence_refs": ["artifact:caller.md"],
+            "deltas": [
+                {
+                    "action": "add_node",
+                    "node": {
+                        "id": "lit-caller-four",
+                        "name": "Literature four",
+                        "type": "sub_agent",
+                        "skill": "research-lit",
+                        "dynamic_parent_id": "caller",
+                    },
+                    "research_request": {"query": "fourth query", "caller_id": "caller"},
+                    "gap_evidence_refs": ["artifact:caller.md"],
+                }
+            ],
+        }
+
+    manager = WorkflowManager(type("R", (), {})(), planner_runner=fake_planner)
+    existing = [
+        WorkflowNode(id=f"lit-caller-{idx}", name=f"Lit {idx}", type="sub_agent", skill="research-lit", dynamic_parent_id="caller")
+        for idx in range(3)
+    ]
+
+    async def run() -> None:
+        workflow = await manager.create(
+            tmp_path,
+            "Policy cap",
+            "Goal",
+            WorkflowGraph(nodes=[WorkflowNode(id="caller", name="Caller", type="sub_agent"), *existing]),
+        )
+        await manager.update(tmp_path, workflow.id, status="running")
+        assert await manager._planner_tick(tmp_path, workflow.id, "test-cap") is False
+        current = get_workflow(tmp_path, workflow.id)
+        assert current is not None
+        assert "lit-caller-four" not in {node.id for node in current.graph_json.nodes}
+        rejected = list_workflow_deltas(tmp_path, workflow.id)[-1]
+        assert rejected.policy_result.allowed is False
+        assert "cap reached for caller" in rejected.policy_result.reason
+
+    asyncio.run(run())
+
+
+def test_runtime_summary_exposes_decisions_deltas_and_blocked_sessions(tmp_path: Path) -> None:
+    async def fake_planner(workspace: Path, record, trigger: str):
+        nodes = {node.id: node for node in record.graph_json.nodes}
+        if "lit-caller-gap" in nodes:
+            return None
+        return {
+            "decision_type": "mutate",
+            "rationale": "caller has a citation gap",
+            "gap_type": "citation_gap",
+            "gap_evidence_refs": ["artifact:caller.md"],
+            "blocked_node_ids": ["caller"],
+            "expected_artifacts": ["literature_result.json"],
+            "resume_plan": "Resume caller after literature_result.json is available.",
+            "deltas": [
+                {
+                    "action": "add_node",
+                    "node": {
+                        "id": "lit-caller-gap",
+                        "name": "Literature gap",
+                        "type": "sub_agent",
+                        "skill": "research-lit",
+                        "dynamic_parent_id": "caller",
+                    },
+                    "research_request": {"query": "citation gap", "caller_id": "caller"},
+                    "gap_evidence_refs": ["artifact:caller.md"],
+                    "expected_artifacts": ["literature_result.json"],
+                },
+                {
+                    "action": "block_node",
+                    "node_id": "caller",
+                    "wait_for": ["lit-caller-gap"],
+                    "reason": "waiting for citation literature",
+                    "resume_plan": "Resume caller with the new findings.",
+                },
+            ],
+        }
+
+    manager = WorkflowManager(type("R", (), {})(), planner_runner=fake_planner)
+
+    async def run() -> None:
+        workflow = await manager.create(
+            tmp_path,
+            "Runtime summary",
+            "Goal",
+            WorkflowGraph(nodes=[WorkflowNode(id="caller", name="Caller", type="sub_agent", status="waiting_approval")]),
+        )
+        await manager.update(tmp_path, workflow.id, status="running")
+        assert await manager._planner_tick(tmp_path, workflow.id, "test-summary") is True
+
+        runtime = manager.runtime(tmp_path, workflow.id)
+        assert runtime.runtime_summary.latest_decision_type == "mutate"
+        assert runtime.runtime_summary.execution_state == "waiting_dynamic_dependency"
+        assert runtime.runtime_summary.waiting_dynamic_dependency_count == 1
+        assert runtime.runtime_summary.waiting_dynamic_dependency_node_ids == ["caller"]
+        assert runtime.runtime_summary.ready_node_ids == ["lit-caller-gap"]
+        assert runtime.runtime_summary.dynamic_node_count == 1
+        assert runtime.blocked_sessions[0]["node_id"] == "caller"
+        assert runtime.dynamic_nodes[0].id == "lit-caller-gap"
+        assert runtime.latest_decision is not None
+        assert runtime.latest_decision.before_graph_hash != runtime.latest_decision.after_graph_hash
+        assert len(manager.deltas(tmp_path, workflow.id)) >= 2
+
+    asyncio.run(run())
+
+
+def test_runtime_summary_reports_active_execution_state(tmp_path: Path) -> None:
+    manager = WorkflowManager(type("R", (), {})())
+
+    async def run() -> None:
+        workflow = await manager.create(
+            tmp_path,
+            "Active runtime",
+            "Goal",
+            WorkflowGraph(
+                nodes=[
+                    WorkflowNode(id="active", name="Active", type="sub_agent", status="running"),
+                    WorkflowNode(id="downstream", name="Downstream", type="sub_agent", depends_on=["active"]),
+                ]
+            ),
+        )
+        await manager.update(tmp_path, workflow.id, status="running")
+        manager._active[workflow.id] = {"active"}
+
+        runtime = manager.runtime(tmp_path, workflow.id)
+
+        assert runtime.runtime_summary.execution_state == "running"
+        assert runtime.runtime_summary.active_node_count == 1
+        assert runtime.runtime_summary.active_node_ids == ["active"]
+        assert runtime.runtime_summary.queued_node_count == 1
+        assert runtime.runtime_summary.ready_node_count == 0
+        assert "active node" in runtime.runtime_summary.next_action
+
+    asyncio.run(run())
+
+
+def test_runtime_handoffs_preview_upstream_output(tmp_path: Path) -> None:
+    manager = WorkflowManager(type("R", (), {})())
+
+    async def run() -> None:
+        workflow = await manager.create(
+            tmp_path,
+            "Handoff preview",
+            "Goal",
+            WorkflowGraph(
+                nodes=[
+                    WorkflowNode(id="source", name="Source", status="succeeded", run_id="run-source"),
+                    WorkflowNode(id="target", name="Target", depends_on=["source"]),
+                ],
+                edges=[WorkflowEdge(id="source->target", source="source", target="target")],
+            ),
+        )
+        output_path = node_output_path(tmp_path, "run-source")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps({"text": "plain text", "json": {"summary": "facts for downstream", "count": 2}}),
+            encoding="utf-8",
+        )
+
+        runtime = manager.runtime(tmp_path, workflow.id)
+
+        assert len(runtime.handoffs) == 1
+        handoff = runtime.handoffs[0]
+        assert handoff.source == "source"
+        assert handoff.target == "target"
+        assert handoff.content_type == "json"
+        assert handoff.has_structured_output is True
+        assert "facts for downstream" in handoff.preview
+        assert handoff.output_path and handoff.output_path.endswith("node_output.json")
+
+    asyncio.run(run())
+
+
+def test_runtime_handoffs_fallback_to_latest_completed_node_run(tmp_path: Path) -> None:
+    manager = WorkflowManager(type("R", (), {})())
+
+    async def run() -> None:
+        workflow = await manager.create(
+            tmp_path,
+            "Handoff fallback",
+            "Goal",
+            WorkflowGraph(
+                nodes=[
+                    WorkflowNode(id="source", name="Source", status="queued", run_id=None),
+                    WorkflowNode(id="target", name="Target", depends_on=["source"]),
+                ],
+                edges=[WorkflowEdge(id="source->target", source="source", target="target")],
+            ),
+        )
+        insert_run(
+            RunRecord(
+                id="run-source-old",
+                workspace=str(tmp_path),
+                skill="research-lit",
+                status="succeeded",
+                created_at=utc_now(),
+                updated_at=utc_now(),
+                command=[],
+            )
+        )
+        output_path = node_output_path(tmp_path, "run-source-old")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps({"text": "previous literature result"}), encoding="utf-8")
+        await manager._append_event(
+            tmp_path,
+            WorkflowEvent(
+                workflow_id=workflow.id,
+                timestamp=utc_now(),
+                event_type="node",
+                node_id="source",
+                run_id="run-source-old",
+                message="Node completed and waiting for batch approval: Source",
+            ),
+        )
+
+        runtime = manager.runtime(tmp_path, workflow.id)
+
+        handoff = runtime.handoffs[0]
+        assert handoff.source_run_id == "run-source-old"
+        assert handoff.content_type == "text"
+        assert "previous literature result" in handoff.preview
 
     asyncio.run(run())
 
