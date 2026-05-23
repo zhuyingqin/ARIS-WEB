@@ -19,11 +19,15 @@ WorkflowNodeStatus = Literal[
     "skipped",
     "cancelled",
 ]
-WorkflowNodeType = Literal["agent", "sub_agent", "human_gate"]
+WorkflowNodeType = Literal["input", "agent", "sub_agent", "human_gate"]
 WorkflowGate = Literal["none", "before", "after", "both"]
 WorkflowTemplate = Literal["research", "paper_introduction"]
 WorkflowFailurePolicy = Literal["halt", "skip_descendants", "continue"]
 FanOutEmptyPolicy = Literal["fail", "succeed"]
+TaskType = Literal["input", "goal", "planning", "research", "analysis", "coding", "writing", "review", "gate"]
+TaskBoardColumn = Literal["backlog", "ready", "running", "review", "rework", "done", "blocked"]
+TaskReviewStatus = Literal["not_required", "pending", "passed", "rework"]
+TeamRoleKind = Literal["planner", "reviewer", "literature", "writer", "citation", "worker", "gate"]
 
 
 class HealthItem(BaseModel):
@@ -64,6 +68,7 @@ class CreateRunRequest(BaseModel):
     effort: str | None = None
     assurance: str | None = None
     session_path: str | None = None
+    allowed_tools: list[str] | None = None
     env_overrides: dict[str, str] = Field(default_factory=dict)
 
 
@@ -326,6 +331,22 @@ class WorkflowNode(BaseModel):
     team_id: str | None = None
     team_instance_id: str | None = None
     team_role_id: str | None = None
+    team_role_kind: TeamRoleKind | None = None
+    scope: str = ""
+    can_ask_questions: bool | None = None
+    can_clone_workers: bool | None = None
+    can_call_planner: bool | None = None
+    peer_access: bool | None = None
+    reports_to_chat: bool | None = None
+    task_type: TaskType = "analysis"
+    objective: str = ""
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    assignee_role: str | None = None
+    assigned_to: str | None = None
+    claimed_by: str | None = None
+    review_status: TaskReviewStatus = "not_required"
+    review_notes: str = ""
+    priority: int = 3
 
     @field_validator("inputs", "outputs", mode="before")
     @classmethod
@@ -337,6 +358,15 @@ class WorkflowNode(BaseModel):
     def _normalize_optional_text(cls, value: Any) -> Any:
         if value is None:
             return ""
+        return value
+
+    @field_validator("acceptance_criteria", mode="before")
+    @classmethod
+    def _normalize_acceptance_criteria(cls, value: Any) -> Any:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [line.strip() for line in value.splitlines() if line.strip()]
         return value
 
 
@@ -400,7 +430,7 @@ class PlannerDecision(BaseModel):
 class RuntimePolicy(BaseModel):
     max_dynamic_nodes_per_caller: int = 3
     max_dynamic_nodes_total: int = 20
-    allowed_dynamic_skills: list[str] = Field(default_factory=lambda: ["research-lit"])
+    allowed_dynamic_skills: list[str] = Field(default_factory=list)
     require_gap_evidence: bool = True
     allow_static_node_rewrite: bool = False
     allow_delete_static_nodes: bool = False
@@ -474,6 +504,22 @@ class ArtifactIndexEntry(BaseModel):
     refs: list[str] = Field(default_factory=list)
 
 
+class TeamMessage(BaseModel):
+    workflow_id: str
+    timestamp: str
+    node_id: str | None = None
+    run_id: str | None = None
+    role: str = ""
+    role_kind: TeamRoleKind = "worker"
+    scope: str = ""
+    message: str = ""
+    artifact_refs: list[ArtifactIndexEntry] = Field(default_factory=list)
+    can_ask_questions: bool = False
+    can_clone_workers: bool = False
+    can_call_planner: bool = False
+    peer_access: bool = True
+
+
 class RuntimeSummary(BaseModel):
     planner_session_id: str
     planner_session_path: str
@@ -518,6 +564,73 @@ class WorkflowHandoff(BaseModel):
     has_structured_output: bool = False
 
 
+class TaskBoardTask(BaseModel):
+    id: str
+    name: str
+    task_type: TaskType
+    column: TaskBoardColumn
+    status: WorkflowNodeStatus
+    role: str = ""
+    skill: str | None = None
+    objective: str = ""
+    prompt: str = ""
+    inputs: list[PortSpec] = Field(default_factory=list)
+    outputs: list[PortSpec] = Field(default_factory=list)
+    depends_on: list[str] = Field(default_factory=list)
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    assignee_role: str | None = None
+    assigned_to: str | None = None
+    claimed_by: str | None = None
+    review_status: TaskReviewStatus = "not_required"
+    review_notes: str = ""
+    priority: int = 3
+    artifact_refs: list[ArtifactIndexEntry] = Field(default_factory=list)
+    dynamic_parent_id: str | None = None
+    dynamic_reason: str | None = None
+    team_id: str | None = None
+    team_role_id: str | None = None
+    team_role_kind: TeamRoleKind | None = None
+    scope: str = ""
+    can_ask_questions: bool | None = None
+    can_clone_workers: bool | None = None
+    can_call_planner: bool | None = None
+    peer_access: bool | None = None
+    reports_to_chat: bool | None = None
+    run_id: str | None = None
+    error: str | None = None
+
+
+class TaskBoardColumnSummary(BaseModel):
+    id: TaskBoardColumn
+    title: str
+    task_ids: list[str] = Field(default_factory=list)
+
+
+class TaskBoardResponse(BaseModel):
+    id: str
+    workspace: str
+    title: str
+    goal: str
+    status: WorkflowStatus
+    tasks: list[TaskBoardTask] = Field(default_factory=list)
+    columns: list[TaskBoardColumnSummary] = Field(default_factory=list)
+    dependencies: list[WorkflowEdge] = Field(default_factory=list)
+    artifact_index: list[ArtifactIndexEntry] = Field(default_factory=list)
+    runtime_summary: RuntimeSummary
+
+
+class TaskClaimRequest(BaseModel):
+    agent_id: str | None = None
+    role: str | None = None
+
+
+class TaskReviewRequest(BaseModel):
+    review_status: Literal["passed", "rework"]
+    notes: str = ""
+    acceptance_criteria: list[str] | None = None
+    reset_for_rework: bool = True
+
+
 class TeamEdge(BaseModel):
     id: str | None = None
     source: str
@@ -528,6 +641,13 @@ class TeamRoleSpec(BaseModel):
     id: str
     name: str
     role: str = ""
+    kind: TeamRoleKind | None = None
+    scope: str = ""
+    can_ask_questions: bool | None = None
+    can_clone_workers: bool | None = None
+    can_call_planner: bool | None = None
+    peer_access: bool | None = None
+    reports_to_chat: bool | None = None
     config_file: str | None = None
     skill: str | None = None
     prompt: str = ""
@@ -650,6 +770,8 @@ class WorkflowEvent(BaseModel):
         "planner",
         "delta",
         "session",
+        "team_message",
+        "artifact",
         "approval",
     ]
     message: str
@@ -677,6 +799,7 @@ class WorkflowRuntimeResponse(BaseModel):
     dynamic_nodes: list[WorkflowNode] = Field(default_factory=list)
     artifact_index: list[ArtifactIndexEntry] = Field(default_factory=list)
     handoffs: list[WorkflowHandoff] = Field(default_factory=list)
+    team_messages: list[TeamMessage] = Field(default_factory=list)
 
 
 class SessionRuntimeView(BaseModel):

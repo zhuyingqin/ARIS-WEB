@@ -379,6 +379,11 @@ If both MCP and CLI are unavailable, skip this source gracefully and continue wi
 
 When the user explicitly requests `— sources: openalex` (or includes `openalex` in a combined source list), use OpenAlex API for comprehensive academic metadata:
 
+If running inside ARIS Web where Bash/shell execution is unavailable, load
+`/openalex-search` and use `WebFetch` directly against the OpenAlex Works API.
+Write any required node artifact under `ARIS_SUBAGENT_DIR` and mark uncertain
+or unverified metadata explicitly.
+
 ```bash
 # Re-resolve $ARIS_REPO (SKILL bash blocks may run in separate shells).
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" || exit 1

@@ -16,6 +16,7 @@ import type {
   RunRecord,
   SessionRuntimeView,
   SkillInfo,
+  TaskBoardResponse,
   TeamConfig,
   TeamConfigPayload,
   UpdateGlobalSettingsPayload,
@@ -142,10 +143,14 @@ export const api = {
   runOutput: (workspace: string, runId: string) =>
     request<RunOutput>(`/api/runs/${runId}/output?workspace=${encodeURIComponent(workspace)}`),
   workflows: (workspace?: string) =>
-    request<WorkflowRecord[]>(`/api/workflows${workspace ? `?workspace=${encodeURIComponent(workspace)}` : ""}`),
+    request<WorkflowRecord[]>(`/api/task-boards${workspace ? `?workspace=${encodeURIComponent(workspace)}` : ""}`),
+  taskBoard: (workflow: WorkflowRecord) =>
+    request<TaskBoardResponse>(
+      `/api/task-boards/${workflow.id}/task-board?workspace=${encodeURIComponent(workflow.workspace)}`,
+    ),
   workflowRuntime: (workflow: WorkflowRecord) =>
     request<WorkflowRuntimeResponse>(
-      `/api/workflows/${workflow.id}/runtime?workspace=${encodeURIComponent(workflow.workspace)}`,
+      `/api/task-boards/${workflow.id}/runtime?workspace=${encodeURIComponent(workflow.workspace)}`,
     ),
   workflowDecisions: (workflow: WorkflowRecord) =>
     request<PlannerDecisionRecord[]>(
@@ -160,22 +165,22 @@ export const api = {
       `/api/workflows/${workflow.id}/sessions/${encodeURIComponent(sessionId)}?workspace=${encodeURIComponent(workflow.workspace)}`,
     ),
   createWorkflow: (payload: CreateWorkflowPayload) =>
-    request<WorkflowRecord>("/api/workflows", {
+    request<WorkflowRecord>("/api/task-boards", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
   generateWorkflow: (payload: GenerateWorkflowPayload) =>
-    request<WorkflowRecord>("/api/workflows/generate", {
+    request<WorkflowRecord>("/api/task-boards/generate", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
   refineWorkflow: (workflow: WorkflowRecord, payload: RefineWorkflowPayload) =>
-    request<WorkflowRecord>(`/api/workflows/${workflow.id}/refine?workspace=${encodeURIComponent(workflow.workspace)}`, {
+    request<WorkflowRecord>(`/api/task-boards/${workflow.id}/refine?workspace=${encodeURIComponent(workflow.workspace)}`, {
       method: "POST",
       body: JSON.stringify(payload),
     }),
   updateWorkflow: (workflow: WorkflowRecord) =>
-    request<WorkflowRecord>(`/api/workflows/${workflow.id}?workspace=${encodeURIComponent(workflow.workspace)}`, {
+    request<WorkflowRecord>(`/api/task-boards/${workflow.id}?workspace=${encodeURIComponent(workflow.workspace)}`, {
       method: "PATCH",
       body: JSON.stringify({
         title: workflow.title,
@@ -184,23 +189,23 @@ export const api = {
       }),
     }),
   deleteWorkflow: (workflow: WorkflowRecord) =>
-    request<{ ok: boolean }>(`/api/workflows/${workflow.id}?workspace=${encodeURIComponent(workflow.workspace)}`, {
+    request<{ ok: boolean }>(`/api/task-boards/${workflow.id}?workspace=${encodeURIComponent(workflow.workspace)}`, {
       method: "DELETE",
     }),
   executeWorkflow: (workflow: WorkflowRecord) =>
-    request<WorkflowRecord>(`/api/workflows/${workflow.id}/execute?workspace=${encodeURIComponent(workflow.workspace)}`, {
+    request<WorkflowRecord>(`/api/task-boards/${workflow.id}/execute?workspace=${encodeURIComponent(workflow.workspace)}`, {
       method: "POST",
     }),
   pauseWorkflow: (workflow: WorkflowRecord) =>
-    request<WorkflowRecord>(`/api/workflows/${workflow.id}/pause?workspace=${encodeURIComponent(workflow.workspace)}`, {
+    request<WorkflowRecord>(`/api/task-boards/${workflow.id}/pause?workspace=${encodeURIComponent(workflow.workspace)}`, {
       method: "POST",
     }),
   resumeWorkflow: (workflow: WorkflowRecord) =>
-    request<WorkflowRecord>(`/api/workflows/${workflow.id}/resume?workspace=${encodeURIComponent(workflow.workspace)}`, {
+    request<WorkflowRecord>(`/api/task-boards/${workflow.id}/resume?workspace=${encodeURIComponent(workflow.workspace)}`, {
       method: "POST",
     }),
   cancelWorkflow: (workflow: WorkflowRecord) =>
-    request<WorkflowRecord>(`/api/workflows/${workflow.id}/cancel?workspace=${encodeURIComponent(workflow.workspace)}`, {
+    request<WorkflowRecord>(`/api/task-boards/${workflow.id}/cancel?workspace=${encodeURIComponent(workflow.workspace)}`, {
       method: "POST",
     }),
   approveWorkflowNode: (workflow: WorkflowRecord, nodeId: string) =>

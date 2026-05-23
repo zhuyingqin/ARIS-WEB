@@ -79,8 +79,10 @@ from app.workflow_storage import get_workflow, list_planner_decisions, list_work
 from app.workflows import (  # noqa: E402
     NodeRunResult,
     WorkflowManager,
+    allowed_tools_for_role,
     build_workflow_generation_prompt,
     build_workflow_refinement_prompt,
+    default_skill_for_node,
     expand_replayed_workflow_event,
     missing_concrete_outputs,
     normalize_workflow_graph,
@@ -125,6 +127,28 @@ def test_scan_skills_includes_nested_package_ids(tmp_path: Path) -> None:
     assert {skill.id for skill in skills} == {"alpha", "skills-codex/beta"}
     beta = next(skill for skill in skills if skill.id == "skills-codex/beta")
     assert beta.package == "skills-codex"
+
+
+def test_bundled_openalex_search_skill_is_available() -> None:
+    skills = scan_skills()
+    ids = {skill.id for skill in skills}
+
+    assert "openalex" in ids
+    assert "openalex-search" in ids
+    openalex_search = next(skill for skill in skills if skill.id == "openalex-search")
+    assert "OpenAlex" in openalex_search.description
+
+
+def test_openalex_nodes_default_to_openalex_search_skill() -> None:
+    node = WorkflowNode(
+        id="oa",
+        type="sub_agent",
+        name="OpenAlex metadata export",
+        task_type="research",
+        objective="Search OpenAlex and export bibliographic metadata",
+    )
+
+    assert default_skill_for_node(node, {"research-lit", "openalex-search"}) == "openalex-search"
 
 
 def test_workspace_store_allowlist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -258,6 +282,10 @@ def test_team_config_storage_roundtrip_update_delete(tmp_path: Path) -> None:
     assert saved.id == "review-team"
     assert saved.path == ".aris/web/team-configs/review-team.json"
     assert [role.id for role in saved.roles] == ["planner", "reviewer"]
+    assert saved.roles[0].kind == "planner"
+    assert saved.roles[1].kind == "reviewer"
+    assert saved.roles[0].can_call_planner is False
+    assert saved.roles[1].can_ask_questions is True
     assert saved.default_edges[0].source == "planner"
     assert get_team_config(tmp_path, saved.path) is not None
     assert list_team_configs(tmp_path)[0].name == "Review Team"
@@ -670,6 +698,8 @@ def test_team_config_api_create_expand_and_execute(tmp_path: Path) -> None:
     assert nodes["team-one-executor"]["depends_on"] == ["team-one-planner"]
     assert "team-one-executor" in nodes["finish"]["depends_on"]
     assert nodes["team-one-planner"]["team_id"] == "triad"
+    assert nodes["team-one-planner"]["team_role_kind"] == "planner"
+    assert nodes["team-one-executor"]["can_call_planner"] is False
 
     execute_response = client.post(f"/api/workflows/{workflow['id']}/execute?workspace={workspace}")
     assert execute_response.status_code == 200
@@ -692,6 +722,68 @@ def test_team_config_api_create_expand_and_execute(tmp_path: Path) -> None:
     run_ids = {node.id: node.run_id for node in current.graph_json.nodes}
     assert run_ids["team-one-planner"] == "run-team-one-planner"
     assert run_ids["team-one-executor"] == "run-team-one-executor"
+
+
+def test_task_board_api_aliases_expose_tasks_claim_and_review(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    from app import main
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    main.workspace_store = WorkspaceStore(home=tmp_path / "home", default_workspace=workspace)
+    main.workflow_manager = WorkflowManager(main.run_manager)
+    client = TestClient(main.app)
+
+    created = client.post(
+        "/api/task-boards",
+        json={
+            "workspace": str(workspace),
+            "title": "Board",
+            "goal": "Initial goal",
+            "graph_json": {
+                "nodes": [
+                    {
+                        "id": "plan",
+                        "name": "Plan",
+                        "type": "agent",
+                        "task_type": "planning",
+                        "objective": "Decompose the goal",
+                        "acceptance_criteria": ["inputs, outputs, dependencies, and checks are explicit"],
+                        "assignee_role": "manager",
+                        "priority": 1,
+                    }
+                ],
+                "edges": [],
+            },
+        },
+    )
+    assert created.status_code == 200
+    board = created.json()
+
+    view = client.get(f"/api/task-boards/{board['id']}/task-board?workspace={workspace}")
+    assert view.status_code == 200
+    body = view.json()
+    assert body["id"] == board["id"]
+    assert body["tasks"][0]["id"] == "plan"
+    assert body["tasks"][0]["column"] == "ready"
+    assert body["tasks"][0]["acceptance_criteria"] == ["inputs, outputs, dependencies, and checks are explicit"]
+
+    claimed = client.post(
+        f"/api/task-boards/{board['id']}/tasks/plan/claim?workspace={workspace}",
+        json={"agent_id": "planner-agent", "role": "manager"},
+    )
+    assert claimed.status_code == 200
+    assert claimed.json()["graph_json"]["nodes"][0]["claimed_by"] == "planner-agent"
+
+    reviewed = client.post(
+        f"/api/task-boards/{board['id']}/tasks/plan/review?workspace={workspace}",
+        json={"review_status": "rework", "notes": "Add concrete artifact paths"},
+    )
+    assert reviewed.status_code == 200
+    node = reviewed.json()["graph_json"]["nodes"][0]
+    assert node["review_status"] == "rework"
+    assert node["error"] == "Add concrete artifact paths"
 
 
 def test_global_settings_api_never_returns_plain_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -801,7 +893,7 @@ def test_workflow_generation_prompt_keeps_agent_overrides_hidden() -> None:
     schema = prompt.split("The DAG must be acyclic.", 1)[0]
 
     assert '"schema_version": 2' in prompt
-    assert '"type": "agent|sub_agent|human_gate"' in prompt
+    assert '"type": "input|agent|sub_agent|human_gate"' in prompt
     assert "type=\"agent\"" in prompt
     assert "type=\"sub_agent\"" in prompt
     assert "type=\"human_gate\"" in prompt
@@ -841,9 +933,229 @@ def test_node_prompt_includes_downstream_fanout_output_contract(tmp_path: Path) 
     prompt = manager._build_node_prompt(tmp_path, workflow, graph.nodes[0])
 
     assert "Downstream fan-out requirements:" in prompt
+    assert "Team protocol:" in prompt
+    assert "can_call_planner=false" in prompt
     assert "ARIS_SUBAGENT_DIR/keyword_groups.json" in prompt
     assert "keyword_groups" in prompt
     assert "resolve to a non-empty array" in prompt
+
+
+def test_planner_node_prompt_is_control_plane_only(tmp_path: Path) -> None:
+    manager = WorkflowManager(type("R", (), {})())
+    graph = WorkflowGraph(
+        nodes=[
+            WorkflowNode(
+                id="worker",
+                name="Worker",
+                type="sub_agent",
+                status="succeeded",
+                run_id="run-worker",
+                outputs=["WORKER.md"],
+                approved_after=True,
+            ),
+            WorkflowNode(
+                id="planner",
+                name="Planner",
+                type="agent",
+                role="planner",
+                team_role_kind="planner",
+                depends_on=["worker"],
+                skill="paper-plan",
+                outputs=["PLAN.md"],
+            ),
+        ]
+    )
+    workflow = WorkflowRecord(
+        id="wf",
+        workspace=str(tmp_path),
+        title="Control",
+        goal="Plan only from chat",
+        status="draft",
+        graph_json=graph,
+        created_at=utc_now(),
+        updated_at=utc_now(),
+    )
+    message_path = last_message_path(tmp_path, "run-worker")
+    message_path.parent.mkdir(parents=True, exist_ok=True)
+    message_path.write_text("Worker summary: artifact is ready.", encoding="utf-8")
+    artifact_path = tmp_path / ".aris" / "web" / "workflows" / "wf" / "nodes" / "worker" / "attempt-1" / "WORKER.md"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text("RAW_FULL_TEXT_SHOULD_NOT_REACH_PLANNER", encoding="utf-8")
+
+    prompt = manager._build_node_prompt(tmp_path, workflow, graph.nodes[1])
+
+    assert "Planner control-plane rules:" in prompt
+    assert "Do not use read/glob/grep/WebSearch/WebFetch/Skill" in prompt
+    assert "Worker summary: artifact is ready." in prompt
+    assert "RAW_FULL_TEXT_SHOULD_NOT_REACH_PLANNER" not in prompt
+    assert "Suggested skill label: (none)" in prompt
+
+
+def test_local_worker_question_routes_to_employee(tmp_path: Path) -> None:
+    manager = WorkflowManager(type("R", (), {})())
+
+    async def run() -> None:
+        workflow = await manager.create(
+            tmp_path,
+            "Questions",
+            "Goal",
+            WorkflowGraph(
+                nodes=[
+                    WorkflowNode(
+                        id="planner",
+                        name="Planner",
+                        type="agent",
+                        role="planner",
+                        team_role_kind="planner",
+                        can_ask_questions=True,
+                        status="waiting_approval",
+                        run_id="run-planner",
+                    )
+                ]
+            ),
+        )
+        message_path = last_message_path(tmp_path, "run-planner")
+        message_path.parent.mkdir(parents=True, exist_ok=True)
+        message_path.write_text(
+            "[ASK_WORKER: writer | summarize artifact .aris/path/CLAIMS.md into 3 claims]",
+            encoding="utf-8",
+        )
+        decision = manager._local_worker_question_decision(tmp_path, workflow)
+        assert decision is not None
+        add = next(delta for delta in decision.deltas if delta.action == "add_node")
+        block = next(delta for delta in decision.deltas if delta.action == "block_node")
+        assert add.node is not None
+        assert add.node.team_role_kind == "writer"
+        assert add.node.skill == "paper-write"
+        assert add.node.can_ask_questions is False
+        assert block.node_id == "planner"
+        assert block.wait_for == [add.node.id]
+
+    asyncio.run(run())
+
+
+def test_local_gap_detector_splits_multiple_literature_markers(tmp_path: Path) -> None:
+    manager = WorkflowManager(type("R", (), {})())
+
+    async def run() -> None:
+        workflow = await manager.create(
+            tmp_path,
+            "Split gaps",
+            "Goal",
+            WorkflowGraph(
+                nodes=[
+                    WorkflowNode(
+                        id="caller",
+                        name="Caller",
+                        type="sub_agent",
+                        outputs=["CALLER.md"],
+                        status="waiting_approval",
+                        run_id="run-caller",
+                    )
+                ]
+            ),
+        )
+        artifact = tmp_path / ".aris" / "web" / "workflows" / workflow.id / "nodes" / "caller" / "attempt-1" / "CALLER.md"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(
+            "[LITERATURE_NEEDED: Bayesian neural network posterior contraction]\n"
+            "[LITERATURE_NEEDED: PAC-Bayes generalization bounds neural networks]",
+            encoding="utf-8",
+        )
+        decision = manager._local_literature_gap_decision(tmp_path, workflow)
+        assert decision is not None
+        add_deltas = [delta for delta in decision.deltas if delta.action == "add_node"]
+        add_nodes = [delta.node for delta in add_deltas]
+        block = next(delta for delta in decision.deltas if delta.action == "block_node")
+        assert len(add_nodes) == 2
+        assert {delta.research_request["query"] for delta in add_deltas if delta.research_request} == {
+            "Bayesian neural network posterior contraction",
+            "PAC-Bayes generalization bounds neural networks",
+        }
+        assert sorted(block.wait_for) == sorted(node.id for node in add_nodes if node)
+
+    asyncio.run(run())
+
+
+def test_local_gap_detector_skips_capped_caller_and_routes_later_gaps(tmp_path: Path) -> None:
+    manager = WorkflowManager(type("R", (), {})())
+
+    async def run() -> None:
+        existing_lit = [
+            WorkflowNode(
+                id=f"lit-intro-{idx}",
+                name=f"Intro literature {idx}",
+                type="sub_agent",
+                skill="research-lit",
+                dynamic_parent_id="intro-planner",
+                status="succeeded",
+                run_id=f"run-lit-{idx}",
+            )
+            for idx in range(3)
+        ]
+        workflow = await manager.create(
+            tmp_path,
+            "Skip capped caller",
+            "Goal",
+            WorkflowGraph(
+                nodes=[
+                    WorkflowNode(
+                        id="intro-planner",
+                        name="Planner",
+                        type="agent",
+                        status="succeeded",
+                        run_id="run-planner",
+                        approved_after=True,
+                        auto_approve_after=True,
+                        outputs=["INTRO_PLAN.md"],
+                    ),
+                    *existing_lit,
+                    WorkflowNode(
+                        id="review-introduction",
+                        name="Reviewer",
+                        type="sub_agent",
+                        team_role_kind="reviewer",
+                        status="succeeded",
+                        run_id="run-review",
+                        approved_after=True,
+                        auto_approve_after=True,
+                        outputs=["INTRO_REVIEW.md"],
+                    ),
+                ]
+            ),
+        )
+        planner_artifact = tmp_path / ".aris" / "web" / "workflows" / workflow.id / "nodes" / "intro-planner" / "attempt-1" / "INTRO_PLAN.md"
+        planner_artifact.parent.mkdir(parents=True, exist_ok=True)
+        planner_artifact.write_text("[LITERATURE_NEEDED: old capped planner query]", encoding="utf-8")
+        review_artifact = tmp_path / ".aris" / "web" / "workflows" / workflow.id / "nodes" / "review-introduction" / "attempt-1" / "INTRO_REVIEW.md"
+        review_artifact.parent.mkdir(parents=True, exist_ok=True)
+        review_artifact.write_text("[LITERATURE_NEEDED: reviewer routed citation query]", encoding="utf-8")
+
+        decision = manager._local_literature_gap_decision(tmp_path, workflow)
+        assert decision is not None
+        add = next(delta for delta in decision.deltas if delta.action == "add_node")
+        assert add.node is not None
+        assert add.node.dynamic_parent_id == "review-introduction"
+        assert add.research_request is not None
+        assert add.research_request["query"] == "reviewer routed citation query"
+
+    asyncio.run(run())
+
+
+def test_role_tool_contract_blocks_writer_web_search() -> None:
+    writer_tools = allowed_tools_for_role("writer", "paper-write")
+    reviewer_tools = allowed_tools_for_role("reviewer", "research-review")
+    literature_tools = allowed_tools_for_role("literature", "research-lit")
+
+    assert writer_tools is not None
+    assert reviewer_tools is not None
+    assert literature_tools is not None
+    assert "WebSearch" not in writer_tools
+    assert "WebFetch" not in writer_tools
+    assert "WebSearch" not in reviewer_tools
+    assert "WebFetch" not in reviewer_tools
+    assert "WebSearch" in literature_tools
+    assert "WebFetch" in literature_tools
 
 
 def test_workflow_refinement_prompt_includes_current_graph_without_runtime() -> None:
@@ -937,21 +1249,31 @@ def test_paper_introduction_template_graph_targets_intro_writing() -> None:
     )
 
     assert [node.id for node in graph.nodes] == [
-        "intro-context",
-        "literature-positioning",
-        "intro-outline",
+        "intro-planner",
         "draft-introduction",
         "review-introduction",
         "revise-introduction",
+        "final-review-introduction",
         "approve-introduction",
     ]
     assert graph.nodes[-1].type == "human_gate"
     assert graph.nodes[0].type == "agent"
     assert graph.nodes[1].type == "sub_agent"
-    assert graph.nodes[2].type == "agent"
-    assert graph.nodes[3].type == "sub_agent"
-    assert graph.nodes[-1].depends_on == ["revise-introduction"]
-    assert {edge.target for edge in graph.edges} >= {"draft-introduction", "review-introduction", "approve-introduction"}
+    assert graph.nodes[2].type == "sub_agent"
+    assert graph.nodes[0].role == "planner"
+    assert graph.nodes[1].role == "writer"
+    assert graph.nodes[2].role == "reviewer"
+    assert graph.nodes[3].role == "writer"
+    assert graph.nodes[4].role == "reviewer"
+    assert graph.nodes[0].skill is None
+    assert "ASK_WORKER" in graph.nodes[0].prompt
+    assert "LITERATURE_NEEDED" in graph.nodes[0].prompt
+    assert "ASK_WORKER" in graph.nodes[2].prompt
+    assert "ASK_WORKER" in graph.nodes[4].prompt
+    assert "Do not use WebSearch/WebFetch" in graph.nodes[3].prompt
+    assert "literature-positioning" not in {node.id for node in graph.nodes}
+    assert graph.nodes[-1].depends_on == ["final-review-introduction"]
+    assert {edge.target for edge in graph.edges} >= {"draft-introduction", "review-introduction", "final-review-introduction", "approve-introduction"}
 
 
 def test_paper_introduction_template_can_insert_dynamic_literature(tmp_path: Path) -> None:
@@ -987,43 +1309,43 @@ def test_paper_introduction_template_can_insert_dynamic_literature(tmp_path: Pat
 
     async def fake_planner(workspace: Path, record: WorkflowRecord, trigger: str):
         nodes = {node.id: node for node in record.graph_json.nodes}
-        if "lit-intro-outline-citation-gap" in nodes:
+        if "lit-intro-planner-citation-gap" in nodes:
             return None
-        outline = nodes.get("intro-outline")
-        if outline and outline.status == "waiting_approval":
+        planner = nodes.get("intro-planner")
+        if planner and planner.status == "waiting_approval":
             return {
                 "decision_type": "mutate",
-                "rationale": "intro-outline marked a citation gap and needs fresh literature before drafting",
+                "rationale": "intro-planner marked a citation gap and needs fresh literature before drafting",
                 "gap_type": "citation_gap",
-                "gap_evidence_refs": ["artifact:.aris/web/workflows/intro-outline/INTRO_OUTLINE.md"],
-                "affected_session_ids": ["node:test:intro-outline"],
-                "blocked_node_ids": ["intro-outline"],
+                "gap_evidence_refs": ["artifact:.aris/web/workflows/intro-planner/INTRO_PLAN.md"],
+                "affected_session_ids": ["node:test:intro-planner"],
+                "blocked_node_ids": ["intro-planner"],
                 "expected_artifacts": ["literature_result.json"],
-                "resume_plan": "Resume intro-outline in the same session with the new citation findings.",
+                "resume_plan": "Resume intro-planner in the same session with the new citation findings.",
                 "deltas": [
                     {
                         "action": "add_node",
                         "node": {
-                            "id": "lit-intro-outline-citation-gap",
+                            "id": "lit-intro-planner-citation-gap",
                             "name": "Literature: introduction citation gap",
                             "type": "sub_agent",
                             "skill": "research-lit",
-                            "dynamic_parent_id": "intro-outline",
+                            "dynamic_parent_id": "intro-planner",
                         },
                         "research_request": {
                             "query": "dynamic DAG citation needs for workflow orchestration",
-                            "caller_id": "intro-outline",
+                            "caller_id": "intro-planner",
                         },
                         "gap_type": "citation_gap",
-                        "gap_evidence_refs": ["artifact:.aris/web/workflows/intro-outline/INTRO_OUTLINE.md"],
+                        "gap_evidence_refs": ["artifact:.aris/web/workflows/intro-planner/INTRO_PLAN.md"],
                         "expected_artifacts": ["literature_result.json"],
                     },
                     {
                         "action": "block_node",
-                        "node_id": "intro-outline",
-                        "wait_for": ["lit-intro-outline-citation-gap"],
+                        "node_id": "intro-planner",
+                        "wait_for": ["lit-intro-planner-citation-gap"],
                         "reason": "waiting for literature",
-                        "resume_plan": "Resume intro-outline after lit-intro-outline-citation-gap succeeds.",
+                        "resume_plan": "Resume intro-planner after lit-intro-planner-citation-gap succeeds.",
                     },
                 ],
             }
@@ -1051,37 +1373,183 @@ def test_paper_introduction_template_can_insert_dynamic_literature(tmp_path: Pat
         workflow = await manager.create(tmp_path, "Introduction dynamic DAG", "Goal", graph)
         await manager.execute(tmp_path, workflow.id)
 
-        await wait_until(lambda current: {node.id: node for node in current.graph_json.nodes}["intro-context"].status == "waiting_approval")
-        await manager.approve_batch(tmp_path, workflow.id)
-        await wait_until(lambda current: {node.id: node for node in current.graph_json.nodes}["literature-positioning"].status == "waiting_approval")
-        await manager.approve_batch(tmp_path, workflow.id)
-
         current = await wait_until(
             lambda current: (
-                "lit-intro-outline-citation-gap" in {node.id: node for node in current.graph_json.nodes}
-                and {node.id: node for node in current.graph_json.nodes}["lit-intro-outline-citation-gap"].status == "succeeded"
-                and {node.id: node for node in current.graph_json.nodes}["intro-outline"].status == "waiting_approval"
-                and calls.count("intro-outline") == 2
+                "lit-intro-planner-citation-gap" in {node.id: node for node in current.graph_json.nodes}
+                and {node.id: node for node in current.graph_json.nodes}["lit-intro-planner-citation-gap"].status == "succeeded"
+                and {node.id: node for node in current.graph_json.nodes}["intro-planner"].status == "waiting_approval"
+                and calls.count("intro-planner") == 2
             )
         )
         nodes = {node.id: node for node in current.graph_json.nodes}
-        dynamic_lit = nodes["lit-intro-outline-citation-gap"]
-        outline = nodes["intro-outline"]
+        dynamic_lit = nodes["lit-intro-planner-citation-gap"]
+        planner = nodes["intro-planner"]
 
-        assert nodes["literature-positioning"].dynamic_parent_id is None
         assert dynamic_lit.skill == "research-lit"
-        assert dynamic_lit.dynamic_parent_id == "intro-outline"
+        assert dynamic_lit.dynamic_parent_id == "intro-planner"
         assert dynamic_lit.auto_approve_after is True
         assert dynamic_lit.approved_after is True
         assert dynamic_lit.status == "succeeded"
-        assert dynamic_lit.id in outline.depends_on
-        assert outline.session_path is not None
-        assert calls.count("intro-outline") == 2
+        assert dynamic_lit.id in planner.depends_on
+        assert planner.session_path is not None
+        assert calls.count("intro-planner") == 2
         assert "draft-introduction" not in calls
-        assert any(edge.source == dynamic_lit.id and edge.target == "intro-outline" for edge in current.graph_json.edges)
+        assert any(edge.source == dynamic_lit.id and edge.target == "intro-planner" for edge in current.graph_json.edges)
         assert (tmp_path / "research-wiki" / "query_pack.md").exists()
 
     workflow: WorkflowRecord
+    asyncio.run(run())
+
+
+def test_local_gap_detector_inserts_literature_without_external_planner(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    def write_output(workspace: Path, record: WorkflowRecord, node: WorkflowNode, text: str | dict) -> None:
+        output_name = "literature_result.json" if node.skill == "research-lit" else "CALLER.md"
+        path = workspace / ".aris" / "web" / "workflows" / record.id / "nodes" / node.id / "attempt-1" / output_name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(text, dict):
+            path.write_text(json.dumps(text), encoding="utf-8")
+        else:
+            path.write_text(text, encoding="utf-8")
+
+    async def fake_runner(workspace: Path, record: WorkflowRecord, node: WorkflowNode) -> NodeRunResult:
+        calls.append(node.id)
+        if node.skill == "research-lit":
+            write_output(
+                workspace,
+                record,
+                node,
+                {
+                    "query": "dynamic role literature dependencies",
+                    "papers": [{"title": "Dynamic evidence dependency orchestration", "year": 2026}],
+                    "findings": ["Roles can request literature only when their task needs it."],
+                    "gaps": [],
+                    "sources": ["https://example.test/paper"],
+                },
+            )
+        elif node.id == "caller" and calls.count("caller") == 1:
+            write_output(
+                workspace,
+                record,
+                node,
+                "# Caller\n[LITERATURE_NEEDED: dynamic role literature dependencies]\nDo not draft until this is searched.\n",
+            )
+        elif node.id == "caller":
+            write_output(workspace, record, node, "# Caller\nLiterature request resolved.\n")
+        return NodeRunResult(run_id=f"run-{node.id}-{calls.count(node.id)}", succeeded=True, message="ok")
+
+    manager = WorkflowManager(type("R", (), {})(), node_runner=fake_runner)
+    graph = WorkflowGraph(
+        nodes=[
+            WorkflowNode(
+                id="caller",
+                name="Caller",
+                type="sub_agent",
+                skill="paper-plan",
+                outputs=["CALLER.md"],
+            ),
+            WorkflowNode(id="downstream", name="Downstream", type="sub_agent", depends_on=["caller"]),
+        ]
+    )
+
+    async def run() -> None:
+        workflow = await manager.create(tmp_path, "Local dynamic literature", "Goal", graph)
+        await manager.execute(tmp_path, workflow.id)
+        for _ in range(120):
+            current = get_workflow(tmp_path, workflow.id)
+            if current:
+                nodes = {node.id: node for node in current.graph_json.nodes}
+                lit_nodes = [node for node in current.graph_json.nodes if node.dynamic_parent_id == "caller"]
+                if (
+                    lit_nodes
+                    and lit_nodes[0].status == "succeeded"
+                    and nodes["caller"].status == "waiting_approval"
+                    and calls.count("caller") == 2
+                ):
+                    break
+            await asyncio.sleep(0.05)
+
+        current = get_workflow(tmp_path, workflow.id)
+        assert current is not None
+        nodes = {node.id: node for node in current.graph_json.nodes}
+        lit_nodes = [node for node in current.graph_json.nodes if node.dynamic_parent_id == "caller"]
+        assert len(lit_nodes) == 1
+        dynamic_lit = lit_nodes[0]
+        assert dynamic_lit.skill == "research-lit"
+        assert dynamic_lit.auto_approve_after is True
+        assert dynamic_lit.id in nodes["caller"].depends_on
+        assert calls.count("caller") == 2
+        assert dynamic_lit.id in calls
+        assert "downstream" not in calls
+        assert list_planner_decisions(tmp_path, workflow.id)[-1].rationale.startswith("Caller declared")
+        assert (tmp_path / "research-wiki" / "query_pack.md").exists()
+
+    asyncio.run(run())
+
+
+def test_local_gap_detector_blocks_auto_approved_task_board_runs(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    def write_output(workspace: Path, record: WorkflowRecord, node: WorkflowNode, text: str | dict) -> None:
+        output_name = "literature_result.json" if node.skill == "research-lit" else "CALLER.md"
+        path = workspace / ".aris" / "web" / "workflows" / record.id / "nodes" / node.id / "attempt-1" / output_name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(text, dict):
+            path.write_text(json.dumps(text), encoding="utf-8")
+        else:
+            path.write_text(text, encoding="utf-8")
+
+    async def fake_runner(workspace: Path, record: WorkflowRecord, node: WorkflowNode) -> NodeRunResult:
+        calls.append(node.id)
+        if node.skill == "research-lit":
+            write_output(
+                workspace,
+                record,
+                node,
+                {
+                    "query": "auto approved task board literature dependency",
+                    "papers": [{"title": "On-demand literature dependencies", "year": 2026}],
+                    "findings": ["Task-board auto approval must still pause for declared literature gaps."],
+                    "gaps": [],
+                    "sources": [],
+                },
+            )
+        elif node.id == "caller" and calls.count("caller") == 1:
+            write_output(
+                workspace,
+                record,
+                node,
+                "# Caller\n[LITERATURE_NEEDED: auto approved task board literature dependency]\n",
+            )
+        elif node.id == "caller":
+            write_output(workspace, record, node, "# Caller\nReady after dynamic literature.\n")
+        return NodeRunResult(run_id=f"run-{node.id}-{calls.count(node.id)}", succeeded=True, message="ok")
+
+    manager = WorkflowManager(type("R", (), {})(), node_runner=fake_runner)
+    graph = WorkflowGraph(
+        nodes=[
+            WorkflowNode(id="caller", name="Caller", type="sub_agent", skill="paper-plan", outputs=["CALLER.md"]),
+            WorkflowNode(id="downstream", name="Downstream", type="sub_agent", depends_on=["caller"]),
+        ]
+    )
+
+    async def run() -> None:
+        workflow = await manager.create(tmp_path, "Auto approved dynamic literature", "Goal", graph)
+        await manager.execute(tmp_path, workflow.id, auto_approve_executable=True)
+        for _ in range(120):
+            if "downstream" in calls:
+                break
+            await asyncio.sleep(0.05)
+
+        current = get_workflow(tmp_path, workflow.id)
+        assert current is not None
+        lit_nodes = [node for node in current.graph_json.nodes if node.dynamic_parent_id == "caller"]
+        assert len(lit_nodes) == 1
+        dynamic_lit = lit_nodes[0]
+        assert dynamic_lit.status == "succeeded"
+        assert calls[:4] == ["caller", dynamic_lit.id, "caller", "downstream"]
+
     asyncio.run(run())
 
 
@@ -1493,6 +1961,39 @@ def test_run_manager_handles_large_stdout_lines(tmp_path: Path) -> None:
         assert record is not None
         assert record.status == "succeeded"
         assert any(event.stream == "stdout" and len(event.message) == 70000 for event in events)
+
+    asyncio.run(run())
+
+
+def test_run_manager_suppresses_provider_selection_stderr(tmp_path: Path) -> None:
+    manager = RunManager()
+    run_id = "provider-noise"
+    insert_run(
+        RunRecord(
+            id=run_id,
+            workspace=str(tmp_path),
+            skill="smoke",
+            status="queued",
+            created_at=utc_now(),
+            updated_at=utc_now(),
+            command=[],
+        )
+    )
+
+    async def run() -> None:
+        script = (
+            "import sys; "
+            "print('DeepSeek not selected: provider=Some(\"anthropic\")', file=sys.stderr); "
+            "print('DeepSeek config not found, EXECUTOR_PROVIDER=anthropic', file=sys.stderr); "
+            "print('Using Anthropic executor', file=sys.stderr); "
+            "print('ok')"
+        )
+        await manager._run_process(run_id, tmp_path, [sys.executable, "-c", script])
+        events = await manager.replay_events(tmp_path, run_id)
+        messages = [event.message for event in events]
+        assert "ok" in messages
+        assert not any("DeepSeek not selected" in message for message in messages)
+        assert not any("Using Anthropic executor" in message for message in messages)
 
     asyncio.run(run())
 
@@ -2797,3 +3298,150 @@ def test_workflow_api_create_execute_and_stream(tmp_path: Path) -> None:
     with client.websocket_connect(f"/api/workflows/{workflow['id']}/stream?workspace={workspace}") as websocket:
         first = websocket.receive_json()
         assert first["workflow_id"] == workflow["id"]
+
+
+def test_task_board_execute_auto_approves_executable_nodes(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    from app import main
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    calls: list[str] = []
+
+    async def fake_runner(workspace: Path, record, node) -> NodeRunResult:
+        calls.append(node.id)
+        return NodeRunResult(run_id=f"run-{node.id}", succeeded=True)
+
+    main.workspace_store = WorkspaceStore(home=tmp_path / "home", default_workspace=workspace)
+    main.run_manager = RunManager()
+    main.workflow_manager = WorkflowManager(main.run_manager, node_runner=fake_runner)
+    client = TestClient(main.app)
+
+    create_response = client.post(
+        "/api/task-boards",
+        json={
+            "workspace": str(workspace),
+            "title": "Auto board",
+            "goal": "Run roles",
+            "graph_json": {
+                "schema_version": 2,
+                "nodes": [
+                    {"id": "plan", "name": "Plan", "type": "agent"},
+                    {"id": "write", "name": "Write", "type": "sub_agent", "depends_on": ["plan"]},
+                ],
+                "edges": [{"id": "plan->write", "source": "plan", "target": "write"}],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    workflow = create_response.json()
+
+    execute_response = client.post(f"/api/task-boards/{workflow['id']}/execute?workspace={workspace}")
+    assert execute_response.status_code == 200
+
+    for _ in range(60):
+        current = get_workflow(workspace, workflow["id"])
+        if current and current.status == "succeeded":
+            break
+        time.sleep(0.05)
+
+    current = get_workflow(workspace, workflow["id"])
+    assert current is not None
+    assert current.status == "succeeded"
+    assert calls == ["plan", "write"]
+    assert all(node.auto_approve_after for node in current.graph_json.nodes)
+    assert all(node.retry and node.retry.max_attempts == 3 for node in current.graph_json.nodes)
+    assert all(node.approved_after for node in current.graph_json.nodes)
+
+
+def test_node_run_archives_declared_root_outputs(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    from app import main
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    async def fake_runner(workspace: Path, record, node) -> NodeRunResult:
+        (workspace / "artifact.json").write_text('{"ok": true}', encoding="utf-8")
+        return NodeRunResult(run_id=f"run-{node.id}", succeeded=True)
+
+    main.workspace_store = WorkspaceStore(home=tmp_path / "home", default_workspace=workspace)
+    main.run_manager = RunManager()
+    main.workflow_manager = WorkflowManager(main.run_manager, node_runner=fake_runner)
+    client = TestClient(main.app)
+
+    create_response = client.post(
+        "/api/task-boards",
+        json={
+            "workspace": str(workspace),
+            "title": "Output board",
+            "goal": "Archive declared output",
+            "graph_json": {
+                "schema_version": 2,
+                "nodes": [
+                    {
+                        "id": "research",
+                        "name": "Research",
+                        "type": "sub_agent",
+                        "outputs": [{"name": "artifact.json", "type": "file"}],
+                    }
+                ],
+                "edges": [],
+            },
+        },
+    )
+    assert create_response.status_code == 200
+    workflow = create_response.json()
+
+    execute_response = client.post(f"/api/task-boards/{workflow['id']}/execute?workspace={workspace}")
+    assert execute_response.status_code == 200
+
+    for _ in range(60):
+        current = get_workflow(workspace, workflow["id"])
+        if current and current.status == "succeeded":
+            break
+        time.sleep(0.05)
+
+    expected = workspace / ".aris" / "web" / "workflows" / workflow["id"] / "nodes" / "research" / "attempt-1" / "artifact.json"
+    assert expected.exists()
+    assert not (workspace / "artifact.json").exists()
+    artifact_response = client.get(f"/api/task-boards/{workflow['id']}/runtime?workspace={workspace}")
+    assert artifact_response.status_code == 200
+    paths = {item["path"] for item in artifact_response.json()["artifact_index"]}
+    assert expected.relative_to(workspace).as_posix() in paths
+
+
+def test_runtime_artifact_index_is_scoped_to_current_workflow(tmp_path: Path) -> None:
+    manager = WorkflowManager(type("R", (), {})())
+
+    async def run() -> None:
+        workflow = await manager.create(
+            tmp_path,
+            "Scoped artifacts",
+            "Goal",
+            WorkflowGraph(
+                nodes=[
+                    WorkflowNode(id="a", name="A", outputs=["report.md"]),
+                ],
+            ),
+        )
+        noisy = tmp_path / "target" / "debug"
+        noisy.mkdir(parents=True)
+        (noisy / "build.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "workspace-note.md").write_text("outside workflow", encoding="utf-8")
+        node_dir = tmp_path / ".aris" / "web" / "workflows" / workflow.id / "nodes" / "a" / "attempt-1"
+        node_dir.mkdir(parents=True)
+        (node_dir / "report.md").write_text("node report", encoding="utf-8")
+        (node_dir.parent / "session.json").write_text("{}", encoding="utf-8")
+
+        runtime = manager.runtime(tmp_path, workflow.id)
+        paths = {artifact.path for artifact in runtime.artifact_index}
+
+        assert f".aris/web/workflows/{workflow.id}/nodes/a/attempt-1/report.md" in paths
+        assert "workspace-note.md" not in paths
+        assert "target/debug/build.json" not in paths
+        assert all(path.startswith(f".aris/web/workflows/{workflow.id}/nodes/") for path in paths)
+
+    asyncio.run(run())

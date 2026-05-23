@@ -7,6 +7,7 @@ from typing import Any
 from .agent_configs import dump_model, dump_updates, relative_config_path, slugify
 from .models import TeamConfig, TeamConfigRequest, TeamEdge, TeamRoleSpec, UpdateTeamConfigRequest
 from .storage import utc_now, web_dir
+from .team_protocol import normalize_role_protocol
 
 
 def team_configs_dir(workspace: Path) -> Path:
@@ -36,9 +37,19 @@ def _normalize_roles(roles: list[TeamRoleSpec]) -> list[TeamRoleSpec]:
     normalized: list[TeamRoleSpec] = []
     for role in roles:
         role_id = slugify(role.id)
+        protocol = normalize_role_protocol(
+            role,
+            id_text=role_id,
+            name=role.name,
+            role=role.role,
+            prompt=role.prompt,
+            skill=role.skill,
+            kind_field="kind",
+        )
+        update = {"id": role_id, **protocol}
         normalized.append(
-            role.model_copy(update={"id": role_id}) if hasattr(role, "model_copy")
-            else role.copy(update={"id": role_id})
+            role.model_copy(update=update) if hasattr(role, "model_copy")
+            else role.copy(update=update)
         )
     return normalized
 

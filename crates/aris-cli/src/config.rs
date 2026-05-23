@@ -142,7 +142,9 @@ impl ArisConfig {
 
         if let Some(provider) = &self.executor_provider {
             if provider == "openai" || provider == "custom" {
-                std::env::set_var("EXECUTOR_PROVIDER", "openai");
+                if force || std::env::var("EXECUTOR_PROVIDER").is_err() {
+                    std::env::set_var("EXECUTOR_PROVIDER", "openai");
+                }
             }
         }
 
@@ -960,6 +962,37 @@ mod tests {
         assert!(
             std::env::var("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS").is_err(),
             "expected CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS to be cleared too"
+        );
+    }
+
+    #[test]
+    fn saved_openai_config_does_not_override_explicit_executor_provider() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _snap = EnvSnapshot::capture(EXECUTOR_ENV_VARS);
+
+        std::env::set_var("EXECUTOR_PROVIDER", "anthropic");
+        std::env::set_var("ANTHROPIC_API_KEY", "web-minimax-key");
+        std::env::set_var("ANTHROPIC_BASE_URL", "https://api.minimaxi.com/anthropic");
+
+        let config = ArisConfig {
+            executor_provider: Some("openai".into()),
+            executor_api_key: Some("saved-openai-key".into()),
+            executor_base_url: Some("https://saved-openai.example/v1".into()),
+            ..Default::default()
+        };
+        config.apply_to_env();
+
+        assert_eq!(
+            std::env::var("EXECUTOR_PROVIDER").ok().as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            std::env::var("ANTHROPIC_API_KEY").ok().as_deref(),
+            Some("web-minimax-key")
+        );
+        assert_eq!(
+            std::env::var("ANTHROPIC_BASE_URL").ok().as_deref(),
+            Some("https://api.minimaxi.com/anthropic")
         );
     }
 }

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .agent_configs import get_agent_config
-from .artifacts import artifact_kind, list_artifacts
+from .artifacts import ARTIFACT_SUFFIXES, artifact_kind
 from .global_settings import (
     build_runtime_env,
     effective_effort_override,
@@ -36,7 +36,14 @@ from .models import (
     RuntimePolicy,
     RuntimeSummary,
     RunEvent,
+    RetryPolicy,
     SessionRuntimeView,
+    TaskBoardColumnSummary,
+    TaskBoardResponse,
+    TaskBoardTask,
+    TaskClaimRequest,
+    TaskReviewRequest,
+    TeamMessage,
     WorkflowHandoff,
     WorkflowEdge,
     WorkflowDelta,
@@ -47,6 +54,7 @@ from .models import (
     WorkflowRecord,
     WorkflowRuntimeResponse,
 )
+from .team_protocol import default_scope_for_kind, normalize_node_protocol, protocol_defaults
 from .pricing import (
     estimate_cost_usd,
     extract_usage_from_payload,
@@ -82,6 +90,23 @@ TERMINAL_NODE_STATUSES = {"succeeded", "skipped", "cancelled", "failed"}
 SUCCESS_NODE_STATUSES = {"succeeded", "skipped"}
 EXECUTABLE_NODE_TYPES = {"agent", "sub_agent"}
 HANDOFF_PREVIEW_CHARS = 900
+
+DEFAULT_SKILL_BY_TASK_TYPE = {
+    "goal": "paper-plan",
+    "planning": "paper-plan",
+    "research": "research-lit",
+    "analysis": "analyze-results",
+    "writing": "paper-write",
+    "review": "research-review",
+}
+
+DEFAULT_SKILL_BY_ROLE_HINT = [
+    (("planner", "planning", "plan", "outline"), "paper-plan"),
+    (("reviewer", "review", "critic", "审查", "审阅"), "research-review"),
+    (("writer", "writing", "draft", "author", "写作"), "paper-write"),
+    (("literature", "research", "search", "scout", "文献", "调研"), "research-lit"),
+    (("analysis", "analyzer", "分析"), "analyze-results"),
+]
 
 
 @dataclass
@@ -121,6 +146,25 @@ def _slug(value: str) -> str:
 def _safe_node_slug(value: object, fallback: str) -> str:
     slug = _slug(str(value))
     return slug[:42].strip("-") or fallback
+
+
+def default_skill_for_node(node: WorkflowNode, known_skills: set[str] | None = None) -> str | None:
+    if node.type not in EXECUTABLE_NODE_TYPES:
+        return None
+    if node.team_role_kind == "planner":
+        return None
+    haystack = f"{node.role} {node.assignee_role or ''} {node.name} {node.objective}".lower()
+    if re.search(r"\b(planner|manager)\b|规划员|计划员", haystack):
+        return None
+    if "openalex" in haystack and (known_skills is None or "openalex-search" in known_skills):
+        return "openalex-search"
+    candidate = DEFAULT_SKILL_BY_TASK_TYPE.get(node.task_type)
+    if candidate and (known_skills is None or candidate in known_skills):
+        return candidate
+    for hints, skill_id in DEFAULT_SKILL_BY_ROLE_HINT:
+        if any(hint in haystack for hint in hints) and (known_skills is None or skill_id in known_skills):
+            return skill_id
+    return None
 
 
 def workflow_event_type_for_run_stream(stream: str) -> str:
@@ -200,8 +244,58 @@ def workflow_output_relative_path(workspace: Path, workflow_id: str, node: Workf
         return output_path.as_posix()
 
 
+def reconcile_declared_outputs(workspace: Path, workflow_id: str, node: WorkflowNode, *, not_before: str | None = None) -> list[dict[str, str]]:
+    """Move declared outputs accidentally written at workspace root into the node attempt dir."""
+
+    moved: list[dict[str, str]] = []
+    workspace_root = workspace.resolve()
+    for output_path in concrete_output_paths(node.outputs):
+        if output_path.is_absolute() or (output_path.parts and output_path.parts[0] == ".aris"):
+            continue
+        expected = workflow_output_path(workspace, workflow_id, node, output_path).resolve()
+        fallback = (workspace / output_path).resolve()
+        if expected.exists() or not fallback.exists() or not fallback.is_file() or fallback == expected:
+            continue
+        if workspace_root not in [fallback, *fallback.parents] or workspace_root not in [expected, *expected.parents]:
+            continue
+        modified_at = time_from_stat(fallback.stat().st_mtime)
+        if not_before and modified_at < not_before:
+            continue
+        expected.parent.mkdir(parents=True, exist_ok=True)
+        fallback.replace(expected)
+        moved.append(
+            {
+                "from": fallback.relative_to(workspace_root).as_posix(),
+                "to": expected.relative_to(workspace_root).as_posix(),
+                "modified_at": modified_at,
+            }
+        )
+    return moved
+
+
 def workflow_node_session_path(workspace: Path, workflow_id: str, node_id: str) -> Path:
     return workspace / ".aris" / "web" / "workflows" / workflow_id / "nodes" / node_id / "session.json"
+
+
+def clear_workflow_node_sessions(workspace: Path, workflow_id: str, graph: WorkflowGraph) -> int:
+    workspace_root = workspace.resolve()
+    removed = 0
+    candidates: set[Path] = set()
+    for node in graph.nodes:
+        candidates.add(workflow_node_session_path(workspace, workflow_id, node.id))
+        if node.session_path:
+            session_path = Path(node.session_path)
+            candidates.add(session_path.resolve() if session_path.is_absolute() else (workspace / session_path).resolve())
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+            if workspace_root not in [resolved, *resolved.parents] or not resolved.exists() or not resolved.is_file():
+                continue
+            resolved.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def planner_session_path(workspace: Path, workflow_id: str) -> Path:
@@ -294,7 +388,7 @@ def compact_recent_artifact_pack(workspace: Path, workflow_id: str, *, limit: in
 
 
 def sync_literature_result_to_wiki(workspace: Path, workflow_id: str, node: WorkflowNode) -> None:
-    if node.skill != "research-lit":
+    if node.skill not in LITERATURE_SKILLS:
         return
     result_path = workflow_output_path(workspace, workflow_id, node, Path("literature_result.json"))
     if not result_path.exists():
@@ -350,13 +444,278 @@ def research_query_from_request(request: dict[str, Any] | None) -> str:
     return json.dumps(request, ensure_ascii=False, sort_keys=True)
 
 
+GAP_MARKER_RE = re.compile(
+    r"\[(?P<tag>LITERATURE_NEEDED|CITATION_NEEDED|EVIDENCE_NEEDED)\s*:?\s*(?P<body>[^\]\n]{0,240})\]",
+    re.IGNORECASE,
+)
+GAP_PHRASES = (
+    "literature needed",
+    "citation needed",
+    "evidence needed",
+    "citation gap",
+    "missing citation",
+    "missing citations",
+    "needs literature",
+    "needs citation",
+    "needs evidence",
+    "unsupported claim",
+    "unsupported claims",
+    "引用需要核实",
+    "需要文献",
+    "缺少引用",
+    "证据不足",
+)
+LITERATURE_SKILLS = {"research-lit", "openalex-search"}
+PLANNER_CONTROL_PLANE_TOOLS = [
+    "write",
+    "edit",
+    "TodoWrite",
+    "Sleep",
+    "SendUserMessage",
+    "Config",
+    "StructuredOutput",
+]
+ARTIFACT_WORKER_TOOLS = [
+    "read",
+    "write",
+    "edit",
+    "glob",
+    "grep",
+    "TodoWrite",
+    "Skill",
+    "Sleep",
+    "SendUserMessage",
+    "Config",
+    "StructuredOutput",
+]
+REVIEWER_TOOLS = [
+    "read",
+    "write",
+    "edit",
+    "glob",
+    "grep",
+    "TodoWrite",
+    "LlmReview",
+    "Skill",
+    "Sleep",
+    "SendUserMessage",
+    "Config",
+    "StructuredOutput",
+]
+LITERATURE_WORKER_TOOLS = [
+    "read",
+    "write",
+    "edit",
+    "glob",
+    "grep",
+    "WebFetch",
+    "WebSearch",
+    "TodoWrite",
+    "Skill",
+    "ToolSearch",
+    "Sleep",
+    "SendUserMessage",
+    "Config",
+    "StructuredOutput",
+]
+CLONE_MARKER_RE = re.compile(
+    r"\[(?P<tag>CLONE_WORKERS?|COPY_WORKERS?|复制员工)\s*:?\s*(?P<body>[^\]\n]{0,360})\]",
+    re.IGNORECASE,
+)
+WORKER_QUESTION_RE = re.compile(
+    r"\[(?P<tag>ASK_WORKER|QUESTION_FOR_WORKER|提问员工)\s*:?\s*(?P<body>[^\]\n]{0,520})\]",
+    re.IGNORECASE,
+)
+QUESTION_LINE_RE = re.compile(
+    r"(^|\n)\s*(?:"
+    r"please\s+clarify|can\s+you|could\s+you|should\s+i|do\s+you\s+want|"
+    r"请问|能否|是否要|要不要|需要你|你希望"
+    r").{0,240}[?？]",
+    re.IGNORECASE,
+)
+
+
+def _clean_gap_query(text: str, *, fallback: str) -> str:
+    query = re.sub(r"\s+", " ", text).strip("`'\"[](){}:;,. -")
+    if len(query) < 12:
+        query = fallback
+    query = re.sub(r"\s+", " ", query).strip("`'\"[](){}:;,. -")
+    if len(query) > 180:
+        query = query[:180].rsplit(" ", 1)[0].strip() or query[:180].strip()
+    return query or fallback
+
+
+def _node_gap_fallback_query(record: WorkflowRecord, node: WorkflowNode) -> str:
+    basis = node.objective.strip() or node.prompt.strip() or node.name or record.goal
+    return _clean_gap_query(basis, fallback=record.goal or node.name or "literature research")
+
+
+def _split_gap_queries(body: str, *, fallback: str) -> list[str]:
+    cleaned = _clean_gap_query(body, fallback=fallback)
+    pieces = re.split(r"\s*(?:;|；|\n|\u2022|\||/)\s*", cleaned)
+    queries: list[str] = []
+    for piece in pieces:
+        item = _clean_gap_query(piece, fallback="")
+        if len(item) < 12:
+            continue
+        if item.lower() in {query.lower() for query in queries}:
+            continue
+        queries.append(item)
+    return queries or [cleaned]
+
+
+def detect_literature_gap_requests(record: WorkflowRecord, node: WorkflowNode, text: str) -> list[dict[str, str]]:
+    fallback = _node_gap_fallback_query(record, node)
+    requests: list[dict[str, str]] = []
+    for marker in GAP_MARKER_RE.finditer(text):
+        tag = marker.group("tag").lower()
+        gap_type = "citation_gap" if "citation" in tag else "evidence_gap" if "evidence" in tag else "literature_gap"
+        for body in _split_gap_queries(marker.group("body") or "", fallback=fallback):
+            requests.append(
+                {
+                    "gap_type": gap_type,
+                    "query": body,
+                    "reason": f"{node.name} declared {marker.group('tag')}",
+                }
+            )
+    if requests:
+        return requests
+
+    lowered = text.lower()
+    if not any(phrase in lowered for phrase in GAP_PHRASES):
+        return []
+    for line in text.splitlines():
+        if any(phrase in line.lower() for phrase in GAP_PHRASES):
+            query = _clean_gap_query(line, fallback=fallback)
+            return [
+                {
+                    "gap_type": "citation_gap" if "citation" in line.lower() or "引用" in line else "evidence_gap",
+                    "query": query,
+                    "reason": f"{node.name} reported a literature or evidence gap",
+                }
+            ]
+    return [
+        {
+            "gap_type": "evidence_gap",
+            "query": fallback,
+            "reason": f"{node.name} reported a literature or evidence gap",
+        }
+    ]
+
+
+def detect_literature_gap_request(record: WorkflowRecord, node: WorkflowNode, text: str) -> dict[str, str] | None:
+    requests = detect_literature_gap_requests(record, node, text)
+    return requests[0] if requests else None
+
+
+def dynamic_clone_node_id(caller_id: str | None, objective: str) -> str:
+    caller = _safe_node_slug(caller_id or "worker", "worker")
+    objective_slug = _safe_node_slug(objective, "clone")
+    digest = hashlib.sha1(f"{caller_id or ''}\n{objective}".encode("utf-8")).hexdigest()[:8]
+    return f"clone-{caller}-{objective_slug[:28]}-{digest}"
+
+
+def detect_worker_clone_request(node: WorkflowNode, text: str) -> dict[str, str] | None:
+    if not node.can_clone_workers:
+        return None
+    marker = CLONE_MARKER_RE.search(text)
+    if not marker:
+        return None
+    body = _clean_gap_query(marker.group("body") or "", fallback=node.objective or node.prompt or node.name)
+    return {
+        "objective": body,
+        "reason": f"{node.name} requested a cloned worker",
+    }
+
+
+def dynamic_worker_question_node_id(caller_id: str | None, role: str, question: str) -> str:
+    caller = _safe_node_slug(caller_id or "planner", "planner")
+    role_slug = _safe_node_slug(role, "worker")
+    question_slug = _safe_node_slug(question, "question")
+    digest = hashlib.sha1(f"{caller_id or ''}\n{role}\n{question}".encode("utf-8")).hexdigest()[:8]
+    return f"ask-{caller}-{role_slug[:16]}-{question_slug[:24]}-{digest}"
+
+
+def _parse_worker_question_body(body: str) -> tuple[str, str]:
+    cleaned = re.sub(r"\s+", " ", body).strip("`'\"[](){} ")
+    role = "worker"
+    question = cleaned
+    for separator in ("|", "::", "：", ":"):
+        if separator in cleaned:
+            left, right = cleaned.split(separator, 1)
+            if left.strip() and right.strip():
+                role = left.strip()
+                question = right.strip()
+                break
+    question = _clean_gap_query(question, fallback=cleaned or "answer the planner question")
+    return role, question
+
+
+def detect_worker_question_requests(node: WorkflowNode, text: str) -> list[dict[str, str]]:
+    if not node.can_ask_questions:
+        return []
+    requests: list[dict[str, str]] = []
+    for marker in WORKER_QUESTION_RE.finditer(text):
+        role, question = _parse_worker_question_body(marker.group("body") or "")
+        if not question:
+            continue
+        requests.append(
+            {
+                "role": role,
+                "question": question,
+                "reason": f"{node.name} asked {role} to answer a question",
+            }
+        )
+    return requests
+
+
+def worker_question_role_spec(target_role: str) -> dict[str, str | None]:
+    text = target_role.lower()
+    if "literature" in text or "research" in text or "文献" in text or "调研" in text:
+        return {"role": "literature scout", "kind": "literature", "skill": "research-lit", "task_type": "research"}
+    if "citation" in text or "reference" in text or "引用" in text or "插文献" in text:
+        return {"role": "citation inserter", "kind": "citation", "skill": "paper-write", "task_type": "writing"}
+    if "review" in text or "critic" in text or "审查" in text or "审阅" in text:
+        return {"role": "reviewer", "kind": "reviewer", "skill": "research-review", "task_type": "review"}
+    if "write" in text or "writer" in text or "author" in text or "写" in text or "改" in text:
+        return {"role": "writer", "kind": "writer", "skill": "paper-write", "task_type": "writing"}
+    return {"role": target_role.strip() or "worker", "kind": "worker", "skill": None, "task_type": "analysis"}
+
+
+def output_has_disallowed_question(text: str) -> bool:
+    if not text.strip():
+        return False
+    candidate_lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("[LITERATURE_NEEDED") or stripped.startswith("[EVIDENCE_NEEDED"):
+            continue
+        if stripped.endswith(("?", "？")):
+            candidate_lines.append(stripped)
+    if candidate_lines:
+        return True
+    return QUESTION_LINE_RE.search(text) is not None
+
+
+def allowed_tools_for_role(role_kind: str, skill_id: str | None = None) -> list[str] | None:
+    if role_kind == "planner":
+        return PLANNER_CONTROL_PLANE_TOOLS
+    if role_kind == "literature" or skill_id in LITERATURE_SKILLS:
+        return LITERATURE_WORKER_TOOLS
+    if role_kind == "reviewer":
+        return REVIEWER_TOOLS
+    if role_kind in {"writer", "citation"}:
+        return ARTIFACT_WORKER_TOOLS
+    return None
+
+
 def stable_graph_hash(graph: WorkflowGraph) -> str:
     payload = json.dumps(model_dict(graph), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def plan_snapshot(graph: WorkflowGraph) -> PlanSnapshot:
-    dynamic_nodes = [node for node in graph.nodes if node.dynamic_parent_id or node.auto_approve_after]
+    dynamic_nodes = [node for node in graph.nodes if node.dynamic_parent_id]
     blocked_nodes = [node for node in graph.nodes if node.status == "waiting_dynamic_dependency"]
     return PlanSnapshot(
         graph=graph,
@@ -616,36 +975,36 @@ def build_artifact_index(workspace: Path, record: WorkflowRecord) -> list[Artifa
         node_id = rel.parts[0]
         return nodes.get(node_id)
 
-    try:
-        candidates = list_artifacts(workspace, limit=1200)
-    except Exception:
-        candidates = []
-    for artifact in candidates:
-        norm_path = artifact.path.replace("\\", "/")
-        if norm_path.startswith(f".aris/web/workflows/{record.id}/runtime/"):
-            continue
-        if norm_path.endswith("/session.json") or norm_path.endswith("/events.jsonl"):
-            continue
-        if norm_path.startswith(".aris/web/workflows/") and f"/{record.id}/nodes/" not in norm_path:
-            continue
-        path = workspace / artifact.path
-        if ".aris/web/workflows/" not in norm_path and artifact.path.startswith(".aris/"):
-            continue
-        producer = infer_producer(path)
-        session_id = _session_id_for_node(record.id, producer) if producer else None
-        entries_by_path[artifact.path] = ArtifactIndexEntry(
-            id=artifact.id,
-            path=artifact.path,
-            name=artifact.name,
-            kind=artifact.kind,
-            producer_node_id=producer.id if producer else None,
-            run_id=producer.run_id if producer else None,
-            session_id=session_id,
-            size=artifact.size,
-            modified_at=artifact.modified_at,
-            sha256=_hash_file(path),
-            summary=_artifact_summary(path),
-        )
+    if workflow_node_root.exists():
+        for root, _dirs, files in os.walk(workflow_node_root):
+            root_path = Path(root)
+            for file_name in files:
+                if file_name in {"session.json", "events.jsonl", "runtime_events.jsonl"}:
+                    continue
+                path = root_path / file_name
+                if path.suffix.lower() not in ARTIFACT_SUFFIXES:
+                    continue
+                producer = infer_producer(path)
+                if producer is None:
+                    continue
+                try:
+                    rel = path.resolve().relative_to(workspace.resolve()).as_posix()
+                    stat = path.stat()
+                except (OSError, ValueError):
+                    continue
+                entries_by_path[rel] = ArtifactIndexEntry(
+                    id=hashlib.sha1(rel.encode("utf-8")).hexdigest()[:16],
+                    path=rel,
+                    name=path.name,
+                    kind=artifact_kind(path),
+                    producer_node_id=producer.id,
+                    run_id=producer.run_id,
+                    session_id=_session_id_for_node(record.id, producer),
+                    size=stat.st_size,
+                    modified_at=time_from_stat(stat.st_mtime),
+                    sha256=_hash_file(path),
+                    summary=_artifact_summary(path),
+                )
 
     # Include declared node outputs even when they live under hidden workflow dirs
     # that the general artifact browser normally suppresses.
@@ -673,6 +1032,64 @@ def build_artifact_index(workspace: Path, record: WorkflowRecord) -> list[Artifa
                 summary=_artifact_summary(path),
             )
     return sorted(entries_by_path.values(), key=lambda item: item.modified_at, reverse=True)
+
+
+def _node_event_timestamp(events: list[WorkflowEvent], node_id: str, fallback: str) -> str:
+    for event in reversed(events):
+        if event.node_id == node_id:
+            return event.timestamp
+    return fallback
+
+
+def _human_message_preview(text: str, *, limit: int = 900) -> str:
+    text = re.sub(r"\n{3,}", "\n\n", text.strip())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def build_team_chat_messages(workspace: Path, record: WorkflowRecord, artifacts: list[ArtifactIndexEntry] | None = None) -> list[TeamMessage]:
+    artifacts = artifacts if artifacts is not None else build_artifact_index(workspace, record)
+    artifacts_by_node: dict[str, list[ArtifactIndexEntry]] = {}
+    for artifact in artifacts:
+        if artifact.producer_node_id:
+            artifacts_by_node.setdefault(artifact.producer_node_id, []).append(artifact)
+    events = replay_workflow_events(workspace, record.id)
+    messages: list[TeamMessage] = []
+    for node in record.graph_json.nodes:
+        if not node.run_id or node.reports_to_chat is False:
+            continue
+        path = last_message_path(workspace, node.run_id)
+        message = ""
+        if path.exists():
+            try:
+                message = _human_message_preview(path.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                message = ""
+        if not message and node.status in TERMINAL_NODE_STATUSES:
+            message = f"{node.name} finished with status {node.status}."
+        if not message:
+            continue
+        role_kind = node.team_role_kind or "worker"
+        role = node.assignee_role or node.role or node.team_role_id or role_kind
+        messages.append(
+            TeamMessage(
+                workflow_id=record.id,
+                timestamp=_node_event_timestamp(events, node.id, record.updated_at),
+                node_id=node.id,
+                run_id=node.run_id,
+                role=role,
+                role_kind=role_kind,  # type: ignore[arg-type]
+                scope=node.scope or default_scope_for_kind(role_kind),
+                message=message,
+                artifact_refs=artifacts_by_node.get(node.id, []),
+                can_ask_questions=bool(node.can_ask_questions),
+                can_clone_workers=bool(node.can_clone_workers),
+                can_call_planner=bool(node.can_call_planner),
+                peer_access=True if node.peer_access is None else bool(node.peer_access),
+            )
+        )
+    return sorted(messages, key=lambda item: item.timestamp)
 
 
 def time_from_stat(value: float) -> str:
@@ -707,6 +1124,42 @@ def _render_port_summary(ports, *, kind: str) -> str:
         suffix = f" — {description}" if description else ""
         lines.append(f"- {name} [{type_label}, {flag}]{suffix}")
     return "\n".join(lines)
+
+
+TASK_BOARD_COLUMN_TITLES = {
+    "backlog": "Backlog",
+    "ready": "Ready",
+    "running": "Running",
+    "review": "Review",
+    "rework": "Rework",
+    "done": "Done",
+    "blocked": "Blocked",
+}
+
+
+def task_board_column_for_node(node: WorkflowNode, nodes_by_id: dict[str, WorkflowNode]) -> str:
+    if node.type == "input":
+        return "done"
+    if node.status in {"succeeded", "skipped", "cancelled"}:
+        return "done"
+    if node.status == "running":
+        return "running"
+    if node.status == "waiting_approval" or node.review_status == "pending":
+        return "review"
+    if node.status == "failed" or node.review_status == "rework":
+        return "rework"
+    if node.status in {"blocked", "waiting_dynamic_dependency"}:
+        return "blocked"
+    if node.status == "queued" and all(
+        dep in nodes_by_id and nodes_by_id[dep].status in SUCCESS_NODE_STATUSES
+        for dep in node.depends_on
+    ):
+        return "ready"
+    return "backlog"
+
+
+def task_objective(node: WorkflowNode) -> str:
+    return node.objective.strip() or node.prompt.strip()
 
 
 def missing_concrete_outputs(workspace: Path, workflow_id: str | WorkflowNode, node: WorkflowNode | None = None) -> list[str]:
@@ -750,14 +1203,21 @@ def normalize_workflow_graph(graph: WorkflowGraph, known_skills: set[str] | None
         node_ids.add(node_id)
         skill = node.skill.strip() if isinstance(node.skill, str) and node.skill.strip() else None
         config_file = node.config_file.strip() if isinstance(node.config_file, str) and node.config_file.strip() else None
-        if node.type in {"agent", "human_gate"}:
+        if node.type in {"input", "human_gate"}:
             skill = None
             config_file = None
+        elif skill is None:
+            skill = default_skill_for_node(node, known_skills)
+        protocol_update = normalize_node_protocol(node, skill=skill, config_file=config_file)
+        if protocol_update.get("team_role_kind") == "planner":
+            skill = None
         if skill and known_skills is not None and skill not in known_skills:
             raise ValueError(f"Unknown skill for node {node_id}: {skill}")
+        update = {"id": node_id, "skill": skill, "config_file": config_file}
+        update.update(protocol_update)
         normalized_nodes.append(
-            node.copy(update={"id": node_id, "skill": skill, "config_file": config_file}) if not hasattr(node, "model_copy")
-            else node.model_copy(update={"id": node_id, "skill": skill, "config_file": config_file})
+            node.copy(update=update) if not hasattr(node, "model_copy")
+            else node.model_copy(update=update)
         )
 
     edge_pairs: set[tuple[str, str]] = set()
@@ -801,6 +1261,34 @@ def normalize_workflow_graph(graph: WorkflowGraph, known_skills: set[str] | None
         max_concurrency=graph.max_concurrency,
         class_limits=graph.class_limits,
     )
+
+
+def prepare_graph_for_task_board_run(graph: WorkflowGraph, *, restart: bool = False) -> WorkflowGraph:
+    """Prepare a board-style run that flows until a real human checkpoint."""
+
+    base = reset_workflow_execution_state(graph) if restart else graph
+    nodes: list[WorkflowNode] = []
+    for node in base.nodes:
+        auto_after = node.auto_approve_after
+        retry = node.retry
+        if node.type in EXECUTABLE_NODE_TYPES and node.gate not in {"after", "both"}:
+            auto_after = True
+            if retry is None:
+                retry = RetryPolicy(
+                    max_attempts=3,
+                    backoff_seconds=2.0,
+                    on=[
+                        "assistant stream produced no content",
+                        "assistant stream ended",
+                        "connection",
+                        "rate limit",
+                        "timeout",
+                        "temporarily unavailable",
+                    ],
+                )
+        update = {"auto_approve_after": auto_after, "retry": retry}
+        nodes.append(node.copy(update=update) if not hasattr(node, "model_copy") else node.model_copy(update=update))
+    return base.copy(update={"nodes": nodes}) if not hasattr(base, "model_copy") else base.model_copy(update={"nodes": nodes})
 
 
 def _assert_acyclic(deps_by_node: dict[str, set[str]]) -> None:
@@ -923,114 +1411,178 @@ def paper_introduction_template_graph(goal: str, known_skills: set[str] | None =
     def skill(name: str) -> str | None:
         return name if known_skills is None or name in known_skills else None
 
-    source_prompt = (
-        "Inventory the available paper materials for this introduction-writing task. "
-        "Read narrative reports, paper plans, experiment logs, figures, references, and existing TeX when present. "
-        "Write INTRO_CONTEXT.md with: one-sentence contribution, target audience/venue assumptions, 3-5 core claims, "
-        "evidence for each claim, missing evidence, and citation/literature needs. "
+    planner_prompt = (
+        "Act only as the Introduction control-plane planner. Do not read full paper materials or artifact contents. "
+        "Use the team chat updates, task status, and artifact references available in the prompt. "
+        "If you need content from a paper artifact, ask an employee with "
+        "[ASK_WORKER: writer | concrete question] or [ASK_WORKER: literature scout | concrete question]. "
+        "Write INTRO_PLAN.md as a compact routing plan: current understanding, open questions for employees, "
+        "known artifact_refs, and next routing decision. If a concrete citation search is needed, write one marker per query "
+        "as [LITERATURE_NEEDED: focused search query]. Mark non-literature support gaps as "
+        "[ASK_WORKER: writer | focused evidence question]. "
         f"User goal:\n{goal}"
     )
     nodes = [
         WorkflowNode(
-            id="intro-context",
+            id="intro-planner",
             type="agent",
-            name="Build introduction context",
-            role="paper context scout",
-            skill=skill("paper-plan"),
-            prompt=source_prompt,
-            outputs=["INTRO_CONTEXT.md"],
+            name="Plan introduction",
+            role="planner",
+            skill=None,
+            task_type="planning",
+            team_role_kind="planner",
+            scope="Explain the Introduction problem, plan the paragraph arc, read worker updates, and route on-demand literature needs.",
+            objective="Inventory existing paper materials and plan the Introduction arc while declaring any on-demand literature gaps.",
+            acceptance_criteria=[
+                "INTRO_PLAN.md lists core claims, current evidence, and a paragraph-level Introduction arc",
+                "Missing citation needs are marked with LITERATURE_NEEDED and non-literature questions with ASK_WORKER",
+                "No invented citations or unsupported related-work claims are introduced",
+            ],
+            assignee_role="planner",
+            priority=1,
+            prompt=planner_prompt,
+            outputs=["INTRO_PLAN.md"],
             position={"x": 0, "y": 100},
-        ),
-        WorkflowNode(
-            id="literature-positioning",
-            type="sub_agent",
-            name="Map positioning and gap",
-            role="literature positioning agent",
-            skill=skill("research-lit"),
-            prompt=(
-                "Using INTRO_CONTEXT.md and the project materials, identify the closest related work, "
-                "the precise gap this paper should claim, and 6-10 citation anchors for the Introduction. "
-                "You must save INTRO_RELATED_WORK.md with short, citation-ready bullets. Do not invent citations."
-            ),
-            depends_on=["intro-context"],
-            inputs=["INTRO_CONTEXT.md"],
-            outputs=["INTRO_RELATED_WORK.md"],
-            position={"x": 260, "y": 0},
-        ),
-        WorkflowNode(
-            id="intro-outline",
-            type="agent",
-            name="Plan introduction arc",
-            role="introduction story planner",
-            skill=skill("paper-plan"),
-            prompt=(
-                "You must create INTRO_OUTLINE.md: a paragraph-by-paragraph Introduction arc. "
-                "Include motivation, problem, gap, key insight, method sketch, evidence preview, and contributions. "
-                "Mark any unsupported claim with [EVIDENCE_NEEDED]."
-            ),
-            depends_on=["intro-context", "literature-positioning"],
-            inputs=["INTRO_CONTEXT.md", "INTRO_RELATED_WORK.md"],
-            outputs=["INTRO_OUTLINE.md"],
-            position={"x": 520, "y": 100},
         ),
         WorkflowNode(
             id="draft-introduction",
             type="sub_agent",
             name="Draft LaTeX introduction",
-            role="introduction writer",
+            role="writer",
             skill=skill("paper-write"),
+            task_type="writing",
+            team_role_kind="writer",
+            scope="Write and revise Introduction text from approved plans, evidence, and artifact references.",
+            objective="Draft the paper introduction from approved context, outline, and any dynamically inserted literature results.",
+            acceptance_criteria=[
+                "INTRODUCTION_DRAFT.md is written at the declared output path",
+                "Claims are grounded in available evidence or explicitly marked as needing literature",
+                "Citation placeholders are used only for known sources",
+            ],
+            assignee_role="writer",
+            priority=2,
             prompt=(
-                "Draft only the paper Introduction from INTRO_OUTLINE.md, INTRO_CONTEXT.md, and INTRO_RELATED_WORK.md. "
-                "You must write INTRODUCTION_DRAFT.md in the workspace root. "
+                "Draft only the paper Introduction from INTRO_PLAN.md and any dynamic literature artifacts already connected upstream. "
+                "You must write INTRODUCTION_DRAFT.md at the mapped node output path. "
+                "Do not use WebSearch/WebFetch; citation discovery belongs to the literature scout. "
                 "Use concrete claims grounded in available evidence, preserve citation placeholders only when the cited source is known, "
-                "and avoid generic hype."
+                "and avoid generic hype. If drafting needs literature that is not yet available, write [LITERATURE_NEEDED: focused search query] "
+                "instead of filling in invented citations."
             ),
-            depends_on=["intro-outline"],
-            inputs=["INTRO_OUTLINE.md", "INTRO_CONTEXT.md", "INTRO_RELATED_WORK.md"],
+            depends_on=["intro-planner"],
+            inputs=["INTRO_PLAN.md"],
             outputs=["INTRODUCTION_DRAFT.md"],
-            position={"x": 780, "y": 100},
+            position={"x": 320, "y": 100},
         ),
         WorkflowNode(
             id="review-introduction",
             type="sub_agent",
             name="Review introduction claims",
-            role="adversarial introduction reviewer",
+            role="reviewer",
             skill=skill("research-review"),
+            task_type="review",
+            team_role_kind="reviewer",
+            scope="Raise evidence, novelty, motivation, and citation-gap questions for the planner to route.",
+            objective="Review the introduction draft for evidence quality, novelty clarity, and citation gaps before revision.",
+            acceptance_criteria=[
+                "INTRO_REVIEW.md lists prioritized pass/rework findings",
+                "Unsupported claims and citation gaps are tied to concrete text locations",
+                "Follow-up work is expressed as focused ASK_WORKER questions for the planner to route",
+                "Every non-passing review round contains at least one concrete planner-routed question",
+            ],
+            assignee_role="reviewer",
+            priority=3,
             prompt=(
                 "Review the drafted Introduction for unsupported claims, weak motivation, unclear novelty, citation gaps, "
-                "and mismatch between evidence and promises. You must save INTRO_REVIEW.md with prioritized fixes."
+                "and mismatch between evidence and promises. You must save INTRO_REVIEW.md with prioritized fixes. "
+                "Do not directly assign the next worker and do not use WebSearch/WebFetch. "
+                "If a fix requires fresh literature search, citation insertion, or writer revision, include explicit planner-routed "
+                "questions in both INTRO_REVIEW.md and the final summary using "
+                "[ASK_WORKER: literature scout | focused search query], [ASK_WORKER: citation inserter | concrete citation task], "
+                "or [ASK_WORKER: writer | concrete revision task]. "
+                "Keep asking concrete questions until the Introduction can pass without blocking evidence or citation gaps."
             ),
             depends_on=["draft-introduction"],
             inputs=["introduction draft"],
             outputs=["INTRO_REVIEW.md"],
-            position={"x": 1040, "y": 0},
+            position={"x": 640, "y": 0},
         ),
         WorkflowNode(
             id="revise-introduction",
             type="sub_agent",
             name="Revise introduction",
-            role="introduction revision agent",
+            role="writer",
             skill=skill("paper-write"),
+            task_type="writing",
+            team_role_kind="writer",
+            scope="Write and revise Introduction text from approved plans, evidence, and artifact references.",
+            objective="Revise the introduction using review findings and any dynamically added literature evidence.",
+            acceptance_criteria=[
+                "INTRODUCTION_REVISED.md incorporates review fixes",
+                "INTRO_REVISION_SUMMARY.md explains the changes and remaining risks",
+                "Unsupported claims are removed, softened, or backed by available evidence",
+            ],
+            assignee_role="writer",
+            priority=4,
             prompt=(
                 "Revise the Introduction using INTRO_REVIEW.md. Keep changes local to the Introduction artifact, "
-                "remove or soften unsupported claims, and write INTRODUCTION_REVISED.md plus INTRO_REVISION_SUMMARY.md explaining the changes."
+                "remove or soften unsupported claims, and write INTRODUCTION_REVISED.md plus INTRO_REVISION_SUMMARY.md explaining the changes. "
+                "Do not use WebSearch/WebFetch; leave unresolved citation checks as [LITERATURE_NEEDED: focused query] for the planner to route."
             ),
             depends_on=["review-introduction"],
             inputs=["introduction draft", "INTRO_REVIEW.md"],
             outputs=["INTRODUCTION_REVISED.md", "INTRO_REVISION_SUMMARY.md"],
-            position={"x": 1300, "y": 100},
+            position={"x": 960, "y": 100},
+        ),
+        WorkflowNode(
+            id="final-review-introduction",
+            type="sub_agent",
+            name="Final review questions",
+            role="reviewer",
+            skill=skill("research-review"),
+            task_type="review",
+            team_role_kind="reviewer",
+            scope="Continuously challenge the revised Introduction with evidence, citation, and clarity questions for planner routing.",
+            objective="Review the revised Introduction and keep surfacing concrete questions until remaining blockers are routed.",
+            acceptance_criteria=[
+                "FINAL_INTRO_REVIEW.md states pass/rework status after revision",
+                "Remaining blockers are phrased as ASK_WORKER questions for planner routing",
+                "If no blocker remains, the review records pass status plus non-blocking watch items",
+            ],
+            assignee_role="reviewer",
+            priority=5,
+            prompt=(
+                "Review INTRODUCTION_REVISED.md after the writer revision. You must save FINAL_INTRO_REVIEW.md. "
+                "Act as the team's persistent reviewer: look for at least one concrete unresolved issue in citations, evidence, "
+                "claim strength, or logical flow. If the issue blocks approval, write it as a planner-routed question using "
+                "[ASK_WORKER: literature scout | focused search query], [ASK_WORKER: citation inserter | concrete citation task], "
+                "or [ASK_WORKER: writer | concrete revision task] in both FINAL_INTRO_REVIEW.md and the final summary. "
+                "If no blocking issue remains, state PASS and list only non-blocking watch items without ASK_WORKER markers."
+            ),
+            depends_on=["revise-introduction"],
+            inputs=["INTRODUCTION_REVISED.md", "INTRO_REVISION_SUMMARY.md"],
+            outputs=["FINAL_INTRO_REVIEW.md"],
+            position={"x": 1280, "y": 0},
         ),
         WorkflowNode(
             id="approve-introduction",
             type="human_gate",
             name="Approve introduction",
             role="checkpoint",
+            task_type="gate",
+            objective="Human checkpoint for approving the revised introduction before using it downstream.",
+            acceptance_criteria=[
+                "Revised introduction is coherent and evidence-aware",
+                "Review findings and revision summary have been inspected",
+            ],
+            assignee_role="human reviewer",
+            priority=5,
             prompt=(
                 "Inspect the revised Introduction, INTRO_REVIEW.md, and INTRO_REVISION_SUMMARY.md. "
                 "Approve when the Introduction is coherent enough to feed the rest of the paper-writing flow."
             ),
-            depends_on=["revise-introduction"],
-            position={"x": 1560, "y": 100},
+            depends_on=["final-review-introduction"],
+            position={"x": 1600, "y": 100},
         ),
     ]
     return normalize_workflow_graph(WorkflowGraph(nodes=nodes), known_skills)
@@ -1048,7 +1600,9 @@ def build_workflow_generation_prompt(goal: str, skills: list[SkillInfo]) -> str:
         for skill in skills
         if skill.id
     )
-    return f"""You are designing an ARIS-Code multi-agent research workflow DAG for the local web console.
+    return f"""You are designing an ARIS-Code multi-agent task board for the local web console.
+
+The user goal starts as the initial top-level task. A Manager/Planner Agent decomposes it into traceable tasks. Each task should declare inputs, outputs, dependencies, an assigned role, and acceptance criteria. Role Agents may later claim or be assigned tasks. Reviewer tasks inspect evidence and acceptance criteria, then decide pass, rework, or follow-up tasks. The returned JSON is still the internal dependency graph used by the runtime.
 
 Return ONLY valid JSON, with no Markdown fences or prose. The JSON must match:
 {{
@@ -1058,12 +1612,25 @@ Return ONLY valid JSON, with no Markdown fences or prose. The JSON must match:
   "nodes": [
     {{
       "id": "stable-slug",
-      "type": "agent|sub_agent|human_gate",
+      "type": "input|agent|sub_agent|human_gate",
       "name": "human readable name",
-      "role": "planner|literature scout|experiment planner|executor|reviewer|writer",
-      "skill": "one skill id from the catalog or null",
-      "prompt": "specific task prompt",
+	      "role": "planner|literature scout|experiment planner|executor|reviewer|writer",
+	      "team_role_kind": "planner|reviewer|literature|writer|citation|worker|gate",
+	      "scope": "core responsibility range, not a detailed flow",
+	      "can_ask_questions": false,
+	      "can_clone_workers": true,
+	      "can_call_planner": false,
+	      "peer_access": true,
+	      "skill": "one skill id from the catalog or null",
+      "task_type": "goal|planning|research|analysis|coding|writing|review|gate",
+      "objective": "task objective written for the assigned role",
+      "acceptance_criteria": ["observable criterion"],
+      "assignee_role": "role expected to own this task",
+      "priority": 1,
+      "prompt": "optional supplemental instructions; prefer skill + objective over long prompts",
       "gate": "none|before|after|both",
+      "inputs": [{{"name":"input name","type":"text","description":"where it comes from"}}],
+      "outputs": [{{"name":"artifact.md","type":"file","description":"what must be written"}}],
       "depends_on": ["upstream-node-id"],
       "fanout": null,
       "position": {{"x": 0, "y": 0}}
@@ -1072,17 +1639,21 @@ Return ONLY valid JSON, with no Markdown fences or prose. The JSON must match:
   "edges": [{{"id": "source->target", "source": "source", "target": "target"}}]
 }}
 
-Use 5-7 nodes. Use type="agent" only for planning/orchestration nodes that decide what should happen next.
-Use type="sub_agent" for independent execution work such as literature search, implementation, writing, or review.
-Use type="human_gate" for visible human checkpoints.
-Include at least one human_gate before expensive implementation and one human_gate after review.
-For human_gate nodes set skill to null and gate to "none".
+Use 5-7 tasks. Use type="input" for user-supplied global context nodes that every execution task should read.
+Use type="agent" only for planning/manager tasks that decide what should happen next.
+Use type="sub_agent" for independent role-agent tasks such as literature search, implementation, analysis, writing, or review.
+	Use type="human_gate" for visible human checkpoints and set task_type="gate".
+	Team protocol: keep scope as the role's core range only. Planner/manager reads human-language updates and routes work; workers must not call the planner. Literature, writing, and citation workers should set can_ask_questions=false and can_clone_workers=true. Reviewer tasks may ask questions but should not execute fixes.
+	Include at least one reviewer task before a human checkpoint; reviewer tasks must have task_type="review" and acceptance criteria about evidence quality.
+Include at least one human_gate before expensive implementation and one human_gate after review when the goal implies implementation or publication work.
+For input and human_gate nodes set skill to null and gate to "none".
+For executable nodes, prefer inheriting a skill over writing a long prompt: planning -> paper-plan, research -> research-lit, OpenAlex metadata/export search -> openalex-search, writing -> paper-write, review -> research-review.
+Do not force every workflow through a fixed literature-search role. Add a static literature/search node only when literature review is itself a primary deliverable or must happen before any other task. Otherwise, instruct roles to emit [LITERATURE_NEEDED: focused query] or [EVIDENCE_NEEDED: focused question] in their artifacts; the runtime Manager can then insert a dynamic Literature task and resume the blocked role.
 For sub_agent nodes, assume a fresh isolated run with no memory beyond declared upstream outputs and artifacts.
 When a planner/keyword node produces a variable-length JSON array, create one template sub_agent with a fanout object:
   "fanout": {{"source": "keyword-node-id", "path": "keyword_groups", "name_template": "Literature search: {{{{item.name}}}}", "max_items": 12}}
 The fanout template will expand at runtime into one independent SubAgent per JSON item. Downstream nodes depending on the template will wait for all generated SubAgents. Use prompt placeholders like {{{{item.name}}}}, {{{{item.keywords}}}}, {{{{item}}}}, {{{{index}}}}, and {{{{number}}}}.
-Do not include model, effort, config_file, inputs, or outputs unless the user explicitly asked for those overrides.
-The DAG must be acyclic. Prefer research workflow skills from this catalog:
+The task dependency graph must be acyclic. Prefer research workflow skills from this catalog:
 {catalog}
 
 User goal:
@@ -1130,6 +1701,22 @@ WORKFLOW_NODE_EXECUTION_FIELDS = [
     "team_id",
     "team_instance_id",
     "team_role_id",
+    "team_role_kind",
+    "scope",
+    "can_ask_questions",
+    "can_clone_workers",
+    "can_call_planner",
+    "peer_access",
+    "reports_to_chat",
+    "task_type",
+    "objective",
+    "acceptance_criteria",
+    "assignee_role",
+    "assigned_to",
+    "claimed_by",
+    "review_status",
+    "review_notes",
+    "priority",
 ]
 
 WORKFLOW_NODE_PRESERVED_RUNTIME_FIELDS = [
@@ -1185,6 +1772,7 @@ def reset_workflow_execution_state(graph: WorkflowGraph) -> WorkflowGraph:
         update = {
             "status": "queued",
             "run_id": None,
+            "session_path": None,
             "error": None,
             "approved_before": False,
             "approved_after": False,
@@ -1243,17 +1831,18 @@ def build_workflow_refinement_prompt(
         if skill.id
     )
     current_graph_json = json.dumps(workflow_graph_prompt_payload(current_graph), ensure_ascii=False, indent=2)
-    return f"""You are updating an existing ARIS-Code multi-agent research workflow DAG for the local web console.
+    return f"""You are updating an existing ARIS-Code multi-agent task board for the local web console.
 
-Return ONLY valid JSON, with no Markdown fences or prose. Return the complete updated workflow, not a patch.
+Return ONLY valid JSON, with no Markdown fences or prose. Return the complete updated task board graph, not a patch.
+Return the complete updated workflow, not a patch.
 
-Current workflow title:
+Current task board title:
 {workflow.title}
 
-Current workflow goal:
+Current initial goal:
 {workflow.goal}
 
-Current workflow graph:
+Current internal dependency graph:
 {current_graph_json}
 
 New user requirements:
@@ -1267,12 +1856,25 @@ The JSON must match:
   "nodes": [
     {{
       "id": "stable-slug",
-      "type": "agent|sub_agent|human_gate",
+      "type": "input|agent|sub_agent|human_gate",
       "name": "human readable name",
-      "role": "planner|literature scout|experiment planner|executor|reviewer|writer",
-      "skill": "one skill id from the catalog or null",
-      "prompt": "specific task prompt",
+	      "role": "planner|literature scout|experiment planner|executor|reviewer|writer",
+	      "team_role_kind": "planner|reviewer|literature|writer|citation|worker|gate",
+	      "scope": "core responsibility range, not a detailed flow",
+	      "can_ask_questions": false,
+	      "can_clone_workers": true,
+	      "can_call_planner": false,
+	      "peer_access": true,
+	      "skill": "one skill id from the catalog or null",
+      "task_type": "goal|planning|research|analysis|coding|writing|review|gate",
+      "objective": "task objective written for the assigned role",
+      "acceptance_criteria": ["observable criterion"],
+      "assignee_role": "role expected to own this task",
+      "priority": 1,
+      "prompt": "optional supplemental instructions; prefer skill + objective over long prompts",
       "gate": "none|before|after|both",
+      "inputs": [{{"name":"input name","type":"text","description":"where it comes from"}}],
+      "outputs": [{{"name":"artifact.md","type":"file","description":"what must be written"}}],
       "depends_on": ["upstream-node-id"],
       "fanout": null,
       "position": {{"x": 0, "y": 0}}
@@ -1283,17 +1885,22 @@ The JSON must match:
 
 Preserve stable node ids, positions, prompts, and edges when they still satisfy the new requirements.
 Only add, remove, rename, or reorder nodes when the new requirements make that necessary.
-Use type="agent" only for planning/orchestration nodes that decide what should happen next.
-Use type="sub_agent" for independent execution work such as literature search, implementation, writing, or review.
-Use type="human_gate" for visible human checkpoints.
-For human_gate nodes set skill to null and gate to "none".
+Use type="agent" only for planning/manager tasks that decide what should happen next.
+Use type="input" for user-supplied global context nodes that every execution task should read.
+	Use type="sub_agent" for independent role-agent tasks such as literature search, implementation, analysis, writing, or review.
+	Use type="human_gate" for visible human checkpoints and set task_type="gate".
+	Team protocol: keep scope as the role's core range only. Planner/manager reads human-language updates and routes work; workers must not call the planner. Literature, writing, and citation workers should set can_ask_questions=false and can_clone_workers=true. Reviewer tasks may ask questions but should not execute fixes.
+	Reviewer tasks must have task_type="review" and acceptance criteria about evidence quality, pass/rework decisions, or follow-up task creation.
+For input and human_gate nodes set skill to null and gate to "none".
+For executable nodes, prefer inheriting a skill over writing a long prompt: planning -> paper-plan, research -> research-lit, OpenAlex metadata/export search -> openalex-search, writing -> paper-write, review -> research-review.
+Do not turn the graph into a mandatory linear literature-first pipeline unless the user explicitly asked for that. Keep literature/search as on-demand dynamic work when a role discovers missing citation or evidence needs; those roles should write [LITERATURE_NEEDED: focused query] or [EVIDENCE_NEEDED: focused question] into their declared artifacts.
 For sub_agent nodes, assume a fresh isolated run with no memory beyond declared upstream outputs and artifacts.
 When the new requirements need variable-length parallel work based on upstream output, use a fanout template sub_agent:
   "fanout": {{"source": "keyword-node-id", "path": "keyword_groups", "name_template": "Literature search: {{{{item.name}}}}", "max_items": 12}}
 The template expands at runtime into one independent SubAgent per JSON item. Downstream nodes depending on the template will wait for all generated SubAgents. Use prompt placeholders like {{{{item.name}}}}, {{{{item.keywords}}}}, {{{{item}}}}, {{{{index}}}}, and {{{{number}}}}.
 Do not include runtime fields such as status, run_id, error, approved_before, approved_after, attempt, or usage.
-Do not include model, effort, config_file, inputs, or outputs unless the user explicitly asked for those overrides.
-The DAG must be acyclic. Prefer research workflow skills from this catalog:
+Do not include model, effort, or config_file unless the user explicitly asked for those overrides.
+The task dependency graph must be acyclic. Prefer research workflow skills from this catalog:
 {catalog}
 """
 
@@ -1463,6 +2070,9 @@ def build_node_prompt_optimization_prompt(
             "name": item.name,
             "role": item.role,
             "skill": item.skill,
+            "task_type": item.task_type,
+            "objective": item.objective,
+            "acceptance_criteria": item.acceptance_criteria,
             "depends_on": item.depends_on,
             "inputs": prompt_context_data(item.inputs),
             "outputs": prompt_context_data(item.outputs),
@@ -1475,6 +2085,10 @@ def build_node_prompt_optimization_prompt(
         "name": node.name,
         "role": node.role,
         "skill": node.skill,
+        "task_type": node.task_type,
+        "objective": node.objective,
+        "acceptance_criteria": node.acceptance_criteria,
+        "assignee_role": node.assignee_role,
         "profile": prompt_context_data(config) if config else None,
         "model": node.model,
         "effort": node.effort,
@@ -1486,25 +2100,25 @@ def build_node_prompt_optimization_prompt(
     focus = instructions.strip() if instructions else ""
     return "\n".join(
         [
-            "You are optimizing a single workflow node prompt for ARIS Web.",
+            "You are optimizing a single task prompt for an ARIS Web task board.",
             "Return only valid JSON with this exact shape: {\"prompt\":\"...\"}.",
             "",
             "Optimization rules:",
-            "- Preserve the node's intent, role, skill contract, dependencies, and required outputs.",
+            "- Preserve the task's intent, role, skill contract, dependencies, acceptance criteria, and required outputs.",
             "- Make the prompt concrete, executable, and self-contained for the assigned agent.",
             "- Include clear success criteria and expected artifacts when outputs imply files or reports.",
-            "- Do not execute the task, do not invent completed results, and do not change the workflow graph.",
+            "- Do not execute the task, do not invent completed results, and do not change the task board graph.",
             "- Keep the prompt in the same natural language as the current prompt unless the user asks otherwise.",
             "- Avoid vague wording; make inputs, constraints, and deliverables explicit.",
             "",
-            f"Workflow title: {record.title}",
-            f"Workflow goal: {record.goal}",
+            f"Task board title: {record.title}",
+            f"Initial goal: {record.goal}",
             f"User optimization focus: {focus or 'Improve clarity, completeness, and execution reliability.'}",
             "",
-            "Workflow nodes:",
+            "Task board tasks:",
             json.dumps(nodes_context, ensure_ascii=False, indent=2),
             "",
-            "Target node:",
+            "Target task:",
             json.dumps(target, ensure_ascii=False, indent=2),
         ]
     )
@@ -1993,10 +2607,11 @@ class WorkflowManager:
         artifacts = build_artifact_index(workspace, record)
         write_artifact_index(workspace, workflow_id, artifacts)
         handoffs = build_handoff_index(workspace, record)
+        team_messages = build_team_chat_messages(workspace, record, artifacts)
         events = replay_workflow_events(workspace, workflow_id)
         latest = decisions[-1] if decisions else None
         nodes_by_id = {node.id: node for node in record.graph_json.nodes}
-        dynamic_nodes = [node for node in record.graph_json.nodes if node.dynamic_parent_id or node.auto_approve_after]
+        dynamic_nodes = [node for node in record.graph_json.nodes if node.dynamic_parent_id]
         planner_active = workflow_id in self._planning
         active_ids = sorted(
             node_id
@@ -2049,6 +2664,11 @@ class WorkflowManager:
         elif record.status in {"succeeded", "failed", "cancelled"}:
             execution_state = record.status
             next_action = f"Workflow is {record.status}."
+        elif failed_nodes and record.status == "paused":
+            execution_state = "failed"
+            failed_names = ", ".join(node.name or node.id for node in failed_nodes[:3])
+            suffix = "" if len(failed_nodes) <= 3 else f" (+{len(failed_nodes) - 3} more)"
+            next_action = f"{len(failed_nodes)} node(s) failed: {failed_names}{suffix}. Rerun the failed role or restart the runtime."
         elif ready_nodes:
             execution_state = "ready"
             next_action = f"{len(ready_nodes)} queued node(s) are ready for the scheduler."
@@ -2100,6 +2720,73 @@ class WorkflowManager:
             dynamic_nodes=dynamic_nodes,
             artifact_index=artifacts,
             handoffs=handoffs,
+            team_messages=team_messages,
+        )
+
+    def task_board(self, workspace: Path, workflow_id: str) -> TaskBoardResponse:
+        record = self._require(workspace, workflow_id)
+        runtime = self.runtime(workspace, workflow_id)
+        artifacts_by_node: dict[str, list[ArtifactIndexEntry]] = {}
+        for artifact in runtime.artifact_index:
+            if artifact.producer_node_id:
+                artifacts_by_node.setdefault(artifact.producer_node_id, []).append(artifact)
+        nodes_by_id = {node.id: node for node in record.graph_json.nodes}
+        tasks: list[TaskBoardTask] = []
+        columns = [
+            TaskBoardColumnSummary(id=column_id, title=title, task_ids=[])
+            for column_id, title in TASK_BOARD_COLUMN_TITLES.items()
+        ]
+        columns_by_id = {column.id: column for column in columns}
+        for node in sorted(record.graph_json.nodes, key=lambda item: (item.priority, item.position.get("x", 0), item.position.get("y", 0), item.id)):
+            column = task_board_column_for_node(node, nodes_by_id)
+            task = TaskBoardTask(
+                id=node.id,
+                name=node.name,
+                task_type="input" if node.type == "input" else "gate" if node.type == "human_gate" else node.task_type,
+                column=column,  # type: ignore[arg-type]
+                status=node.status,
+                role=node.role,
+                skill=node.skill,
+                objective=task_objective(node),
+                prompt=node.prompt,
+                inputs=node.inputs,
+                outputs=node.outputs,
+                depends_on=node.depends_on,
+                acceptance_criteria=node.acceptance_criteria,
+                assignee_role=node.assignee_role or node.role or node.team_role_id,
+                assigned_to=node.assigned_to,
+                claimed_by=node.claimed_by,
+                review_status=node.review_status,
+                review_notes=node.review_notes,
+                priority=node.priority,
+                artifact_refs=artifacts_by_node.get(node.id, []),
+                dynamic_parent_id=node.dynamic_parent_id,
+                dynamic_reason=node.dynamic_reason,
+                team_id=node.team_id,
+                team_role_id=node.team_role_id,
+                team_role_kind=node.team_role_kind,
+                scope=node.scope,
+                can_ask_questions=node.can_ask_questions,
+                can_clone_workers=node.can_clone_workers,
+                can_call_planner=node.can_call_planner,
+                peer_access=node.peer_access,
+                reports_to_chat=node.reports_to_chat,
+                run_id=node.run_id,
+                error=node.error,
+            )
+            tasks.append(task)
+            columns_by_id[task.column].task_ids.append(task.id)
+        return TaskBoardResponse(
+            id=record.id,
+            workspace=record.workspace,
+            title=record.title,
+            goal=record.goal,
+            status=record.status,
+            tasks=tasks,
+            columns=columns,
+            dependencies=record.graph_json.edges,
+            artifact_index=runtime.artifact_index,
+            runtime_summary=runtime.runtime_summary,
         )
 
     def session_view(self, workspace: Path, workflow_id: str, session_id: str) -> SessionRuntimeView:
@@ -2263,6 +2950,84 @@ class WorkflowManager:
         )
         return updated
 
+    async def claim_task(
+        self,
+        workspace: Path,
+        workflow_id: str,
+        node_id: str,
+        request: TaskClaimRequest,
+    ) -> WorkflowRecord:
+        record = self._require(workspace, workflow_id)
+        graph = record.graph_json
+        node = self._find_node(graph, node_id)
+        claimer = (request.agent_id or request.role or "").strip()
+        if not claimer:
+            raise ValueError("Task claim requires agent_id or role")
+        node.claimed_by = claimer
+        if request.role:
+            node.assignee_role = request.role.strip() or node.assignee_role
+        if not node.assigned_to:
+            node.assigned_to = claimer
+        update_workflow(workspace, workflow_id, graph_json=graph, clear_error=True)
+        await self._append_event(
+            workspace,
+            WorkflowEvent(
+                workflow_id=workflow_id,
+                timestamp=utc_now(),
+                event_type="node",
+                node_id=node_id,
+                message=f"Task claimed: {node.name}",
+                payload={"claimed_by": node.claimed_by, "assignee_role": node.assignee_role},
+            ),
+        )
+        return self._require(workspace, workflow_id)
+
+    async def review_task(
+        self,
+        workspace: Path,
+        workflow_id: str,
+        node_id: str,
+        request: TaskReviewRequest,
+    ) -> WorkflowRecord:
+        record = self._require(workspace, workflow_id)
+        graph = record.graph_json
+        node = self._find_node(graph, node_id)
+        node.review_status = request.review_status
+        node.review_notes = request.notes.strip()
+        if request.acceptance_criteria is not None:
+            node.acceptance_criteria = [item.strip() for item in request.acceptance_criteria if item.strip()]
+        if request.review_status == "passed":
+            if node.status == "waiting_approval" and node.type == "human_gate":
+                node.status = "succeeded"
+            elif node.status == "waiting_approval" and node.run_id:
+                node.approved_after = True
+                node.status = "succeeded"
+            elif node.status == "failed":
+                node.status = "succeeded"
+            node.error = None
+        else:
+            if request.reset_for_rework:
+                node.status = "queued"
+                node.run_id = None
+                node.session_path = None
+                node.approved_after = False
+                node.error = request.notes.strip() or "Reviewer requested rework"
+        update_workflow(workspace, workflow_id, status="running", graph_json=graph, clear_error=True, clear_finished_at=True)
+        await self._append_event(
+            workspace,
+            WorkflowEvent(
+                workflow_id=workflow_id,
+                timestamp=utc_now(),
+                event_type="approval",
+                node_id=node_id,
+                message=f"Task review recorded: {node.name}",
+                payload={"review_status": node.review_status, "review_notes": node.review_notes},
+            ),
+        )
+        if request.review_status == "passed":
+            await self._tick(workspace, workflow_id)
+        return self._require(workspace, workflow_id)
+
     async def optimize_node_prompt(
         self,
         workspace: Path,
@@ -2352,6 +3117,13 @@ class WorkflowManager:
                     team_id=team.id,
                     team_instance_id=instance_id,
                     team_role_id=role.id,
+                    team_role_kind=role.kind,
+                    scope=role.scope,
+                    can_ask_questions=role.can_ask_questions,
+                    can_clone_workers=role.can_clone_workers,
+                    can_call_planner=role.can_call_planner,
+                    peer_access=role.peer_access,
+                    reports_to_chat=role.reports_to_chat,
                 )
             )
 
@@ -2409,14 +3181,37 @@ class WorkflowManager:
         self._active.pop(workflow_id, None)
         delete_workflow(workspace, workflow_id)
 
-    async def execute(self, workspace: Path, workflow_id: str) -> WorkflowRecord:
+    async def execute(
+        self,
+        workspace: Path,
+        workflow_id: str,
+        *,
+        auto_approve_executable: bool = False,
+        restart: bool = False,
+    ) -> WorkflowRecord:
         record = self._require(workspace, workflow_id)
         ensure_research_wiki(workspace)
-        started_at = record.started_at or utc_now()
+        if auto_approve_executable or restart:
+            graph = (
+                prepare_graph_for_task_board_run(record.graph_json, restart=restart)
+                if auto_approve_executable
+                else reset_workflow_execution_state(record.graph_json)
+            )
+            removed_sessions = clear_workflow_node_sessions(workspace, workflow_id, record.graph_json) if restart else 0
+            update_workflow(workspace, workflow_id, graph_json=graph, clear_error=True, clear_finished_at=True)
+        else:
+            removed_sessions = 0
+        started_at = utc_now() if restart else record.started_at or utc_now()
         update_workflow(workspace, workflow_id, status="running", started_at=started_at, finished_at=None, clear_error=True)
         await self._append_event(
             workspace,
-            WorkflowEvent(workflow_id=workflow_id, timestamp=utc_now(), event_type="workflow", message="Workflow execution started"),
+            WorkflowEvent(
+                workflow_id=workflow_id,
+                timestamp=utc_now(),
+                event_type="workflow",
+                message="Workflow execution restarted" if restart else "Workflow execution started",
+                payload={"auto_approve_executable": auto_approve_executable, "restart": restart, "removed_sessions": removed_sessions},
+            ),
         )
         await self._tick(workspace, workflow_id)
         return self._require(workspace, workflow_id)
@@ -2731,6 +3526,25 @@ class WorkflowManager:
                 team_id=node.team_id,
                 team_instance_id=node.team_instance_id,
                 team_role_id=node.team_role_id,
+                team_role_kind=node.team_role_kind,
+                scope=node.scope,
+                can_ask_questions=node.can_ask_questions,
+                can_clone_workers=node.can_clone_workers,
+                can_call_planner=node.can_call_planner,
+                peer_access=node.peer_access,
+                reports_to_chat=node.reports_to_chat,
+                task_type=node.task_type,
+                objective=_render_fanout_template(node.objective, item, index) if node.objective else "",
+                acceptance_criteria=[
+                    _render_fanout_template(criteria, item, index)
+                    for criteria in node.acceptance_criteria
+                ],
+                assignee_role=node.assignee_role,
+                assigned_to=node.assigned_to,
+                claimed_by=node.claimed_by,
+                review_status=node.review_status,
+                review_notes=node.review_notes,
+                priority=node.priority,
             )
             graph.nodes.append(child)
 
@@ -2791,6 +3605,15 @@ class WorkflowManager:
                 "dynamic_reason": node.dynamic_reason,
                 "research_request": node.research_request,
                 "auto_approve_after": node.auto_approve_after,
+                "task_type": node.task_type,
+                "objective": node.objective,
+                "acceptance_criteria": node.acceptance_criteria,
+                "assignee_role": node.assignee_role or node.role or node.team_role_id,
+                "assigned_to": node.assigned_to,
+                "claimed_by": node.claimed_by,
+                "review_status": node.review_status,
+                "review_notes": node.review_notes,
+                "priority": node.priority,
             }
             for node in record.graph_json.nodes
         ]
@@ -2798,27 +3621,56 @@ class WorkflowManager:
             {
                 "event_type": event.event_type,
                 "node_id": event.node_id,
-                "message": event.message[-1000:],
+                "message": event.message[-240:],
             }
-            for event in replay_workflow_events(workspace, record.id)[-30:]
+            for event in replay_workflow_events(workspace, record.id)[-60:]
+            if event.event_type in {"workflow", "node", "planner", "delta", "team_message", "session", "artifact"}
+        ]
+        recent_events = recent_events[-30:]
+        artifacts = build_artifact_index(workspace, record)
+        team_messages = [
+            {
+                "timestamp": item.timestamp,
+                "node_id": item.node_id,
+                "role": item.role,
+                "role_kind": item.role_kind,
+                "scope": item.scope,
+                "message": item.message,
+                "artifact_refs": [artifact.path for artifact in item.artifact_refs],
+                "can_ask_questions": item.can_ask_questions,
+                "can_clone_workers": item.can_clone_workers,
+            }
+            for item in build_team_chat_messages(workspace, record, artifacts)[-30:]
+        ]
+        artifact_refs = [
+            {
+                "path": artifact.path,
+                "producer_node_id": artifact.producer_node_id,
+                "kind": artifact.kind,
+                "summary": artifact.summary[:240],
+            }
+            for artifact in artifacts[:40]
         ]
         return "\n".join(
             [
-                "You are the persistent Planner/Orchestrator Agent for an ARIS Web workflow.",
+                "You are the persistent Manager/Planner Agent for an ARIS Web task board runtime.",
                 "Return ONLY valid JSON. Do not include Markdown fences or prose.",
                 "",
-                "Your job is to inspect the current materialized DAG and decide whether to dynamically add literature research workers, block nodes, resume nodes, or do nothing.",
+                "Your job is to inspect the current materialized task board and decide whether to dynamically add follow-up tasks, add dependencies, block tasks, resume tasks, or do nothing.",
                 "Rules:",
                 "- Keep the graph acyclic.",
-                "- Only the planner may change the DAG.",
-                "- Literature workers are stateless sub_agent nodes with skill research-lit.",
-                "- DAG is only the current PlanSnapshot; history belongs to the EventLog and DeltaHistory.",
+                "- Only the Manager/Planner may change the task dependency graph.",
+                "- New dynamic work must be a stateless sub_agent task with objective, assignee_role, acceptance_criteria, and expected artifacts.",
+                "- Use skill research-lit for literature gaps, research-review for reviewer follow-up, paper-write for writing, and null/ad-hoc skill only when no bundled skill fits.",
+                "- The dependency graph is only the current PlanSnapshot; history belongs to the EventLog and DeltaHistory.",
                 "- Every tick must produce a Decision Card. Use decision_type=noop when no mutation is justified.",
                 "- Dynamic add_node requests must cite gap_evidence_refs or source_artifact_refs; without evidence choose noop.",
-                "- Use add_node plus block_node when a node needs literature before it can continue.",
-                "- Use resume_node only when a waiting_dynamic_dependency node has all needed research complete.",
-                "- If a waiting_approval planning/writing/review node produced artifacts that explicitly mention evidence gaps, citation gaps, missing citations, literature needs, [EVIDENCE_NEEDED], or unsupported claims, insert a focused literature worker and block that caller before human approval.",
-                "- Do not add literature work only because a node is waiting for ordinary approval; require a concrete gap from events, artifacts, or the Research Wiki.",
+                "- Planner context is control-plane only: use Team chat messages, task status, and artifact references. Do not request or rely on raw full artifact text.",
+                "- When a planner/reviewer needs content details, route a worker question as a focused sub_agent instead of reading full text yourself.",
+                "- Use add_node plus block_node when a task needs new evidence, rework, review, code, literature, or analysis before it can continue.",
+                "- Use resume_node only when a waiting_dynamic_dependency task has all dynamic dependencies complete.",
+                "- If a waiting_approval planning/writing/review task produced artifacts that explicitly mention evidence gaps, citation gaps, missing citations, literature needs, [EVIDENCE_NEEDED], unsupported claims, failed acceptance criteria, or reviewer-requested rework, insert a focused follow-up task and block that caller before human approval.",
+                "- Do not add work only because a task is waiting for ordinary approval; require a concrete gap from events, artifacts, or the Research Wiki.",
                 "- Do not delete static nodes, rewrite user static definitions, or bypass human gates.",
                 "- Prefer no deltas when the current DAG can proceed.",
                 "",
@@ -2832,11 +3684,11 @@ class WorkflowManager:
                 '  "dynamic_reason": "why a dynamic worker is needed, when applicable",',
                 '  "affected_session_ids": ["node:<workflow>:<caller>"],',
                 '  "blocked_node_ids": ["caller"],',
-                '  "expected_artifacts": ["literature_result.json"],',
+                '  "expected_artifacts": ["artifact.md"],',
                 '  "resume_plan": "how the caller session should continue after research",',
                 '  "complete": false,',
                 '  "deltas": [',
-                '    {"action":"add_node","node":{...},"research_request":{"query":"..."},"gap_evidence_refs":["artifact:..."],"expected_artifacts":["literature_result.json"],"refresh":false},',
+                '    {"action":"add_node","node":{"id":"follow-up-task","type":"sub_agent","name":"...","role":"...","skill":"research-lit|null","task_type":"research|analysis|coding|writing|review","objective":"...","acceptance_criteria":["..."],"assignee_role":"...","prompt":"...","outputs":[{"name":"artifact.md","type":"file"}],"dynamic_parent_id":"caller"},"research_request":{"query":"..."},"gap_evidence_refs":["artifact:..."],"expected_artifacts":["artifact.md"],"refresh":false},',
                 '    {"action":"add_edge","source":"node-a","target":"node-b"},',
                 '    {"action":"block_node","node_id":"caller","wait_for":["lit-node"],"reason":"...","resume_plan":"..."},',
                 '    {"action":"resume_node","node_id":"caller","reason":"..."},',
@@ -2845,20 +3697,23 @@ class WorkflowManager:
                 "}",
                 "",
                 f"Trigger: {trigger}",
-                f"Workflow title: {record.title}",
-                f"Workflow goal: {record.goal}",
+                f"Task board title: {record.title}",
+                f"Initial goal: {record.goal}",
                 "",
-                "Current nodes:",
+                "Current tasks:",
                 json.dumps(nodes, ensure_ascii=False, indent=2),
                 "",
                 "Recent events:",
                 json.dumps(recent_events, ensure_ascii=False, indent=2),
                 "",
-                "Recent artifacts compact pack:",
-                compact_recent_artifact_pack(workspace, record.id),
+                "Team chat messages (human-language updates only; use artifact_refs for large text):",
+                json.dumps(team_messages, ensure_ascii=False, indent=2),
                 "",
-                "Research Wiki compact pack:",
-                compact_research_wiki_pack(workspace),
+                "Artifact reference index (do not treat this as a full-text dump):",
+                json.dumps(artifact_refs, ensure_ascii=False, indent=2),
+                "",
+                "Research Wiki state:",
+                "initialized" if (workspace / "research-wiki").exists() else "not initialized",
                 "",
                 "Runtime policy:",
                 json.dumps(model_dict(self.runtime_policy(workspace, record.id)), ensure_ascii=False, indent=2),
@@ -2991,22 +3846,28 @@ class WorkflowManager:
                 [
                     "Run a focused, stateless literature research task for the workflow.",
                     f"Research query: {query}",
+                    "This is one precise routed question. Do not broaden it into a general survey.",
                     "",
                     "Deliverables:",
                     "- Save literature_result.json with keys: query, papers, findings, gaps, sources, wiki_refs, artifact_refs.",
+                    "- If searches fail or the requested citation cannot be verified after 3 search/fetch failures, still save literature_result.json with status='inconclusive', papers=[], gaps explaining the failure, and sources tried.",
                     "- If research-wiki/ exists, upsert the relevant paper metadata and findings into it.",
                     "- Return concise citations and source URLs where available. Do not invent citations.",
+                    "- Final summary must be a short human-language update plus artifact path, not the full JSON.",
                 ]
             )
         if request and "Research request JSON:" not in prompt:
             prompt = f"{prompt}\n\nResearch request JSON:\n{json.dumps(request, ensure_ascii=False, indent=2)}"
+        requested_skill = (node.skill if node and node.skill in LITERATURE_SKILLS else None) or (
+            "openalex-search" if "openalex" in query.lower() else "research-lit"
+        )
 
         update = {
             "id": node_id,
             "type": "sub_agent",
             "name": (node.name if node and node.name.strip() else f"Literature research: {query[:48]}"),
             "role": (node.role if node and node.role.strip() else "literature scout"),
-            "skill": "research-lit",
+            "skill": requested_skill,
             "prompt": prompt,
             "depends_on": list(node.depends_on if node else []),
             "outputs": [{"name": "literature_result.json", "type": "file", "required": True}],
@@ -3016,8 +3877,12 @@ class WorkflowManager:
             "research_request": request or {"query": query},
             "concurrency_class": "literature",
             "failure_policy": "continue",
+            "timeout_seconds": node.timeout_seconds if node and node.timeout_seconds is not None else 180,
             "position": (node.position if node and node.position else {"x": 120, "y": 320}),
         }
+        update.update(protocol_defaults("literature"))
+        update["team_role_kind"] = "literature"
+        update["scope"] = default_scope_for_kind("literature")
         if node is None:
             return WorkflowNode(**update)
         data = model_dict(node)
@@ -3031,12 +3896,415 @@ class WorkflowManager:
         for item in graph.nodes:
             if item.id == node.id:
                 continue
-            if item.skill != "research-lit":
+            if item.skill not in LITERATURE_SKILLS:
                 continue
             if item.dynamic_parent_id != node.dynamic_parent_id:
                 continue
             if research_query_from_request(item.research_request) == query:
                 return item
+        return None
+
+    def _has_existing_literature_request(self, graph: WorkflowGraph, caller_id: str, query: str) -> bool:
+        normalized_query = _clean_gap_query(query, fallback=query).lower()
+        for item in graph.nodes:
+            if item.dynamic_parent_id != caller_id or item.skill not in LITERATURE_SKILLS:
+                continue
+            existing_query = _clean_gap_query(research_query_from_request(item.research_request), fallback="").lower()
+            if existing_query == normalized_query:
+                return True
+        return False
+
+    def _caller_has_pending_dynamic_dependency(self, graph: WorkflowGraph, caller_id: str) -> bool:
+        return any(
+            item.dynamic_parent_id == caller_id
+            and item.status not in TERMINAL_NODE_STATUSES
+            and item.skill in LITERATURE_SKILLS
+            for item in graph.nodes
+        )
+
+    def _caller_has_pending_dynamic_work(self, graph: WorkflowGraph, caller_id: str) -> bool:
+        return any(
+            item.dynamic_parent_id == caller_id
+            and item.status not in TERMINAL_NODE_STATUSES
+            for item in graph.nodes
+        )
+
+    def _local_worker_question_decision(self, workspace: Path, record: WorkflowRecord) -> PlannerDecision | None:
+        graph = record.graph_json
+        artifacts = build_artifact_index(workspace, record)
+        artifacts_by_node: dict[str, list[ArtifactIndexEntry]] = {}
+        for artifact in artifacts:
+            if artifact.producer_node_id:
+                artifacts_by_node.setdefault(artifact.producer_node_id, []).append(artifact)
+
+        for node in graph.nodes:
+            if node.type not in EXECUTABLE_NODE_TYPES or not node.run_id or not node.can_ask_questions:
+                continue
+            if node.status not in {"waiting_approval", "succeeded"}:
+                continue
+            if self._caller_has_pending_dynamic_work(graph, node.id):
+                continue
+
+            evidence_ref = ""
+            requests: list[dict[str, str]] = []
+            message_path = last_message_path(workspace, node.run_id)
+            if message_path.exists():
+                try:
+                    requests = detect_worker_question_requests(node, message_path.read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    requests = []
+                if requests:
+                    evidence_ref = f"event:{node.id}"
+            if not requests:
+                for artifact in artifacts_by_node.get(node.id, []):
+                    path = workspace / artifact.path
+                    try:
+                        if path.stat().st_size > 512_000:
+                            continue
+                        text = path.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        continue
+                    requests = detect_worker_question_requests(node, text)
+                    if requests:
+                        evidence_ref = f"artifact:{artifact.path}"
+                        break
+            if not requests:
+                continue
+
+            deltas: list[WorkflowDelta] = []
+            wait_for: list[str] = []
+            for request in requests[:3]:
+                spec = worker_question_role_spec(request["role"])
+                question = request["question"]
+                answer_id = dynamic_worker_question_node_id(node.id, str(spec["role"]), question)
+                if any(item.id == answer_id for item in graph.nodes):
+                    continue
+                kind = str(spec["kind"] or "worker")
+                answer_name = f"Answer: {question[:56]}"
+                answer_prompt = (
+                    f"Answer this planner/reviewer question for the team chat: {question}\n"
+                    "Read only the artifacts needed to answer. Do not ask follow-up questions. "
+                    "Write WORKER_ANSWER.md with a concise answer, artifact references, assumptions, and remaining uncertainty. "
+                    "End with a compact human-language summary; do not paste full artifacts."
+                )
+                answer_node = WorkflowNode(
+                    id=answer_id,
+                    name=answer_name,
+                    type="sub_agent",
+                    role=str(spec["role"] or "worker"),
+                    skill=str(spec["skill"]) if spec["skill"] else None,
+                    task_type=str(spec["task_type"] or "analysis"),  # type: ignore[arg-type]
+                    team_role_kind=kind,  # type: ignore[arg-type]
+                    scope=default_scope_for_kind(kind),
+                    can_ask_questions=False,
+                    can_clone_workers=True,
+                    can_call_planner=False,
+                    peer_access=True,
+                    reports_to_chat=True,
+                    auto_approve_after=True,
+                    failure_policy="continue",
+                    timeout_seconds=180,
+                    objective=f"Answer the routed team question: {question}",
+                    acceptance_criteria=[
+                        "WORKER_ANSWER.md directly answers the routed question",
+                        "Artifact paths and uncertainty are explicit",
+                        "The final summary is concise and contains no full-text dump",
+                    ],
+                    assignee_role=str(spec["role"] or "worker"),
+                    prompt=answer_prompt,
+                    outputs=["WORKER_ANSWER.md"],
+                    dynamic_parent_id=node.id,
+                    dynamic_reason=request.get("reason") or "Planner asked a worker question",
+                    position={
+                        "x": float(node.position.get("x", 0)) + 160,
+                        "y": float(node.position.get("y", 0)) + 240 + 80 * len(wait_for),
+                    },
+                )
+                deltas.append(
+                    WorkflowDelta(
+                        action="add_node",
+                        node=answer_node,
+                        reason=request.get("reason") or "Planner asked a worker question",
+                        gap_evidence_refs=[evidence_ref],
+                        expected_artifacts=["WORKER_ANSWER.md"],
+                    )
+                )
+                wait_for.append(answer_id)
+            if not wait_for:
+                continue
+            deltas.append(
+                WorkflowDelta(
+                    action="block_node",
+                    node_id=node.id,
+                    wait_for=wait_for,
+                    reason=f"{node.name} asked worker question(s)",
+                    resume_plan=f"Resume {node.name} after worker answer(s) are available in team chat.",
+                )
+            )
+            return PlannerDecision(
+                rationale=f"{node.name} asked worker question(s)",
+                decision_type="mutate",
+                confidence=0.9,
+                gap_type="method_gap",
+                gap_evidence_refs=[evidence_ref],
+                dynamic_reason="Planner routed question(s) to employees",
+                affected_session_ids=[_session_id_for_node(record.id, node)],
+                blocked_node_ids=[node.id],
+                expected_artifacts=["WORKER_ANSWER.md"],
+                resume_plan=f"Resume {node.name} after worker answer(s) are available in team chat.",
+                deltas=deltas,
+            )
+        return None
+
+    def _local_worker_clone_decision(self, workspace: Path, record: WorkflowRecord) -> PlannerDecision | None:
+        graph = record.graph_json
+        artifacts = build_artifact_index(workspace, record)
+        artifacts_by_node: dict[str, list[ArtifactIndexEntry]] = {}
+        for artifact in artifacts:
+            if artifact.producer_node_id:
+                artifacts_by_node.setdefault(artifact.producer_node_id, []).append(artifact)
+
+        for node in graph.nodes:
+            if node.type not in EXECUTABLE_NODE_TYPES or not node.run_id or not node.can_clone_workers:
+                continue
+            if self._caller_has_pending_dynamic_work(graph, node.id):
+                continue
+            is_review_waiting = node.status == "waiting_approval" and not node.approved_after
+            is_auto_approved = node.status == "succeeded" and node.auto_approve_after and node.approved_after
+            if not (is_review_waiting or is_auto_approved):
+                continue
+
+            request: dict[str, str] | None = None
+            evidence_ref = ""
+            for artifact in artifacts_by_node.get(node.id, []):
+                path = workspace / artifact.path
+                try:
+                    if path.stat().st_size > 512_000:
+                        continue
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                request = detect_worker_clone_request(node, text)
+                if request:
+                    evidence_ref = f"artifact:{artifact.path}"
+                    break
+            if request is None and node.run_id:
+                message_path = last_message_path(workspace, node.run_id)
+                if message_path.exists():
+                    try:
+                        request = detect_worker_clone_request(node, message_path.read_text(encoding="utf-8", errors="replace"))
+                    except OSError:
+                        request = None
+                    if request:
+                        evidence_ref = f"event:{node.id}"
+
+            if request is None:
+                continue
+
+            objective = request["objective"]
+            clone_id = dynamic_clone_node_id(node.id, objective)
+            if any(item.id == clone_id for item in graph.nodes):
+                continue
+            role_kind = node.team_role_kind or "worker"
+            clone_outputs = [{"name": f"{_safe_node_slug(objective, 'worker-result')}.md", "type": "file", "required": True}]
+            clone = WorkflowNode(
+                id=clone_id,
+                name=f"{node.name} helper: {objective[:48]}",
+                type="sub_agent",
+                role=node.role,
+                skill=node.skill,
+                config_file=node.config_file,
+                model=node.model,
+                effort=node.effort,
+                task_type=node.task_type,
+                objective=f"Assist {node.name} with this delegated subtask: {objective}",
+                acceptance_criteria=[
+                    "Work autonomously without asking the planner or user questions",
+                    "Write the declared helper artifact with concise findings or edits",
+                    "Report only a human-language summary plus artifact references",
+                ],
+                assignee_role=node.assignee_role or node.role or node.team_role_id,
+                prompt=(
+                    f"You are a cloned helper for {node.name}. Complete this subtask autonomously:\n{objective}\n\n"
+                    "Use upstream artifacts as context and write the declared helper artifact. "
+                    "Do not call the planner; report concise status with artifact links."
+                ),
+                depends_on=[node.id],
+                outputs=clone_outputs,
+                dynamic_parent_id=node.id,
+                dynamic_reason=request["reason"],
+                team_id=node.team_id,
+                team_instance_id=node.team_instance_id,
+                team_role_id=node.team_role_id,
+                team_role_kind=role_kind,  # type: ignore[arg-type]
+                scope=node.scope or default_scope_for_kind(role_kind),
+                can_ask_questions=False,
+                can_clone_workers=node.can_clone_workers,
+                can_call_planner=False,
+                peer_access=node.peer_access,
+                reports_to_chat=True,
+                auto_approve_after=True,
+                position={
+                    "x": float(node.position.get("x", 0)) + 160,
+                    "y": float(node.position.get("y", 0)) + 220,
+                },
+            )
+            return PlannerDecision(
+                rationale=request["reason"],
+                decision_type="mutate",
+                confidence=0.84,
+                gap_type="worker_clone",
+                gap_evidence_refs=[evidence_ref],
+                dynamic_reason=request["reason"],
+                affected_session_ids=[_session_id_for_node(record.id, node)],
+                blocked_node_ids=[node.id],
+                expected_artifacts=[clone_outputs[0]["name"]],
+                resume_plan=f"Resume {node.name} after helper {clone_id} finishes, using the helper artifact as context.",
+                deltas=[
+                    WorkflowDelta(
+                        action="add_node",
+                        node=clone,
+                        gap_type="worker_clone",
+                        gap_evidence_refs=[evidence_ref],
+                        expected_artifacts=[clone_outputs[0]["name"]],
+                        reason=request["reason"],
+                    ),
+                    WorkflowDelta(
+                        action="block_node",
+                        node_id=node.id,
+                        wait_for=[clone_id],
+                        reason=request["reason"],
+                        resume_plan=f"Resume {node.name} after {clone_id} succeeds.",
+                    ),
+                ],
+            )
+        return None
+
+    def _local_literature_gap_decision(self, workspace: Path, record: WorkflowRecord) -> PlannerDecision | None:
+        graph = record.graph_json
+        policy = self.runtime_policy(workspace, record.id)
+        artifacts = build_artifact_index(workspace, record)
+        artifacts_by_node: dict[str, list[ArtifactIndexEntry]] = {}
+        for artifact in artifacts:
+            if artifact.producer_node_id:
+                artifacts_by_node.setdefault(artifact.producer_node_id, []).append(artifact)
+
+        for node in graph.nodes:
+            if node.type not in EXECUTABLE_NODE_TYPES:
+                continue
+            if node.skill in LITERATURE_SKILLS:
+                continue
+            if not node.run_id:
+                continue
+            is_review_waiting = node.status == "waiting_approval" and not node.approved_after
+            is_auto_approved = node.status == "succeeded" and node.auto_approve_after and node.approved_after
+            if not (is_review_waiting or is_auto_approved):
+                continue
+            if self._caller_has_pending_dynamic_work(graph, node.id):
+                continue
+            caller_dynamic_count = sum(1 for item in graph.nodes if item.dynamic_parent_id == node.id)
+            if caller_dynamic_count >= policy.max_dynamic_nodes_per_caller:
+                continue
+
+            evidence_ref = ""
+            gaps: list[dict[str, str]] = []
+            for artifact in artifacts_by_node.get(node.id, []):
+                path = workspace / artifact.path
+                try:
+                    if path.stat().st_size > 512_000:
+                        continue
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                gaps = detect_literature_gap_requests(record, node, text)
+                if gaps:
+                    evidence_ref = f"artifact:{artifact.path}"
+                    break
+
+            if not gaps and node.run_id:
+                message_path = last_message_path(workspace, node.run_id)
+                if message_path.exists():
+                    try:
+                        text = message_path.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        text = ""
+                    gaps = detect_literature_gap_requests(record, node, text)
+                    if gaps:
+                        evidence_ref = f"event:{node.id}"
+
+            if not gaps:
+                continue
+            deltas: list[WorkflowDelta] = []
+            wait_for: list[str] = []
+            expected_artifacts: list[str] = []
+            gap_types: list[str] = []
+            reason = gaps[0].get("reason") or f"{node.name} needs literature before downstream work can continue"
+            for gap in gaps[:6]:
+                query = gap["query"]
+                if self._has_existing_literature_request(graph, node.id, query):
+                    continue
+                skill_id = "openalex-search" if "openalex" in query.lower() else "research-lit"
+                lit_id = dynamic_literature_node_id(node.id, query)
+                wait_for.append(lit_id)
+                expected_artifacts.append("literature_result.json")
+                gap_types.append(gap.get("gap_type") or "literature_gap")
+                deltas.append(
+                    WorkflowDelta(
+                        action="add_node",
+                        node=WorkflowNode(
+                            id=lit_id,
+                            name=f"Literature: {query[:64]}",
+                            type="sub_agent",
+                            role="literature scout",
+                            skill=skill_id,
+                            task_type="research",
+                            objective=f"Search and summarize literature needed by {node.name}: {query}",
+                            acceptance_criteria=[
+                                "literature_result.json is written with query, papers, findings, gaps, and sources",
+                                "Citations and source URLs are explicit; uncertain items are marked",
+                                "Findings directly answer the blocked role's request",
+                                "If search fails, write an inconclusive result instead of continuing indefinitely",
+                            ],
+                            assignee_role="literature scout",
+                            dynamic_parent_id=node.id,
+                            timeout_seconds=180,
+                            failure_policy="continue",
+                            position={
+                                "x": float(node.position.get("x", 0)) + 120,
+                                "y": float(node.position.get("y", 0)) + 220 + 80 * len(wait_for),
+                            },
+                        ),
+                        research_request={"query": query, "caller_id": node.id, "source": "local-gap-detector"},
+                        gap_type=gap.get("gap_type") or "literature_gap",
+                        gap_evidence_refs=[evidence_ref],
+                        expected_artifacts=["literature_result.json"],
+                        reason=gap.get("reason") or reason,
+                    )
+                )
+            if not wait_for:
+                continue
+            deltas.append(
+                WorkflowDelta(
+                    action="block_node",
+                    node_id=node.id,
+                    wait_for=wait_for,
+                    reason=reason,
+                    resume_plan=f"Resume {node.name} after dynamic worker answer(s) are available in team chat.",
+                )
+            )
+            return PlannerDecision(
+                rationale=reason,
+                decision_type="mutate",
+                confidence=0.86,
+                gap_type=gap_types[0] if gap_types else "literature_gap",
+                gap_evidence_refs=[evidence_ref],
+                dynamic_reason=reason,
+                affected_session_ids=[_session_id_for_node(record.id, node)],
+                blocked_node_ids=[node.id],
+                expected_artifacts=expected_artifacts,
+                resume_plan=f"Resume {node.name} with the dynamic worker result(s), then regenerate only from team-chat summaries and artifact references.",
+                deltas=deltas,
+            )
         return None
 
     def _normalize_planner_decision(self, workflow_id: str, decision: PlannerDecision) -> PlannerDecision:
@@ -3059,7 +4327,7 @@ class WorkflowManager:
         if delta.action in {"mark_noop", "complete", "resume_node"}:
             return PolicyResult(allowed=True, reason="allowed")
         nodes_by_id = {node.id: node for node in graph.nodes}
-        dynamic_research_nodes = [node for node in graph.nodes if node.dynamic_parent_id and node.skill == "research-lit"]
+        dynamic_nodes = [node for node in graph.nodes if node.dynamic_parent_id]
         if delta.action == "add_node":
             node = prepared_node or delta.node
             if node is None:
@@ -3068,17 +4336,17 @@ class WorkflowManager:
                 return PolicyResult(allowed=True, reason="deduplicated existing node id")
             if node.type != "sub_agent":
                 return PolicyResult(allowed=False, reason="Planner may only insert sub_agent nodes")
-            if node.skill not in policy.allowed_dynamic_skills:
+            if policy.allowed_dynamic_skills and node.skill not in policy.allowed_dynamic_skills:
                 return PolicyResult(allowed=False, reason=f"Planner may only insert skills: {', '.join(policy.allowed_dynamic_skills)}")
             if policy.require_gap_evidence and not _evidence_refs(decision, delta):
-                return PolicyResult(allowed=False, reason="dynamic literature insertion requires gap evidence refs")
-            if len(dynamic_research_nodes) >= policy.max_dynamic_nodes_total:
-                return PolicyResult(allowed=False, reason="workflow dynamic research node cap reached")
+                return PolicyResult(allowed=False, reason="dynamic task insertion requires gap evidence refs")
+            if len(dynamic_nodes) >= policy.max_dynamic_nodes_total:
+                return PolicyResult(allowed=False, reason="task board dynamic node cap reached")
             caller = node.dynamic_parent_id or str((node.research_request or {}).get("caller_id") or "").strip()
             if caller:
-                caller_count = sum(1 for item in dynamic_research_nodes if item.dynamic_parent_id == caller)
+                caller_count = sum(1 for item in dynamic_nodes if item.dynamic_parent_id == caller)
                 if caller_count >= policy.max_dynamic_nodes_per_caller:
-                    return PolicyResult(allowed=False, reason=f"dynamic research node cap reached for caller {caller}")
+                    return PolicyResult(allowed=False, reason=f"dynamic task cap reached for caller {caller}")
             if delta.refresh and not (delta.reason or decision.rationale):
                 return PolicyResult(allowed=False, reason="refresh requires an explicit rationale")
             return PolicyResult(allowed=True, reason="allowed")
@@ -3484,6 +4752,12 @@ class WorkflowManager:
                 )
             decision = await self._run_planner(workspace, record, trigger)
             if decision is None:
+                decision = (
+                    self._local_worker_question_decision(workspace, record)
+                    or self._local_worker_clone_decision(workspace, record)
+                    or self._local_literature_gap_decision(workspace, record)
+                )
+            if decision is None:
                 if planner_enabled:
                     noop_decision = PlannerDecision(
                         tick_id=tick_id,
@@ -3647,6 +4921,26 @@ class WorkflowManager:
 
         ready = []
         nodes_by_id = {node.id: node for node in graph.nodes}
+        completed_inputs = []
+        for node in graph.nodes:
+            if node.type == "input" and node.status == "queued":
+                node.status = "succeeded"
+                node.error = None
+                completed_inputs.append(node.id)
+        if completed_inputs:
+            update_workflow(workspace, workflow_id, graph_json=graph)
+            await self._append_event(
+                workspace,
+                WorkflowEvent(
+                    workflow_id=workflow_id,
+                    timestamp=utc_now(),
+                    event_type="workflow",
+                    message=f"Input context ready: {len(completed_inputs)} node(s)",
+                    payload={"input_nodes": completed_inputs},
+                ),
+            )
+            await self._tick(workspace, workflow_id)
+            return
         for node in graph.nodes:
             if node.status != "queued":
                 continue
@@ -3775,9 +5069,41 @@ class WorkflowManager:
                 if not result.succeeded:
                     failure_error = result.error or result.message or "Node failed"
                 else:
+                    run_record = get_run(workspace, node.run_id) if node.run_id else None
+                    moved_outputs = reconcile_declared_outputs(
+                        workspace,
+                        workflow_id,
+                        node,
+                        not_before=run_record.started_at or run_record.created_at if run_record else None,
+                    )
+                    if moved_outputs:
+                        await self._append_event(
+                            workspace,
+                            WorkflowEvent(
+                                workflow_id=workflow_id,
+                                timestamp=utc_now(),
+                                event_type="artifact",
+                                node_id=node_id,
+                                run_id=node.run_id,
+                                message=f"Archived {len(moved_outputs)} declared output(s) from workspace root",
+                                payload={"moved": moved_outputs},
+                            ),
+                        )
                     missing_outputs = missing_concrete_outputs(workspace, workflow_id, node)
                     if missing_outputs:
                         failure_error = "Missing expected output file(s): " + ", ".join(missing_outputs)
+                    elif node.can_ask_questions is False and node.run_id:
+                        message_path = last_message_path(workspace, node.run_id)
+                        if message_path.exists():
+                            try:
+                                final_message = message_path.read_text(encoding="utf-8", errors="replace")
+                            except OSError:
+                                final_message = ""
+                            if output_has_disallowed_question(final_message):
+                                failure_error = (
+                                    "Protocol violation: this worker role cannot ask questions. "
+                                    "Rerun with assumptions stated as facts or evidence markers."
+                                )
 
                 if failure_error is None:
                     if node.auto_approve_after:
@@ -3808,6 +5134,36 @@ class WorkflowManager:
                             payload={"auto_approve_after": node.auto_approve_after},
                         ),
                     )
+                    final_summary = ""
+                    if node.run_id:
+                        message_path = last_message_path(workspace, node.run_id)
+                        if message_path.exists():
+                            try:
+                                final_summary = _human_message_preview(message_path.read_text(encoding="utf-8", errors="replace"))
+                            except OSError:
+                                final_summary = ""
+                    if final_summary and node.reports_to_chat is not False:
+                        await self._append_event(
+                            workspace,
+                            WorkflowEvent(
+                                workflow_id=workflow_id,
+                                timestamp=utc_now(),
+                                event_type="team_message",
+                                node_id=node_id,
+                                run_id=node.run_id,
+                                message=final_summary,
+                                payload={
+                                    "role": node.assignee_role or node.role or node.team_role_id,
+                                    "role_kind": node.team_role_kind or "worker",
+                                    "scope": node.scope,
+                                    "artifact_refs": [
+                                        item.path for item in artifact_entries if item.producer_node_id == node_id
+                                    ],
+                                    "can_ask_questions": node.can_ask_questions,
+                                    "can_clone_workers": node.can_clone_workers,
+                                },
+                            ),
+                        )
                     await self._append_event(
                         workspace,
                         WorkflowEvent(
@@ -3961,11 +5317,57 @@ class WorkflowManager:
         update_workflow(workspace, workflow_id, graph_json=graph)
         return node
 
+    def _write_literature_inconclusive_result(
+        self,
+        workspace: Path,
+        record: WorkflowRecord,
+        node: WorkflowNode,
+        run_id: str,
+        subagent_dir: Path,
+        failures: list[str],
+    ) -> str:
+        subagent_dir.mkdir(parents=True, exist_ok=True)
+        artifact_path = subagent_dir / "literature_result.json"
+        try:
+            artifact_rel = artifact_path.resolve().relative_to(workspace.resolve()).as_posix()
+        except ValueError:
+            artifact_rel = str(artifact_path)
+        query = research_query_from_request(node.research_request) or node.objective or node.name
+        payload = {
+            "query": query,
+            "status": "inconclusive",
+            "papers": [],
+            "findings": [],
+            "gaps": [
+                "Search/fetch failed repeatedly, so the requested literature evidence was not verified.",
+                "Planner should route a narrower question, switch search source, or ask another worker if this evidence is still needed.",
+            ],
+            "sources": [],
+            "wiki_refs": [],
+            "artifact_refs": [],
+            "tool_failures": failures[-5:],
+            "workflow_id": record.id,
+            "node_id": node.id,
+        }
+        artifact_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        summary = (
+            "Literature scout stopped after repeated search/fetch failures.\n\n"
+            f"- Question: {query}\n"
+            f"- Status: inconclusive after {len(failures)} search/fetch failure(s)\n"
+            f"- Artifact: `{artifact_rel}`\n"
+            "- Routing note: planner should decide whether to narrow the query, use another source, or continue without this citation."
+        )
+        last_message_path(workspace, run_id).write_text(summary, encoding="utf-8")
+        return summary
+
     async def _run_node_with_aris(self, workspace: Path, record: WorkflowRecord, node: WorkflowNode) -> NodeRunResult:
         config = get_agent_config(workspace, node.config_file) if node.type == "sub_agent" and node.config_file else None
         if node.type == "sub_agent" and node.config_file and config is None:
             raise ValueError(f"Agent config not found: {node.config_file}")
         effective_skill_id = node.skill or (config.skill if config else None)
+        role_kind = node.team_role_kind or "worker"
+        if role_kind == "planner":
+            effective_skill_id = None
         effective_model = node.model or (config.model if config else None)
         effective_effort = node.effort or (config.effort if config else None) or effective_effort_override()
         # Prefer the node/config skill so web-launched sub-agents follow the
@@ -4004,6 +5406,7 @@ class WorkflowManager:
             model=effective_model,
             effort=effective_effort,
             session_path=str(session_abs),
+            allowed_tools=allowed_tools_for_role(role_kind, effective_skill_id or skill.id),
             env_overrides={
                 "ARIS_WORKFLOW_ID": record.id,
                 "ARIS_NODE_ID": node.id,
@@ -4046,6 +5449,8 @@ class WorkflowManager:
 
         queue = await self.run_manager.bus.subscribe(run.id)
         forwarded_event_keys: set[tuple[str, str, str, str]] = set()
+        search_failure_messages: list[str] = []
+        enforce_search_failure_cap = role_kind == "literature" or skill.id in LITERATURE_SKILLS
         started_at = loop.time()
         heartbeat_interval = 15.0
         next_heartbeat_at = started_at + heartbeat_interval
@@ -4062,6 +5467,13 @@ class WorkflowManager:
                 return
             forwarded_event_keys.add(key)
             await self._forward_run_event(workspace, record.id, node.id, event)
+            if (
+                enforce_search_failure_cap
+                and event.stream == "stderr"
+                and "Tool failed:" in event.message
+                and ("WebSearch" in event.message or "WebFetch" in event.message)
+            ):
+                search_failure_messages.append(event.message.strip())
 
         async def flush_run_events() -> None:
             for event in await self.run_manager.replay_events(workspace, run.id):
@@ -4094,8 +5506,41 @@ class WorkflowManager:
                 ),
             )
 
+        async def maybe_stop_after_search_failures() -> NodeRunResult | None:
+            if not enforce_search_failure_cap or len(search_failure_messages) < 3:
+                return None
+            summary = self._write_literature_inconclusive_result(
+                workspace,
+                record,
+                node,
+                run.id,
+                subagent_dir,
+                search_failure_messages,
+            )
+            await self._append_event(
+                workspace,
+                WorkflowEvent(
+                    workflow_id=record.id,
+                    timestamp=utc_now(),
+                    event_type="node",
+                    node_id=node.id,
+                    run_id=run.id,
+                    message=f"Literature search stopped after repeated tool failures: {node.name}",
+                    payload={"reason": "search_failure_cap", "failure_count": len(search_failure_messages)},
+                ),
+            )
+            try:
+                await self.run_manager.cancel(workspace, run.id)
+            except Exception:
+                pass
+            last_message_path(workspace, run.id).write_text(summary, encoding="utf-8")
+            return NodeRunResult(run_id=run.id, succeeded=True, message=summary, error=None)
+
         try:
             await flush_run_events()
+            cap_result = await maybe_stop_after_search_failures()
+            if cap_result is not None:
+                return cap_result
             while True:
                 current = get_run(workspace, run.id)
                 if current and current.status in {"succeeded", "failed", "cancelled"}:
@@ -4164,6 +5609,9 @@ class WorkflowManager:
                         next_heartbeat_at = now + heartbeat_interval
                     continue
                 await forward_once(event)
+                cap_result = await maybe_stop_after_search_failures()
+                if cap_result is not None:
+                    return cap_result
         finally:
             await self.run_manager.bus.unsubscribe(run.id, queue)
 
@@ -4184,6 +5632,25 @@ class WorkflowManager:
             raise ValueError(f"Agent config not found: {node.config_file}")
         upstream = []
         nodes_by_id = {item.id: item for item in record.graph_json.nodes}
+        role_kind = node.team_role_kind or "worker"
+        artifact_index = build_artifact_index(workspace, record)
+        artifacts_by_node: dict[str, list[ArtifactIndexEntry]] = {}
+        for artifact in artifact_index:
+            if artifact.producer_node_id:
+                artifacts_by_node.setdefault(artifact.producer_node_id, []).append(artifact)
+        team_chat_items = [
+            {
+                "timestamp": item.timestamp,
+                "node_id": item.node_id,
+                "role": item.role,
+                "role_kind": item.role_kind,
+                "scope": item.scope,
+                "message": item.message,
+                "artifact_refs": [artifact.path for artifact in item.artifact_refs],
+            }
+            for item in build_team_chat_messages(workspace, record, artifact_index)[-20:]
+        ]
+        team_chat_text = json.dumps(team_chat_items, ensure_ascii=False, indent=2) if team_chat_items else "(no team chat updates yet)"
         fanout_source_id = None
         if node.fanout_parent_id:
             template_node = nodes_by_id.get(node.fanout_parent_id)
@@ -4197,6 +5664,20 @@ class WorkflowManager:
             structured_blob = ""
             if node.fanout_item is not None and fanout_source_id == parent.id:
                 summary = "Fan-out source completed. Use the Dynamic fan-out assignment above for this child node."
+            elif parent.type == "input":
+                summary = parent.objective.strip() or parent.prompt.strip() or parent.name
+            elif role_kind == "planner":
+                parent_messages = [item for item in team_chat_items if item["node_id"] == parent.id]
+                parent_artifacts = [artifact.path for artifact in artifacts_by_node.get(parent.id, [])]
+                summary = json.dumps(
+                    {
+                        "status": parent.status,
+                        "human_language_updates": parent_messages,
+                        "artifact_refs": parent_artifacts,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
             elif parent.run_id:
                 # Prefer the structured node_output.json when an upstream agent
                 # produced a parseable JSON payload — gives the downstream node
@@ -4234,6 +5715,7 @@ class WorkflowManager:
         fanout_assignment = ""
         if node.fanout_item is not None:
             fanout_assignment = json.dumps(node.fanout_item, ensure_ascii=False, indent=2)
+        acceptance_text = "\n".join(f"- {item}" for item in node.acceptance_criteria) or "(none declared)"
         config_text = "(none)"
         config_prefix = ""
         if config:
@@ -4254,18 +5736,71 @@ Prompt prefix from config:
 Output contract from config:
 {config.output_contract or "(none)"}
 """
-        effective_skill_label = node.skill or (config.skill if config else None)
+        effective_skill_label = None if role_kind == "planner" else node.skill or (config.skill if config else None)
         actor_label = "SubAgent" if node.type == "sub_agent" else "Agent"
-        return f"""You are executing one {actor_label} node in an ARIS Web multi-agent workflow.
+        prompt_text = node.prompt.strip()
+        if not prompt_text:
+            prompt_text = "(none; follow the inherited skill contract, objective, inputs, outputs, and acceptance criteria.)"
+        role_scope = node.scope or default_scope_for_kind(role_kind)
+        defaults = protocol_defaults(role_kind)
+        can_ask_questions = defaults["can_ask_questions"] if node.can_ask_questions is None else bool(node.can_ask_questions)
+        can_clone_workers = defaults["can_clone_workers"] if node.can_clone_workers is None else bool(node.can_clone_workers)
+        can_call_planner = defaults["can_call_planner"] if node.can_call_planner is None else bool(node.can_call_planner)
+        peer_access = defaults["peer_access"] if node.peer_access is None else bool(node.peer_access)
+        planner_control_text = ""
+        if role_kind == "planner":
+            planner_control_text = """
+	Planner control-plane rules:
+	- You are the control-plane planner, not a content worker.
+	- You cannot read full artifacts. Use only Team chat updates, artifact_refs, task status, and the initial goal.
+	- Do not use read/glob/grep/WebSearch/WebFetch/Skill. Those tools are intentionally unavailable for this role.
+	- If you need details, ask an employee by writing `[ASK_WORKER: writer|literature scout|citation inserter|reviewer | concrete question]` in your declared artifact or final summary.
+	- Use `[LITERATURE_NEEDED: one precise query]` only for concrete literature gaps. Write one marker per query.
+	- Keep your own output short: route questions, summarize status, and point to artifact_refs.
+"""
+        reviewer_dialogue_text = ""
+        if role_kind == "reviewer":
+            reviewer_dialogue_text = """
+	Reviewer dialogue rules:
+	- Keep looking for concrete problems in evidence, citations, claims, and clarity.
+	- If an issue needs work, write `[ASK_WORKER: writer|literature scout|citation inserter | concrete question]` in your artifact and final summary.
+	- Do not perform the fix yourself and do not decide the assignee; the planner routes your questions.
+	- If no blocking question remains, explicitly say PASS and keep any notes as non-blocking watch items.
+"""
+        if role_kind == "planner":
+            tool_contract = "- Planner tool contract: only write/edit/TodoWrite/Sleep/SendUserMessage/Config/StructuredOutput are available; do not attempt to inspect file contents."
+        elif role_kind == "literature":
+            tool_contract = "- Literature tool contract: use search/fetch and artifact tools only for the routed query; stop with an inconclusive artifact after repeated failures."
+        elif role_kind in {"writer", "citation"}:
+            tool_contract = "- Artifact worker tool contract: read and edit artifacts, but do not use WebSearch/WebFetch and do not ask follow-up questions. If citations or evidence are missing, report focused [LITERATURE_NEEDED: ...] markers in the short human update."
+        elif role_kind == "reviewer":
+            tool_contract = "- Reviewer tool contract: inspect artifacts and write review questions, but do not use WebSearch/WebFetch. Route follow-up work with [ASK_WORKER: writer|literature scout|citation inserter | concrete question]."
+        else:
+            tool_contract = "- Use the available workspace-safe tools directly for the assigned scope."
+        skill_contract = (
+            "- Planner role ignores suggested skills. Ask workers to read artifacts or search; do not load skill instructions."
+            if role_kind == "planner"
+            else "- When a suggested skill label is present, treat that ARIS skill as the node's execution contract. Load its SKILL.md with the Skill tool when it is relevant to the node, especially for literature search or research review, while keeping this node prompt as the local scope and output contract."
+        )
+        return f"""You are executing one {actor_label} task in an ARIS Web multi-agent task board runtime.
 
-Workflow title: {record.title}
-Workflow goal:
+Task board title: {record.title}
+Initial goal:
 {record.goal}
 
-Node id: {node.id}
-Node name: {node.name}
-Node type: {node.type}
-Node role: {node.role or "agent"}
+Task id: {node.id}
+Task name: {node.name}
+Task type: {node.task_type}
+Task runtime type: {node.type}
+Task role: {node.role or "agent"}
+Task objective:
+{node.objective.strip() or "(derive the concrete work from the inherited skill and declared inputs/outputs)"}
+Acceptance criteria:
+{acceptance_text}
+Assigned role: {node.assignee_role or node.role or node.team_role_id or "(none)"}
+Assigned to: {node.assigned_to or "(unassigned)"}
+Claimed by: {node.claimed_by or "(unclaimed)"}
+Review status: {node.review_status}
 Suggested skill label: {("/" + effective_skill_label) if effective_skill_label else "(none)"}
 Expected inputs:
 {inputs_text}
@@ -4278,50 +5813,72 @@ Concrete output storage paths:
 Downstream fan-out requirements:
 {fanout_output_requirements}
 
-Sub-agent execution namespace:
+Task execution namespace:
 - ARIS_WORKFLOW_ID={record.id}
 - ARIS_NODE_ID={node.id}
 - ARIS_NODE_ATTEMPT={node.attempt + 1}
 - ARIS_SUBAGENT_DIR=.aris/web/workflows/{record.id}/nodes/{node.id}/attempt-{node.attempt + 1}
 - ARIS_NODE_SESSION={node.session_path or ".aris/web/workflows/" + record.id + "/nodes/" + node.id + "/session.json"}
 
-Dynamic planning context:
-- dynamic_parent_id={node.dynamic_parent_id or "(none)"}
+	Dynamic planning context:
+	- dynamic_parent_id={node.dynamic_parent_id or "(none)"}
 - dynamic_reason={node.dynamic_reason or "(none)"}
 - auto_approve_after={str(node.auto_approve_after).lower()}
 - research_request={json.dumps(node.research_request, ensure_ascii=False) if node.research_request else "(none)"}
 
-Agent configuration profile:
-{config_text}
+	Agent configuration profile:
+	{config_text}
 
-Dynamic fan-out assignment:
+	Team protocol:
+	- role_kind={role_kind}
+	- core_scope={role_scope}
+	- can_ask_questions={str(can_ask_questions).lower()}
+	- can_clone_workers={str(can_clone_workers).lower()}
+	- can_call_planner={str(can_call_planner).lower()}
+	- peer_access={str(peer_access).lower()}
+	- Communicate in normal human language. Final summaries should be compact status updates plus artifact paths, not raw full-text dumps.
+	- The planner reads team chat updates and artifact references. Do not paste long artifacts into the final summary.
+	- If can_call_planner=false, do not ask, invoke, or route requests directly to the planner. State assumptions, blockers, and artifacts in your own update.
+	- If can_ask_questions=false, do not ask questions. Make a reasonable default assumption and record it as a statement. Use [LITERATURE_NEEDED: ...] or [EVIDENCE_NEEDED: ...] when evidence is missing.
+	- If can_clone_workers=true and the task needs parallel help, write [CLONE_WORKER: concise helper objective] in the declared artifact or final summary; the runtime planner will decide whether to materialize helper workers.
+{planner_control_text}
+{reviewer_dialogue_text}
+
+	Dynamic fan-out assignment:
 {fanout_assignment or "(none)"}
 
-Upstream node outputs:
+Team chat updates:
+{team_chat_text}
+
+Upstream task outputs:
 {upstream_text}
 
-Node task prompt:
-{config_prefix}{node.prompt}
+Task prompt:
+{config_prefix}{prompt_text}
 
 Execution requirements:
 - The subprocess current working directory is already the workspace.
 - Work only inside this workspace.
 - Use the provided ARIS_NODE_SESSION for conversation continuity when the runner resumes this node; otherwise rely only on this prompt, upstream outputs, and workspace artifacts.
 - Do not write workflow-generated files into the project root.
+- Do not treat same-named files already sitting in the project root as this node's current outputs; regenerate and write this node's deliverables to the mapped ARIS_SUBAGENT_DIR paths.
 - Use ARIS_SUBAGENT_DIR for all node-owned files: scratch files, intermediate notes, private analysis artifacts, temporary per-agent state, and final node deliverables.
 - Do not use Bash, shell scripts, PowerShell, REPL tools, or sub-agent spawning from the web runner.
-- Use the available workspace-safe tools directly: read/write/edit/glob/grep/WebSearch/WebFetch/Skill/LlmReview.
+- {tool_contract[2:] if tool_contract.startswith("- ") else tool_contract}
 - If a skill suggests a helper script that requires Bash, perform the equivalent search, reading, or writing with the safe tools instead.
+- For literature or research tasks, keep external search bounded: use at most 12 WebSearch/WebFetch calls total, stop after 3 search/fetch failures, and then write the declared artifacts from available evidence. Mark uncertain or unverified entries explicitly instead of continuing to search.
+- If this task needs missing literature, citation anchors, or external evidence before it can make a claim, do not invent sources or silently continue. Write a clear marker like `[LITERATURE_NEEDED: focused search query]` or `[EVIDENCE_NEEDED: focused evidence question]` into this node's declared artifact; the Manager will insert a dynamic Literature task and rerun this role after it completes.
 - Use relative paths for file operations; do not use absolute workspace paths in commands or tool inputs.
 - Produce every expected output that names a concrete file path at the mapped path shown in "Concrete output storage paths".
 - If "Downstream fan-out requirements" is not "(none)", write those JSON fan-out artifacts under ARIS_SUBAGENT_DIR before the final summary.
 - If a declared output is `INTRO_OUTLINE.md`, write it as `ARIS_SUBAGENT_DIR/INTRO_OUTLINE.md`, not `./INTRO_OUTLINE.md`.
 - If a declared output includes subdirectories, preserve that relative structure under ARIS_SUBAGENT_DIR unless the mapped path already starts with `.aris/`.
-- Treat upstream node outputs as read-only context. Do not rewrite upstream artifacts unless the current node explicitly declares that output path.
-- When a suggested skill label is present, treat that ARIS skill as the node's execution contract. Load its SKILL.md with the Skill tool when it is relevant to the node, especially for literature search or research review, while keeping this node prompt as the local scope and output contract.
-- Follow the agent configuration profile when present. Node fields override config defaults for skill/model/effort.
+- Treat upstream task outputs as read-only context. Do not rewrite upstream artifacts unless the current task explicitly declares that output path.
+- {skill_contract[2:] if skill_contract.startswith("- ") else skill_contract}
+- Follow the agent configuration profile when present. Task fields override config defaults for skill/model/effort.
+- Satisfy the acceptance criteria explicitly in your final summary and name any criteria that remain unmet.
 - Respect the output contract from config when present.
-- Keep a concise final summary that names files created or changed.
+- Keep a concise final summary (roughly 200 words or fewer) that names files created or changed, artifact paths, risks, and blockers. Do not paste full artifact contents.
 - Do not store API keys or credentials in files.
 """
 

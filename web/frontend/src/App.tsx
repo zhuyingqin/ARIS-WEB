@@ -63,6 +63,9 @@ import type {
   RunOutput,
   RunRecord,
   SkillInfo,
+  TaskBoardResponse,
+  TaskBoardTask,
+  TeamRoleKind,
   WorkflowEvent,
   WorkflowGate,
   WorkflowHandoff,
@@ -93,8 +96,8 @@ type WorkflowEventFilter = "all" | "aris" | "workflow" | "node" | "planner" | "r
 const workflowEventFilterOptions: { value: WorkflowEventFilter; label: string }[] = [
   { value: "all", label: "All" },
   { value: "aris", label: "ARIS" },
-  { value: "workflow", label: "Flow" },
-  { value: "node", label: "Nodes" },
+  { value: "workflow", label: "Runtime" },
+  { value: "node", label: "Tasks" },
   { value: "planner", label: "Planner" },
   { value: "runtime", label: "Runtime" },
   { value: "errors", label: "Errors" },
@@ -105,6 +108,8 @@ const WORKFLOW_REPLAY_LIMIT = 600
 const NODE_EVENT_LIMIT = 400
 const NODE_REPLAY_LIMIT = 300
 const EVENT_FLUSH_INTERVAL_MS = 80
+const EMPTY_TASK_BOARD_TASKS: TaskBoardTask[] = []
+const EMPTY_TASK_BOARD_COLUMNS: TaskBoardResponse["columns"] = []
 
 function appendLimited<T>(current: T[], incoming: T[], limit: number) {
   return [...current, ...incoming].slice(-limit)
@@ -299,7 +304,7 @@ export default function App() {
             </div>
           </div>
         </div>
-        {view === "orchestrator" && <OrchestratorPage workspace={workspace} />}
+        {view === "orchestrator" && <TaskBoardsPage workspace={workspace} />}
         {view === "skills" && <SkillsPage workspace={workspace} onRunCreated={() => setView("runs")} />}
         {view === "runs" && <RunsPage workspace={workspace} />}
         {view === "artifacts" && <ArtifactsPage workspace={workspace} />}
@@ -480,7 +485,7 @@ function workflowNodeSequence(workflow: WorkflowRecord | null): Map<string, numb
 }
 
 function workflowEventLabel(event: WorkflowEvent) {
-  if (event.event_type === "workflow") return "workflow"
+  if (event.event_type === "workflow") return "runtime"
   if (event.event_type === "planner") return "planner"
   if (event.event_type === "delta") return "delta"
   if (event.event_type === "session") return "session"
@@ -540,17 +545,28 @@ function isArisOutputEvent(event: WorkflowEvent) {
   return ["aris", "thinking", "tool", "result", "stdout", "stderr"].includes(event.event_type)
 }
 
+function isProviderDiagnosticNoise(message: string) {
+  const normalized = message.toLowerCase()
+  return (
+    normalized.includes("deepseek not selected:")
+    || normalized.includes("deepseek config not found")
+    || normalized.includes("using anthropic executor")
+  )
+}
+
 function isWorkflowErrorEvent(event: WorkflowEvent) {
+  if (isProviderDiagnosticNoise(event.message)) return false
   return event.event_type === "stderr" || /\b(error|failed|failure|unauthorized|timeout)\b/i.test(event.message)
 }
 
 function workflowEventMatchesFilter(event: WorkflowEvent, filter: WorkflowEventFilter) {
+  if (isProviderDiagnosticNoise(event.message)) return false
   if (filter === "all") return true
   if (filter === "aris") return isArisOutputEvent(event)
   if (filter === "workflow") return event.event_type === "workflow"
   if (filter === "node") return event.event_type === "node" || event.event_type === "run"
   if (filter === "planner") return event.event_type === "planner"
-  if (filter === "runtime") return ["delta", "session", "approval"].includes(event.event_type)
+  if (filter === "runtime") return ["delta", "session", "team_message", "artifact", "approval"].includes(event.event_type)
   if (filter === "errors") return isWorkflowErrorEvent(event)
   return true
 }
@@ -669,21 +685,155 @@ function organizeWorkflowPositions(workflow: WorkflowRecord, expandedFanoutGroup
   })
 }
 
-function nodeKindLabel(node: WorkflowNodeInfo) {
-  if (node.type === "human_gate") return "Gate"
-  if (node.skill === "research-lit" && node.dynamic_parent_id) return "Research"
-  return "Agent"
-}
-
 const FANOUT_STACK_MIN_SIZE = 3
 const FANOUT_STACK_NODE_PREFIX = "fanout-stack:"
 const STACK_EDGE_PREFIX = "stack-edge:"
+const ROLE_NODE_PREFIX = "role:"
+const PLANNER_ROLE = "planner"
+const LITERATURE_ROLE = "literature scout"
+const REVIEWER_ROLE = "reviewer"
+const LITERATURE_SKILLS = new Set(["research-lit", "openalex-search"])
+
+type CanvasMode = "role" | "task"
 
 type FanoutStackGroup = {
   key: string
   parentId: string
   parent?: WorkflowNodeInfo
   nodes: WorkflowNodeInfo[]
+}
+
+type RoleSummary = {
+  role: string
+  total: number
+  active: number
+  running: number
+  blocked: number
+  review: number
+  done: number
+  agents: Set<string>
+  tasks: WorkflowNodeInfo[]
+  onDemand: boolean
+  standbyLabel?: string
+}
+
+type RoleKind = TeamRoleKind
+
+const roleKindOptions: { value: TeamRoleKind; label: string }[] = [
+  { value: "planner", label: "Planner" },
+  { value: "reviewer", label: "Reviewer" },
+  { value: "literature", label: "Literature" },
+  { value: "writer", label: "Writer" },
+  { value: "citation", label: "Citation" },
+  { value: "worker", label: "Worker" },
+  { value: "gate", label: "Gate" },
+]
+
+function defaultScopeForRoleKind(kind: TeamRoleKind) {
+  if (kind === "planner") return "解释问题、拆任务、读员工的人话进展，并决定下一步交给谁。员工不能反向调用规划员。"
+  if (kind === "reviewer") return "只提出质量问题、证据缺口和返工建议；由规划员决定继续指派给哪个员工。"
+  if (kind === "literature") return "按请求检索/整理文献证据，写回可引用 artifact；不主动提问，不把全文一次性交给规划员。"
+  if (kind === "citation") return "把已确认文献插入草稿并修正引用格式；只执行任务，可复制帮手处理批量引用。"
+  if (kind === "writer") return "根据已有材料写作和改写论文片段；只执行任务，用人话报告结果、风险和 artifact 链接。"
+  if (kind === "gate") return "人工确认点，只做通过/暂停/返工判断。"
+  return "自主完成被分配的问题，和其他员工用人话同步必要状态，可复制同类员工分担工作。"
+}
+
+function protocolDefaultsForRoleKind(kind: TeamRoleKind) {
+  if (kind === "planner") return { can_ask_questions: true, can_clone_workers: false, can_call_planner: false, peer_access: true, reports_to_chat: true }
+  if (kind === "reviewer") return { can_ask_questions: true, can_clone_workers: false, can_call_planner: false, peer_access: true, reports_to_chat: true }
+  if (kind === "gate") return { can_ask_questions: true, can_clone_workers: false, can_call_planner: false, peer_access: false, reports_to_chat: true }
+  return { can_ask_questions: false, can_clone_workers: true, can_call_planner: false, peer_access: true, reports_to_chat: true }
+}
+
+function applyRoleProtocolDefaults(node: WorkflowNodeInfo, kind: TeamRoleKind) {
+  const defaults = protocolDefaultsForRoleKind(kind)
+  node.team_role_kind = kind
+  if (!node.scope) node.scope = defaultScopeForRoleKind(kind)
+  node.can_ask_questions = defaults.can_ask_questions
+  node.can_clone_workers = defaults.can_clone_workers
+  node.can_call_planner = defaults.can_call_planner
+  node.peer_access = defaults.peer_access
+  node.reports_to_chat = defaults.reports_to_chat
+}
+
+function isLiteratureSkill(skill?: string | null) {
+  return Boolean(skill && LITERATURE_SKILLS.has(skill))
+}
+
+function isLiteratureRoleText(role: string) {
+  return /literature|文献|调研/.test(role.toLowerCase())
+}
+
+function isCitationRoleText(role: string) {
+  return /citation|reference|bibliography|引用|插文献/.test(role.toLowerCase())
+}
+
+function inferRoleKindForNode(node: WorkflowNodeInfo): TeamRoleKind {
+  if (node.team_role_kind) return node.team_role_kind
+  const text = `${node.team_role_id ?? ""} ${node.assignee_role ?? ""} ${node.role} ${node.name} ${node.skill ?? ""} ${node.task_type ?? ""}`.toLowerCase()
+  if (node.type === "human_gate" || node.task_type === "gate" || /gate|approval|checkpoint|人工|审批/.test(text)) return "gate"
+  if (/planner|manager|coordinator|plan|outline|规划|计划/.test(text)) return "planner"
+  if (/review|reviewer|critic|审查|审阅/.test(text)) return "reviewer"
+  if (isCitationRoleText(text)) return "citation"
+  if (isLiteratureRoleText(text) || isLiteratureSkill(node.skill)) return "literature"
+  if (/write|writer|draft|author|paper-write|写作|撰写|改写/.test(text)) return "writer"
+  return "worker"
+}
+
+function roleKindForSummary(role: RoleSummary): RoleKind {
+  const explicit = role.tasks.find((task) => task.team_role_kind)?.team_role_kind
+  if (explicit) return explicit
+  const roleName = role.role.trim().toLowerCase()
+  const text = `${role.role} ${role.tasks.map((task) => `${task.name} ${task.skill ?? ""} ${task.task_type}`).join(" ")}`.toLowerCase()
+  if (role.standbyLabel === "control" || ["planner", "manager", "manager/planner", "规划员", "计划员"].includes(roleName)) return "planner"
+  if (/review|reviewer|critic|审查|审阅/.test(text)) return "reviewer"
+  if (isCitationRoleText(text)) return "citation"
+  if (isLiteratureRoleText(text) || role.tasks.some((task) => isLiteratureSkill(task.skill))) return "literature"
+  if (/write|writer|draft|author|paper-write|写作/.test(text)) return "writer"
+  if (/gate|approval|human|checkpoint/.test(text)) return "gate"
+  return "worker"
+}
+
+function roleScopeForSummary(role: RoleSummary) {
+  const kind = roleKindForSummary(role)
+  const explicitScope = role.tasks.find((task) => task.scope?.trim())?.scope?.trim()
+  return explicitScope || defaultScopeForRoleKind(kind)
+}
+
+function rolePermissionChips(role: RoleSummary) {
+  const kind = roleKindForSummary(role)
+  const source = role.tasks.find((task) => task.team_role_kind || task.can_ask_questions !== undefined || task.can_clone_workers !== undefined)
+  const defaults = protocolDefaultsForRoleKind(kind)
+  const canAsk = source?.can_ask_questions ?? defaults.can_ask_questions
+  const canClone = source?.can_clone_workers ?? defaults.can_clone_workers
+  const canCallPlanner = source?.can_call_planner ?? defaults.can_call_planner
+  const peerAccess = source?.peer_access ?? defaults.peer_access
+  if (kind === "planner") return ["chat coordinator", "reads human updates", "not callable"]
+  if (kind === "reviewer") return ["asks questions", "planner routes", "evidence gate"]
+  if (kind === "gate") return ["approve", "pause", "rework"]
+  return [
+    canAsk ? "can ask" : "no questions",
+    canClone ? "can clone workers" : "no clone",
+    canCallPlanner ? "planner callable" : "no planner call",
+    peerAccess ? "peer access" : "isolated",
+  ]
+}
+
+function roleSortWeight(role: RoleSummary) {
+  const kind = roleKindForSummary(role)
+  if (kind === "planner") return 0
+  if (kind === "reviewer") return 80
+  if (kind === "gate") return 90
+  if (role.onDemand) return 70
+  return 40
+}
+
+function nodeKindLabel(node: WorkflowNodeInfo) {
+  if (node.type === "input") return "Input"
+  if (node.type === "human_gate") return "Gate"
+  if (isLiteratureSkill(node.skill) && node.dynamic_parent_id) return "Research"
+  return "Agent"
 }
 
 function fanoutStackKey(node: WorkflowNodeInfo) {
@@ -825,6 +975,22 @@ function isExecutableNode(node: WorkflowNodeInfo) {
   return node.type === "agent" || node.type === "sub_agent"
 }
 
+function syncWorkflowEdges(workflow: WorkflowRecord) {
+  workflow.graph_json.edges = workflow.graph_json.nodes.flatMap((item) =>
+    item.depends_on.map((source) => ({ id: `${source}->${item.id}`, source, target: item.id })),
+  )
+}
+
+function taskTypeLabel(task: TaskBoardTask | WorkflowNodeInfo) {
+  const raw = "task_type" in task ? task.task_type : undefined
+  return raw ? raw.replace("_", " ") : "analysis"
+}
+
+function taskDependencyLabel(task: TaskBoardTask) {
+  if (!task.depends_on.length) return "no dependencies"
+  return `${task.depends_on.length} dependencies`
+}
+
 const ROLE_PALETTE = ["#7c3aed", "#0ea5e9", "#16a34a", "#f59e0b", "#dc2626", "#0891b2", "#9333ea", "#0d9488"]
 
 function roleColor(seed: string): string {
@@ -833,6 +999,53 @@ function roleColor(seed: string): string {
     hash = ((hash << 5) - hash + seed.charCodeAt(i)) | 0
   }
   return ROLE_PALETTE[Math.abs(hash) % ROLE_PALETTE.length]
+}
+
+function defaultSkillForTask(taskType?: string, role = "", name = "") {
+  const haystack = `${role} ${name}`.toLowerCase()
+  if (haystack.includes("openalex")) return "openalex-search"
+  const exact: Record<string, string> = {
+    goal: "paper-plan",
+    planning: "paper-plan",
+    research: "research-lit",
+    analysis: "analyze-results",
+    writing: "paper-write",
+    review: "research-review",
+  }
+  if (taskType && exact[taskType]) return exact[taskType]
+  if (/(review|reviewer|critic|审查|审阅)/.test(haystack)) return "research-review"
+  if (/(write|writer|draft|author|写作)/.test(haystack)) return "paper-write"
+  if (/(literature|research|scout|文献|调研)/.test(haystack)) return "research-lit"
+  if (/(analysis|analy|分析)/.test(haystack)) return "analyze-results"
+  if (/(plan|planner|outline|规划)/.test(haystack)) return "paper-plan"
+  return ""
+}
+
+function taskRoleForNode(node: WorkflowNodeInfo, task?: TaskBoardTask) {
+  return task?.assignee_role || node.assignee_role || node.team_role_id || node.role || "unassigned"
+}
+
+function canonicalRoleForNode(node: WorkflowNodeInfo, task?: TaskBoardTask) {
+  const rawRole = taskRoleForNode(node, task)
+  const kind = inferRoleKindForNode({
+    ...node,
+    assignee_role: task?.assignee_role ?? node.assignee_role,
+    team_role_kind: task?.team_role_kind ?? node.team_role_kind,
+  })
+  if (kind === "planner") return PLANNER_ROLE
+  if (kind === "literature") return LITERATURE_ROLE
+  if (kind === "reviewer") return REVIEWER_ROLE
+  if (kind === "writer") return "writer"
+  if (kind === "citation") return "citation inserter"
+  return rawRole
+}
+
+function roleNodeId(role: string) {
+  return `${ROLE_NODE_PREFIX}${encodeURIComponent(role)}`
+}
+
+function roleFromNodeId(id: string) {
+  return decodeURIComponent(id.slice(ROLE_NODE_PREFIX.length))
 }
 
 function findAgentConfig(
@@ -892,6 +1105,10 @@ function NodeResultPanel({ workflow, node }: { workflow: WorkflowRecord; node: W
     typeof outputQuery.data?.node_output?.text === "string"
       ? outputQuery.data.node_output.text
       : outputQuery.data?.last_message ?? ""
+  const displayedNodeEvents = useMemo(
+    () => nodeEvents.filter((event) => !isProviderDiagnosticNoise(event.message)),
+    [nodeEvents],
+  )
 
   useEffect(() => {
     setNodeEvents([])
@@ -982,9 +1199,9 @@ function NodeResultPanel({ workflow, node }: { workflow: WorkflowRecord; node: W
             : `This ${nodeKindLabel(node)} has not run yet.`}
         </p>
       )}
-      {nodeEvents.length > 0 && (
+      {displayedNodeEvents.length > 0 && (
         <div className="node-event-log" ref={nodeEventLogRef}>
-          {nodeEvents.map((event, index) => (
+          {displayedNodeEvents.map((event, index) => (
             <div className={`term-line term-${event.event_type}`} key={`${event.timestamp}-${index}`}>
               <span>{event.timestamp.slice(11, 19)}</span>
               <b>{event.event_type}</b>
@@ -1205,7 +1422,7 @@ function NodeArtifactDialog({ preview, onClose }: { preview: NodeArtifactPreview
   )
 }
 
-function OrchestratorPage({ workspace }: { workspace: string }) {
+function TaskBoardsPage({ workspace }: { workspace: string }) {
   const queryClient = useQueryClient()
   const [selectedId, setSelectedId] = useState("")
   const [draft, setDraft] = useState<WorkflowRecord | null>(null)
@@ -1217,6 +1434,9 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
   const [flowPanelCollapsed, setFlowPanelCollapsed] = useState(false)
   const [generatorCollapsed, setGeneratorCollapsed] = useState(true)
   const [canvasToolsCollapsed, setCanvasToolsCollapsed] = useState(true)
+  const [canvasMode, setCanvasMode] = useState<CanvasMode>("role")
+  const [selectedRole, setSelectedRole] = useState("")
+  const [roleNodePositions, setRoleNodePositions] = useState<Record<string, { x: number; y: number }>>({})
   const [expandedFanoutGroups, setExpandedFanoutGroups] = useState<Set<string>>(() => new Set())
   const [fanoutStackPositions, setFanoutStackPositions] = useState<Record<string, { x: number; y: number }>>({})
   const [selectedNodeId, setSelectedNodeId] = useState("")
@@ -1233,6 +1453,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
   const artifactRefreshTimerRef = useRef<number | null>(null)
   const runtimeRefreshTimerRef = useRef<number | null>(null)
   const [canvasNodes, setCanvasNodes] = useState<Node[]>([])
+  const [roleCanvasNodes, setRoleCanvasNodes] = useState<Node[]>([])
   const workflows = useQuery({
     queryKey: ["workflows", workspace],
     queryFn: () => api.workflows(workspace),
@@ -1260,6 +1481,12 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
     enabled: Boolean(selected),
     refetchInterval: isLiveWorkflowStatus(selected?.status) ? 5000 : false,
   })
+  const taskBoard = useQuery<TaskBoardResponse>({
+    queryKey: ["task-board", selected?.id],
+    queryFn: () => api.taskBoard(selected as WorkflowRecord),
+    enabled: Boolean(selected),
+    refetchInterval: isLiveWorkflowStatus(selected?.status) ? 5000 : false,
+  })
 
   const scheduleWorkflowRefresh = useCallback(() => {
     if (workflowRefreshTimerRef.current !== null) return
@@ -1282,6 +1509,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
     runtimeRefreshTimerRef.current = window.setTimeout(() => {
       runtimeRefreshTimerRef.current = null
       queryClient.invalidateQueries({ queryKey: ["workflow-runtime", workflowId] })
+      queryClient.invalidateQueries({ queryKey: ["task-board", workflowId] })
     }, 900)
   }, [queryClient])
 
@@ -1335,7 +1563,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
       if (flushTimer === null) {
         flushTimer = window.setTimeout(flushEvents, EVENT_FLUSH_INTERVAL_MS)
       }
-      if (isRecentEvent(event.timestamp) && ["workflow", "node", "planner", "delta", "session", "approval"].includes(event.event_type)) {
+      if (isRecentEvent(event.timestamp) && ["workflow", "node", "planner", "delta", "session", "team_message", "artifact", "approval"].includes(event.event_type)) {
         scheduleWorkflowRefresh()
         scheduleArtifactRefresh()
         scheduleRuntimeRefresh(selected.id)
@@ -1542,9 +1770,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
       const node = workflow.graph_json.nodes.find((item) => item.id === nodeId)
       if (!node) return
       updater(node)
-      workflow.graph_json.edges = workflow.graph_json.nodes.flatMap((item) =>
-        item.depends_on.map((source) => ({ id: `${source}->${item.id}`, source, target: item.id })),
-      )
+      syncWorkflowEdges(workflow)
     })
   }
 
@@ -1567,28 +1793,34 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
   function addNode(type: WorkflowNodeInfo["type"]) {
     updateDraft((workflow) => {
       const index = workflow.graph_json.nodes.length + 1
-      const id = slug(`${type === "human_gate" ? "gate" : "agent"}-${index}`)
+      const id = slug(`${type === "input" ? "input" : type === "human_gate" ? "gate" : "agent"}-${index}`)
+      const inputDependencies = workflow.graph_json.nodes.filter((node) => node.type === "input").map((node) => node.id)
+      const taskType = type === "input" ? "input" : type === "human_gate" ? "gate" : type === "agent" ? "planning" : "analysis"
+      const role = type === "input" ? "global input" : type === "human_gate" ? "human approval" : type === "sub_agent" ? "executor" : "planner"
+      const teamRoleKind: TeamRoleKind = type === "input" ? "worker" : type === "human_gate" ? "gate" : type === "agent" ? "planner" : "worker"
+      const protocolDefaults = protocolDefaultsForRoleKind(teamRoleKind)
+      const skill = type === "input" || type === "human_gate" ? null : defaultSkillForTask(taskType, role) || null
       workflow.graph_json.nodes.push({
         id,
         type,
-        name: type === "human_gate" ? `Gate ${index}` : `Agent ${index}`,
-        role: type === "human_gate" ? "human approval" : type === "sub_agent" ? "executor" : "planner",
-        skill: null,
+        name: type === "input" ? `Input ${index}` : type === "human_gate" ? `Gate ${index}` : `Agent ${index}`,
+        role,
+        skill,
         config_file: null,
-        prompt: type === "human_gate" ? "Review the upstream output and approve when it is ready for downstream work." : "",
+        prompt: "",
         model: null,
         effort: null,
         gate: "none",
-        depends_on: [],
+        depends_on: type === "input" ? [] : inputDependencies,
         inputs: [],
-        outputs: [],
-        status: "queued",
+        outputs: type === "input" ? [{ name: "user_context", type: "text", description: "User-provided context inherited by downstream tasks" }] : [],
+        status: type === "input" ? "succeeded" : "queued",
         run_id: null,
         session_path: null,
         error: null,
         approved_before: false,
         approved_after: false,
-        position: { x: 120 + workflow.graph_json.nodes.length * 220, y: type === "human_gate" ? 90 : type === "agent" ? 170 : 260 },
+        position: { x: 120 + workflow.graph_json.nodes.length * 220, y: type === "input" ? 20 : type === "human_gate" ? 90 : type === "agent" ? 170 : 260 },
         timeout_seconds: null,
         retry: null,
         failure_policy: "halt",
@@ -1598,9 +1830,33 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
         fanout_item: null,
         dynamic_parent_id: null,
         dynamic_reason: null,
-        auto_approve_after: false,
+        auto_approve_after: type === "agent" || type === "sub_agent",
         research_request: null,
+        team_role_kind: teamRoleKind,
+        scope: type === "input" ? "" : defaultScopeForRoleKind(teamRoleKind),
+        can_ask_questions: protocolDefaults.can_ask_questions,
+        can_clone_workers: protocolDefaults.can_clone_workers,
+        can_call_planner: protocolDefaults.can_call_planner,
+        peer_access: protocolDefaults.peer_access,
+        reports_to_chat: protocolDefaults.reports_to_chat,
+        task_type: taskType,
+        objective: type === "input" ? "Add user-provided context, constraints, files, or requirements that every task should inherit." : "",
+        acceptance_criteria: [],
+        assignee_role: type === "input" ? null : type === "human_gate" ? "human approval" : type === "agent" ? "planner" : "executor",
+        assigned_to: null,
+        claimed_by: null,
+        review_status: type === "human_gate" ? "pending" : "not_required",
+        review_notes: "",
+        priority: 3,
       })
+      if (type === "input") {
+        for (const node of workflow.graph_json.nodes) {
+          if (node.id !== id && node.type !== "input" && !node.depends_on.includes(id)) {
+            node.depends_on.push(id)
+          }
+        }
+      }
+      syncWorkflowEdges(workflow)
       setSelectedNodeId(id)
       setSelectedEdgeId("")
     })
@@ -1815,6 +2071,94 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
     ).length ?? 0
   const runtimeSummary = runtime.data?.runtime_summary
   const executionState = runtimeSummary?.execution_state ?? draft?.status ?? "idle"
+  const roleRuntimeLive = ["planning", "running", "waiting_dynamic_dependency", "ready", "scheduled"].includes(executionState)
+  const draftDisplayStatus = draft ? executionState : undefined
+  const boardTasks = taskBoard.data?.tasks ?? EMPTY_TASK_BOARD_TASKS
+  const boardTaskById = useMemo(() => new Map(boardTasks.map((task) => [task.id, task])), [boardTasks])
+  const boardColumns = taskBoard.data?.columns ?? EMPTY_TASK_BOARD_COLUMNS
+  const roleSummaries = useMemo(() => {
+    const roles = new Map<string, RoleSummary>()
+    for (const node of draft?.graph_json.nodes ?? []) {
+      if (node.type === "input" || node.type === "human_gate") continue
+      const task = boardTaskById.get(node.id)
+      const role = canonicalRoleForNode(node, task)
+      const summary = roles.get(role) ?? { role, total: 0, active: 0, running: 0, blocked: 0, review: 0, done: 0, agents: new Set<string>(), tasks: [], onDemand: false }
+      const column = task?.column
+      const status = task?.status ?? node.status
+      const reviewStatus = task?.review_status ?? node.review_status
+      summary.total += 1
+      if (column === "running" || column === "ready" || status === "running") summary.active += 1
+      if (status === "running") summary.running += 1
+      if (status === "waiting_dynamic_dependency") summary.blocked += 1
+      if (column === "review" || reviewStatus === "pending" || status === "waiting_approval") summary.review += 1
+      if (column === "done" || status === "succeeded") summary.done += 1
+      if (task?.claimed_by) summary.agents.add(task.claimed_by)
+      if (task?.assigned_to) summary.agents.add(task.assigned_to)
+      summary.tasks.push(node)
+      roles.set(role, summary)
+    }
+    if (draft && ![...roles.values()].some((role) => roleKindForSummary(role) === "planner")) {
+      roles.set(PLANNER_ROLE, {
+        role: PLANNER_ROLE,
+        total: 0,
+        active: 0,
+        running: 0,
+        blocked: 0,
+        review: 0,
+        done: 0,
+        agents: new Set<string>(),
+        tasks: [],
+        onDemand: true,
+        standbyLabel: "control",
+      })
+    }
+    if (draft && ![...roles.values()].some((role) => role.tasks.some((task) => isLiteratureSkill(task.skill)) || isLiteratureRoleText(role.role))) {
+      roles.set(LITERATURE_ROLE, {
+        role: LITERATURE_ROLE,
+        total: 0,
+        active: 0,
+        running: 0,
+        blocked: 0,
+        review: 0,
+        done: 0,
+        agents: new Set<string>(),
+        tasks: [],
+        onDemand: true,
+        standbyLabel: "on-demand",
+      })
+    }
+    if (draft && ![...roles.values()].some((role) => roleKindForSummary(role) === "reviewer")) {
+      roles.set(REVIEWER_ROLE, {
+        role: REVIEWER_ROLE,
+        total: 0,
+        active: 0,
+        running: 0,
+        blocked: 0,
+        review: 0,
+        done: 0,
+        agents: new Set<string>(),
+        tasks: [],
+        onDemand: true,
+        standbyLabel: "review gate",
+      })
+    }
+    return [...roles.values()].sort(
+      (a, b) =>
+        roleSortWeight(a) - roleSortWeight(b)
+        || b.active - a.active
+        || b.review - a.review
+        || b.total - a.total
+        || a.role.localeCompare(b.role),
+    )
+  }, [boardTaskById, draft?.graph_json.nodes])
+  const routedRoleCount = roleSummaries.filter((role) => !role.onDemand).length
+  const onDemandRoleCount = roleSummaries.length - routedRoleCount
+  useEffect(() => {
+    setSelectedRole((current) => {
+      if (current && roleSummaries.some((role) => role.role === current)) return current
+      return roleSummaries[0]?.role ?? ""
+    })
+  }, [roleSummaries])
   const selectedNodeRuntimeArtifacts = useMemo(
     () => (selectedNode ? (runtime.data?.artifact_index ?? []).filter((artifact) => artifact.producer_node_id === selectedNode.id) : []),
     [runtime.data?.artifact_index, selectedNode],
@@ -1827,19 +2171,19 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
     [runtime.data?.blocked_sessions, selectedNode],
   )
   const nodeSequence = useMemo(() => workflowNodeSequence(draft), [draft])
-  const draftFlowNodes: Node[] = useMemo(
+  const draftFlowTasks: Node[] = useMemo(
     () => {
-      const visibleNodes = (draft?.graph_json.nodes ?? []).filter((node) => !collapsedNodeIds.has(node.id))
-      const normalNodes = visibleNodes.map((node) => {
+      const visibleTasks = (draft?.graph_json.nodes ?? []).filter((node) => !collapsedNodeIds.has(node.id))
+      const normalTasks = visibleTasks.map((node) => {
         const agentConfig = findAgentConfig(agentConfigs.data, node.config_file)
         const inheritedSkill = node.skill ?? agentConfig?.skill ?? null
-        const skillLabel = node.type === "sub_agent" && inheritedSkill ? `/${inheritedSkill}` : null
+        const skillLabel = isExecutableNode(node) && inheritedSkill ? `/${inheritedSkill}` : null
         const roleLabel = agentConfig
           ? agentConfig.name
           : node.role || (node.type === "human_gate" ? "human approval" : node.type === "sub_agent" ? "executor" : "planner")
         const roleAccent = agentConfig ? roleColor(agentConfig.id) : null
         const teamAccent = node.team_instance_id ? roleColor(node.team_instance_id) : null
-        const isDynamicResearch = node.skill === "research-lit" && Boolean(node.dynamic_parent_id)
+        const isDynamicResearch = isLiteratureSkill(node.skill) && Boolean(node.dynamic_parent_id)
         const dynamicAccent = isDynamicResearch ? "#0891b2" : null
         const accent = roleAccent ?? teamAccent ?? dynamicAccent
         const style: React.CSSProperties | undefined = accent
@@ -1868,7 +2212,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                   <span className="flow-node-kind-row">
                     <span className="flow-node-order">{String(sequence).padStart(2, "0")}</span>
                     <span className={`node-kind node-kind-${isDynamicResearch ? "research" : node.type}`}>
-                      {node.type === "human_gate" ? <ClipboardCheck size={13} /> : <Cpu size={13} />}
+                      {node.type === "input" ? <FileText size={13} /> : node.type === "human_gate" ? <ClipboardCheck size={13} /> : <Cpu size={13} />}
                       {nodeKindLabel(node)}
                     </span>
                   </span>
@@ -2012,7 +2356,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
         )
       }
 
-      const stackNodes: Node[] = collapsedFanoutGroups.map((group) => {
+      const stackTasks: Node[] = collapsedFanoutGroups.map((group) => {
         const xValues = group.nodes.map((node) => Number(node.position?.x ?? 0))
         const yValues = group.nodes.map((node) => Number(node.position?.y ?? 0))
         const position = fanoutStackPositions[group.key] ?? {
@@ -2052,7 +2396,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
           }
         })
 
-      return [...normalNodes, ...stackNodes, ...expandedStackControls]
+      return [...normalTasks, ...stackTasks, ...expandedStackControls]
     },
     [
       artifactsByPath,
@@ -2074,9 +2418,172 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
   )
   useEffect(() => {
     if (!isDraggingNode) {
-      setCanvasNodes(draftFlowNodes)
+      setCanvasNodes(draftFlowTasks)
     }
-  }, [draftFlowNodes, isDraggingNode])
+  }, [draftFlowTasks, isDraggingNode])
+
+  const roleFlowNodes: Node[] = useMemo(() => {
+    const columns = Math.min(3, Math.max(1, Math.ceil(Math.sqrt(Math.max(roleSummaries.length, 1)))))
+    return roleSummaries.map((role, index) => {
+      const accent = roleColor(role.role)
+      const position = roleNodePositions[role.role] ?? {
+        x: 72 + (index % columns) * 430,
+        y: 86 + Math.floor(index / columns) * 300,
+      }
+      const visibleTasks = role.tasks.slice(0, 5)
+      const statusItems = statusSummary(role.tasks)
+      const kind = roleKindForSummary(role)
+      const permissionChips = rolePermissionChips(role)
+      const isRoleRunning = role.running > 0
+      const isRoleBlocked = role.blocked > 0
+      const isRoleLive = roleRuntimeLive && (isRoleRunning || isRoleBlocked || role.active > 0 || role.review > 0)
+      return {
+        id: roleNodeId(role.role),
+        type: "workflow",
+        position,
+        data: {
+          label: (
+            <div className="role-flow-label">
+              <div className="flow-node-topline">
+                <span className="flow-node-kind-row">
+                  <span className="role-flow-mark" style={{ background: `${accent}22`, color: accent }}>
+                    {kind === "literature" ? <Search size={14} /> : <UsersRound size={14} />}
+                  </span>
+                  <span className="role-flow-title">{role.role}</span>
+                </span>
+                <em>{role.onDemand ? role.standbyLabel ?? "standby" : `${role.total} tasks`}</em>
+              </div>
+              <p className="role-scope">{roleScopeForSummary(role)}</p>
+              <div className="role-flow-stats">
+                {role.onDemand ? (
+                  <>
+                    <span>standby</span>
+                    <span>{kind === "planner" ? "chat control" : "no link until needed"}</span>
+                  </>
+                ) : (
+                  <>
+                    <span>{role.active} active</span>
+                    <span>{role.review} review</span>
+                    <span>{role.done} done</span>
+                  </>
+                )}
+              </div>
+              {isRoleLive && (
+                <div className="role-live-row">
+                  <Activity size={12} />
+                  <span>{isRoleRunning ? "thinking" : isRoleBlocked ? "waiting on answers" : role.review ? "reviewing" : "queued"}</span>
+                  <i />
+                </div>
+              )}
+              <div className="role-permission-row" aria-label={`${role.role} permissions`}>
+                {permissionChips.map((chip) => <span key={chip}>{chip}</span>)}
+              </div>
+              <div className="role-task-stack">
+                {visibleTasks.map((task) => {
+                  const boardTask = boardTaskById.get(task.id)
+                  const taskStatus = boardTask?.status ?? task.status
+                  const inheritedSkill = task.skill || boardTask?.skill
+                  return (
+                    <button
+                      className={`role-task-chip nodrag nopan role-task-chip-${taskStatus}`}
+                      key={task.id}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        setSelectedNodeId(task.id)
+                        setSelectedEdgeId("")
+                        setSelectedRole(role.role)
+                        setCanvasMode("task")
+                      }}
+                      title={task.objective || task.prompt || task.name}
+                      type="button"
+                    >
+                      <span>{inheritedSkill ? `/${inheritedSkill}` : taskTypeLabel(boardTask ?? task)}</span>
+                      <strong>{task.name}</strong>
+                    </button>
+                  )
+                })}
+                {role.tasks.length > visibleTasks.length && (
+                  <small className="role-task-more">+{role.tasks.length - visibleTasks.length} more tasks</small>
+                )}
+                {!visibleTasks.length && (
+                  <small className="role-task-more">
+                    {role.onDemand ? "Waiting for human-language updates or routed work" : "No routed tasks"}
+                  </small>
+                )}
+              </div>
+              {statusItems.length > 0 && (
+                <div className="role-status-row">
+                  {statusItems.slice(0, 4).map((item) => (
+                    <small key={item.status}>
+                      {item.count} {item.status}
+                    </small>
+                  ))}
+                </div>
+              )}
+            </div>
+          ),
+        },
+        className: `flow-node role-flow-node${role.onDemand ? " role-flow-node-ondemand" : ""}${selectedRole === role.role ? " role-flow-node-selected" : ""}${isRoleRunning ? " role-flow-node-running" : ""}${isRoleBlocked ? " role-flow-node-blocked" : ""}${isRoleLive ? " role-flow-node-live" : ""}`,
+        style: { borderLeft: `4px solid ${accent}` },
+      }
+    })
+  }, [boardTaskById, roleNodePositions, roleRuntimeLive, roleSummaries, selectedRole])
+
+  useEffect(() => {
+    if (!isDraggingNode) {
+      setRoleCanvasNodes(roleFlowNodes)
+    }
+  }, [isDraggingNode, roleFlowNodes])
+
+  const roleFlowEdges: WorkflowCanvasEdge[] = useMemo(() => {
+    const nodesById = new Map((draft?.graph_json.nodes ?? []).map((node) => [node.id, node]))
+    const communications = new Map<
+      string,
+      { sourceRole: string; targetRole: string; count: number; previews: string[] }
+    >()
+    for (const handoff of runtime.data?.handoffs ?? []) {
+      if (handoff.content_type === "status" || handoff.content_type === "none") continue
+      const source = nodesById.get(handoff.source)
+      const target = nodesById.get(handoff.target)
+      if (!source || !target) continue
+      const sourceRole = canonicalRoleForNode(source, boardTaskById.get(source.id))
+      const targetRole = canonicalRoleForNode(target, boardTaskById.get(target.id))
+      if (sourceRole === targetRole) continue
+      const key = `${sourceRole}->${targetRole}`
+      const item = communications.get(key) ?? { sourceRole, targetRole, count: 0, previews: [] }
+      item.count += 1
+      if (handoff.preview) item.previews.push(handoff.preview)
+      communications.set(key, item)
+    }
+    return Array.from(communications.values()).map((item) => ({
+      id: `role-edge:${item.sourceRole}->${item.targetRole}`,
+      type: "workflowHandoff",
+      source: roleNodeId(item.sourceRole),
+      target: roleNodeId(item.targetRole),
+      markerEnd: { type: MarkerType.ArrowClosed },
+      data: {
+        label: item.count === 1 ? "handoff" : `${item.count} handoffs`,
+      },
+      animated: roleRuntimeLive,
+      ariaLabel: item.previews[0] ? truncate(item.previews[0], 140) : undefined,
+      interactionWidth: 24,
+      className: `flow-edge-role-route${roleRuntimeLive ? " flow-edge-role-route-live" : ""}`,
+    }))
+  }, [boardTaskById, draft?.graph_json.nodes, roleRuntimeLive, runtime.data?.handoffs])
+
+  const selectedRoleSummary = roleSummaries.find((role) => role.role === selectedRole) ?? roleSummaries[0]
+  const selectedRoleMessages = useMemo(() => {
+    if (!selectedRoleSummary) return []
+    const taskIds = new Set(selectedRoleSummary.tasks.map((task) => task.id))
+    return (runtime.data?.team_messages ?? [])
+      .filter((message) => message.role === selectedRoleSummary.role || (message.node_id ? taskIds.has(message.node_id) : false))
+      .slice(-4)
+      .reverse()
+  }, [runtime.data?.team_messages, selectedRoleSummary])
+  const latestTeamMessages = useMemo(
+    () => (runtime.data?.team_messages ?? []).slice(-3).reverse(),
+    [runtime.data?.team_messages],
+  )
 
   const flowEdges: WorkflowCanvasEdge[] = useMemo(
     () => {
@@ -2167,11 +2674,17 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
     })
     setDirty(true)
   }, [])
+  const onRoleNodesChange = useCallback((changes: NodeChange[]) => {
+    const nonRemovingChanges = changes.filter((change) => change.type !== "remove")
+    setRoleCanvasNodes((nodes) => applyNodeChanges(nonRemovingChanges, nodes))
+  }, [])
   const onEdgesChange = useCallback((changes: EdgeChange[]) => {
+    if (canvasMode === "role") return
     const removed = changes.filter((change) => change.type === "remove").map((change) => change.id)
     if (removed.length) removeEdges(removed)
-  }, [])
+  }, [canvasMode])
   const onConnect = useCallback((connection: Connection) => {
+    if (canvasMode === "role") return
     if (!connection.source || !connection.target || connection.source === connection.target) return
     const edgeId = `${connection.source}->${connection.target}`
     updateDraft((workflow) => {
@@ -2186,12 +2699,12 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
     })
     setSelectedEdgeId(edgeId)
     setSelectedNodeId("")
-  }, [])
+  }, [canvasMode])
 
   function handleCreateTemplate() {
     createWorkflow.mutate({
       workspace,
-      title: title || (template === "paper_introduction" ? "Paper introduction workflow" : "Research workflow"),
+      title: title || (template === "paper_introduction" ? "Paper introduction runtime" : "Research runtime"),
       goal: goal || (template === "paper_introduction" ? "Draft and refine the Introduction for the current research paper" : "Explore and validate a research idea"),
       template,
     })
@@ -2218,7 +2731,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
 
   function handleDeleteWorkflow(workflow: WorkflowRecord | null = draft) {
     if (!workflow) return
-    if (!globalThis.confirm(`Delete Flow "${workflow.title}"? This cannot be undone.`)) return
+    if (!globalThis.confirm(`Delete runtime "${workflow.title}"? This cannot be undone.`)) return
     deleteWorkflow.mutate(workflow)
   }
 
@@ -2231,25 +2744,25 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
             variant="secondary"
             onClick={() => setFlowPanelCollapsed(false)}
             type="button"
-            aria-label="Show flows"
-            title="Show flows"
+            aria-label="Show orchestrations"
+            title="Show orchestrations"
           >
             <ChevronRight size={16} />
             <GitBranch size={16} />
-            <span>Flows</span>
+            <span>Orchestrations</span>
           </Button>
         ) : (
           <>
         <div className="panel-head compact-head">
           <div>
-            <h2>Flows</h2>
-            <p>{(workflows.data ?? []).length} local workflows</p>
+            <h2>Orchestrations</h2>
+            <p>{(workflows.data ?? []).length} local runtimes</p>
           </div>
           <div className="panel-head-actions">
-            <Button variant="secondary" onClick={() => workflows.refetch()} type="button" aria-label="Refresh flows" title="Refresh flows">
+            <Button variant="secondary" onClick={() => workflows.refetch()} type="button" aria-label="Refresh orchestrations" title="Refresh orchestrations">
               <RefreshCcw size={15} />
             </Button>
-            <Button variant="secondary" onClick={() => setFlowPanelCollapsed(true)} type="button" aria-label="Hide flows" title="Hide flows">
+            <Button variant="secondary" onClick={() => setFlowPanelCollapsed(true)} type="button" aria-label="Hide orchestrations" title="Hide orchestrations">
               <ChevronLeft size={15} />
             </Button>
           </div>
@@ -2257,6 +2770,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
         <div className="workflow-list">
           {(workflows.data ?? []).map((workflow) => {
             const counts = workflowCounts(workflow)
+            const displayStatus = workflow.id === draft?.id ? executionState : workflow.status
             return (
               <div
                 className={`workflow-row ${draft?.id === workflow.id ? "selected" : ""}`}
@@ -2272,19 +2786,19 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                 >
                   <div className="workflow-row-title">
                     <strong>{workflow.title}</strong>
-                    <Badge>Flow</Badge>
+                    <Badge>Runtime</Badge>
                   </div>
                   <span>
                   {counts.agents} Agents · {counts.gates} Gates
                   </span>
-                  <em className={statusClass(workflow.status)}>{workflow.status}</em>
+                  <em className={statusClass(displayStatus)}>{displayStatus}</em>
                 </button>
                 <Button
-                  aria-label={`Delete flow ${workflow.title}`}
+                  aria-label={`Delete runtime ${workflow.title}`}
                   className="workflow-row-delete"
                   disabled={deleteWorkflow.isPending}
                   onClick={() => handleDeleteWorkflow(workflow)}
-                  title="Delete flow"
+                  title="Delete runtime"
                   type="button"
                   variant="ghost"
                 >
@@ -2296,7 +2810,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
           {workflows.data?.length === 0 && (
             <div className="list-empty">
               <GitBranch size={18} />
-              <span>No flows yet</span>
+              <span>No orchestrations yet</span>
             </div>
           )}
         </div>
@@ -2305,23 +2819,23 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
             aria-expanded={!generatorCollapsed}
             className="generator-toggle"
             onClick={() => setGeneratorCollapsed((current) => !current)}
-            title={generatorCollapsed ? "Expand flow editor" : "Collapse flow editor"}
+            title={generatorCollapsed ? "Expand runtime editor" : "Collapse runtime editor"}
             type="button"
           >
             <span className="generator-toggle-title">
               <Sparkles size={14} />
-              Create / Update Flow
+              Create / Update Runtime
             </span>
             {generatorCollapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
           </button>
           {!generatorCollapsed && (
             <div className="generator-content">
-              <label>Flow goal</label>
+              <label>Initial goal</label>
               <Textarea
                 rows={5}
                 value={goal}
                 onChange={(event) => setGoal(event.target.value)}
-                placeholder="Describe a new flow, or changes to apply to the selected flow..."
+                placeholder="Describe a new runtime, or changes to apply to the selected orchestration..."
               />
               <label>Title</label>
               <Input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Optional title" />
@@ -2352,7 +2866,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                   type="button"
                 >
                   <Wand2 size={15} />
-                  Generate New
+                  Plan Tasks
                 </Button>
                 <Button
                   onClick={handleRefine}
@@ -2360,7 +2874,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                   type="button"
                 >
                   <Wand2 size={15} />
-                  Update Flow
+                  Refine Board
                 </Button>
               </div>
               {(createWorkflow.error || generateWorkflow.error || refineWorkflow.error) && (
@@ -2381,59 +2895,92 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                 <div className="flow-title-row">
                   <Badge>
                     <GitBranch size={13} />
-                    Flow
+                    Runtime Flow
                   </Badge>
                   <span>{draftCounts.agents} Agents</span>
                   <span>{draftCounts.gates} Gates</span>
                   {dirty && <Badge>unsaved</Badge>}
-                  <span className={statusClass(draft.status)}>{draft.status}</span>
+                  {draftDisplayStatus && <span className={statusClass(draftDisplayStatus)}>{executionStateLabel(draftDisplayStatus)}</span>}
                 </div>
                 <h1>{draft.title}</h1>
                 <p>{draft.goal || "No goal set"}</p>
               </div>
             </div>
             {deleteWorkflow.error && <p className="error-text">{deleteWorkflow.error.message}</p>}
-            <div className="flow-shell">
-              <div className={`flow-canvas-toolbar ${canvasToolsCollapsed ? "flow-canvas-toolbar-collapsed" : ""}`} aria-label="Flow canvas actions">
-                <Button
-                  className="flow-canvas-toolbar-toggle"
-                  variant="secondary"
-                  onClick={() => setCanvasToolsCollapsed((current) => !current)}
-                  type="button"
-                  aria-label={canvasToolsCollapsed ? "Expand canvas tools" : "Collapse canvas tools"}
-                  title={canvasToolsCollapsed ? "Expand tools" : "Collapse tools"}
-                >
-                  {canvasToolsCollapsed ? <ChevronRight size={15} /> : <ChevronLeft size={15} />}
-                  {!canvasToolsCollapsed && "Tools"}
-                </Button>
-                <div className="canvas-actions-group">
-                  <Button variant="secondary" onClick={() => addNode("agent")} type="button" title="Agent">
+            <section className="task-runtime-strip" aria-label="Task board runtime">
+              <div className="task-runtime-item">
+                <span>Runtime</span>
+                <strong>{executionStateLabel(executionState)}</strong>
+                <small>{runtimeSummary?.next_action || "No runtime activity yet."}</small>
+              </div>
+              <div className="task-runtime-item">
+                <span>Ready</span>
+                <strong>{runtimeSummary?.ready_node_count ?? 0}</strong>
+                <small>{runtimeSummary?.ready_node_ids.slice(0, 3).join(", ") || "none"}</small>
+              </div>
+              <div className="task-runtime-item">
+                <span>Review</span>
+                <strong>{runtimeSummary?.waiting_approval_count ?? 0}</strong>
+                <small>{waitingBatchCount ? `${waitingBatchCount} completed task(s)` : "no approval batch"}</small>
+              </div>
+              <div className="task-runtime-item">
+                <span>Artifacts</span>
+                <strong>{taskBoard.data?.artifact_index.length ?? runtimeSummary?.artifact_count ?? 0}</strong>
+                <small>{runtimeSummary?.delta_count ?? 0} planner changes</small>
+              </div>
+            </section>
+
+            <section className="role-flow-surface" aria-label="Role orchestration flow">
+              <div className="task-section-head">
+                <div>
+                  <h2>Role Orchestration Flow</h2>
+                  <p>
+                    {roleSummaries.length} Role Agents · {boardTasks.length || draft.graph_json.nodes.length} routed tasks
+                    {onDemandRoleCount ? ` · ${onDemandRoleCount} standby` : ""}
+                  </p>
+                </div>
+                <div className="task-board-actions">
+                  <div className="canvas-mode-toggle" aria-label="Canvas mode">
+                    <button
+                      className={canvasMode === "role" ? "active" : ""}
+                      onClick={() => setCanvasMode("role")}
+                      type="button"
+                    >
+                      <UsersRound size={14} />
+                      Role Flow
+                    </button>
+                    <button
+                      className={canvasMode === "task" ? "active" : ""}
+                      onClick={() => setCanvasMode("task")}
+                      type="button"
+                    >
+                      <GitBranch size={14} />
+                      Task Dependencies
+                    </button>
+                  </div>
+                  <Button variant="secondary" onClick={() => addNode("agent")} type="button" title="Add manager task">
                     <Cpu size={15} />
-                    Agent
+                    Task
                   </Button>
-                  <Button variant="secondary" onClick={() => addNode("human_gate")} type="button" title="Gate">
+                  <Button variant="secondary" onClick={() => addNode("input")} type="button" title="Add global input">
+                    <FileText size={15} />
+                    Input
+                  </Button>
+                  <Button variant="secondary" onClick={() => addNode("human_gate")} type="button" title="Add checkpoint">
                     <ClipboardCheck size={15} />
                     Gate
                   </Button>
-                  {selectedEdge && (
-                    <Button variant="secondary" onClick={() => removeEdges([selectedEdge.id])} type="button" title="Remove selected edge">
-                      <XCircle size={15} />
-                      Edge
-                    </Button>
-                  )}
                   <Button
                     variant="secondary"
                     onClick={organizeWorkflow}
-                    disabled={!draft.graph_json.nodes.length}
+                    disabled={!draft.graph_json.nodes.length || canvasMode === "role"}
                     type="button"
-                    aria-label="Organize flow"
-                    title="Organize flow"
+                    aria-label="Organize task dependency flow"
+                    title={canvasMode === "role" ? "Switch to Task Dependencies to organize task nodes" : "Organize task dependency flow"}
                   >
                     <SlidersHorizontal size={15} />
                     Organize
                   </Button>
-                </div>
-                <div className="canvas-actions-group">
                   <Button
                     variant="secondary"
                     onClick={() => draft && saveWorkflow.mutate(draft)}
@@ -2444,118 +2991,225 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                     <Save size={15} />
                     Save
                   </Button>
-                  <Button
-                    variant="destructive"
-                    onClick={() => handleDeleteWorkflow()}
-                    disabled={deleteWorkflow.isPending}
-                    type="button"
-                    title="Delete"
-                  >
-                    <Trash2 size={15} />
-                    Delete
-                  </Button>
-                </div>
-                <div className="canvas-actions-group">
-                  <Button onClick={() => executeWorkflow.mutate(draft)} disabled={executeWorkflow.isPending} type="button" title="Run">
+                  <Button onClick={() => executeWorkflow.mutate(draft)} disabled={executeWorkflow.isPending} type="button" title="Start runtime">
                     <Play size={15} />
-                    Run
-                  </Button>
-                  <Button
-                    variant="secondary"
-                    onClick={() => (draft.status === "paused" ? resumeWorkflow.mutate(draft) : pauseWorkflow.mutate(draft))}
-                    disabled={pauseWorkflow.isPending || resumeWorkflow.isPending}
-                    type="button"
-                    title={draft.status === "paused" ? "Resume" : "Pause"}
-                  >
-                    {draft.status === "paused" ? <Play size={15} /> : <Pause size={15} />}
-                    {draft.status === "paused" ? "Resume" : "Pause"}
-                  </Button>
-                  <Button
-                    variant="secondary"
-                    onClick={() => approveBatch.mutate(draft)}
-                    disabled={!waitingBatchCount || approveBatch.isPending}
-                    type="button"
-                    title={waitingBatchCount ? "Approve completed execution batch" : "No completed batch is waiting"}
-                  >
-                    <ClipboardCheck size={15} />
-                    Approve Batch
-                  </Button>
-                  <Button
-                    variant="destructive"
-                    onClick={() => cancelWorkflow.mutate(draft)}
-                    disabled={cancelWorkflow.isPending}
-                    type="button"
-                    title="Cancel"
-                  >
-                    <Square size={15} />
-                    Cancel
+                    Start
                   </Button>
                 </div>
               </div>
-              <ReactFlow
-                nodes={canvasNodes}
-                edges={flowEdges}
-                nodeTypes={workflowNodeTypes}
-                edgeTypes={workflowEdgeTypes}
-                onNodesChange={onNodesChange}
-                onEdgesChange={onEdgesChange}
-                onInit={(instance) => {
-                  flowInstanceRef.current = instance
-                }}
-                fitView
-                fitViewOptions={{ padding: 0.16 }}
-                deleteKeyCode={["Backspace", "Delete"]}
-                elementsSelectable
-                nodesConnectable
-                nodesDraggable
-                onlyRenderVisibleElements
-                onConnect={onConnect}
-                onNodeClick={(_, node) => {
-                  if (isFanoutStackNodeId(node.id)) {
-                    const key = node.id.slice(FANOUT_STACK_NODE_PREFIX.length)
-                    if (key.endsWith(":expanded-control")) return
-                    expandFanoutGroup(key)
+              <div className="flow-shell role-flow-shell">
+                {roleRuntimeLive && (
+                  <div className="role-live-overlay" aria-live="polite">
+                    <div className="role-live-overlay-head">
+                      <span className="role-live-dot" />
+                      <strong>Live dialogue</strong>
+                      <small>{runtimeSummary?.next_action ?? "runtime active"}</small>
+                    </div>
+                    <div className="role-live-message-strip">
+                      {latestTeamMessages.length ? (
+                        latestTeamMessages.map((message) => (
+                          <span key={`${message.node_id ?? message.role}-${message.timestamp}`}>
+                            <b>{message.role}</b>
+                            {truncate(message.message, 120)}
+                          </span>
+                        ))
+                      ) : (
+                        <span>
+                          <b>{runtimeSummary?.active_node_ids[0] ?? "team"}</b>
+                          waiting for the next human-language update
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                )}
+                <ReactFlow
+                  nodes={canvasMode === "role" ? roleCanvasNodes : canvasNodes}
+                  edges={canvasMode === "role" ? roleFlowEdges : flowEdges}
+                  nodeTypes={workflowNodeTypes}
+                  edgeTypes={workflowEdgeTypes}
+                  onNodesChange={canvasMode === "role" ? onRoleNodesChange : onNodesChange}
+                  onEdgesChange={onEdgesChange}
+                  onInit={(instance) => {
+                    flowInstanceRef.current = instance
+                  }}
+                  fitView
+                  fitViewOptions={{ padding: 0.18 }}
+                  deleteKeyCode={canvasMode === "role" ? null : ["Backspace", "Delete"]}
+                  elementsSelectable
+                  nodesConnectable={canvasMode === "task"}
+                  nodesDraggable
+                  onlyRenderVisibleElements
+                  onConnect={onConnect}
+                  onNodeClick={(_, node) => {
+                    if (canvasMode === "role" && node.id.startsWith(ROLE_NODE_PREFIX)) {
+                      const role = roleFromNodeId(node.id)
+                      setSelectedRole(role)
+                      setSelectedNodeId(roleSummaries.find((item) => item.role === role)?.tasks[0]?.id ?? "")
+                      setSelectedEdgeId("")
+                      return
+                    }
+                    if (isFanoutStackNodeId(node.id)) {
+                      const key = node.id.slice(FANOUT_STACK_NODE_PREFIX.length)
+                      if (key.endsWith(":expanded-control")) return
+                      expandFanoutGroup(key)
+                      setSelectedEdgeId("")
+                      return
+                    }
+                    setSelectedNodeId(node.id)
                     setSelectedEdgeId("")
-                    return
-                  }
-                  setSelectedNodeId(node.id)
-                  setSelectedEdgeId("")
-                }}
-                onEdgeClick={(_, edge) => {
-                  if (isStackEdgeId(edge.id)) return
-                  setSelectedEdgeId(edge.id)
-                  setSelectedNodeId("")
-                }}
-                onNodeDragStart={() => setIsDraggingNode(true)}
-                onNodeDragStop={(_, node) => {
-                  setIsDraggingNode(false)
-                  if (isFanoutStackNodeId(node.id)) {
-                    const key = node.id.slice(FANOUT_STACK_NODE_PREFIX.length)
-                    setFanoutStackPositions((current) => ({
-                      ...current,
-                      [key]: { x: node.position.x, y: node.position.y },
-                    }))
-                    return
-                  }
-                  updateNode(node.id, (item) => {
-                    item.position = { x: node.position.x, y: node.position.y }
-                  })
-                }}
-                onPaneClick={() => {
-                  setSelectedEdgeId("")
-                }}
-              >
-                <Background />
-                <MiniMap pannable zoomable />
-                <Controls />
-              </ReactFlow>
-            </div>
+                  }}
+                  onEdgeClick={(_, edge) => {
+                    if (canvasMode === "role" || isStackEdgeId(edge.id)) return
+                    setSelectedEdgeId(edge.id)
+                    setSelectedNodeId("")
+                  }}
+                  onNodeDragStart={() => setIsDraggingNode(true)}
+                  onNodeDragStop={(_, node) => {
+                    setIsDraggingNode(false)
+                    if (canvasMode === "role" && node.id.startsWith(ROLE_NODE_PREFIX)) {
+                      const role = roleFromNodeId(node.id)
+                      setRoleNodePositions((current) => ({
+                        ...current,
+                        [role]: { x: node.position.x, y: node.position.y },
+                      }))
+                      setSelectedRole(role)
+                      return
+                    }
+                    if (isFanoutStackNodeId(node.id)) {
+                      const key = node.id.slice(FANOUT_STACK_NODE_PREFIX.length)
+                      setFanoutStackPositions((current) => ({
+                        ...current,
+                        [key]: { x: node.position.x, y: node.position.y },
+                      }))
+                      return
+                    }
+                    updateNode(node.id, (item) => {
+                      item.position = { x: node.position.x, y: node.position.y }
+                    })
+                  }}
+                  onPaneClick={() => {
+                    setSelectedEdgeId("")
+                  }}
+                >
+                  <Background />
+                  {canvasMode === "task" && <MiniMap pannable zoomable />}
+                  <Controls />
+                </ReactFlow>
+              </div>
+              {selectedRoleSummary && (
+                <div className="role-internal-flow-panel">
+                  <div className="role-internal-flow-head">
+                    <span className="role-pill" style={{ background: `${roleColor(selectedRoleSummary.role)}22`, color: roleColor(selectedRoleSummary.role) }}>
+                      {roleKindForSummary(selectedRoleSummary) === "literature" ? <Search size={12} /> : <UsersRound size={12} />}
+                      {selectedRoleSummary.role}
+                    </span>
+                    <strong>Team Chat Protocol</strong>
+                    <small>Planner reads human-language updates, not full artifact dumps.</small>
+                  </div>
+                  <div className="role-demand-note">
+                    <strong>Core scope</strong>
+                    <span>{roleScopeForSummary(selectedRoleSummary)}</span>
+                  </div>
+                  <div className="role-chat-grid">
+                    <div className="role-chat-card">
+                      <strong>Planner</strong>
+                      <span>Continuously explains the problem in chat, reads compact human updates, and routes follow-up work.</span>
+                    </div>
+                    <div className="role-chat-card">
+                      <strong>Workers</strong>
+                      <span>Write papers, search literature, insert citations, or analyze results. They execute and report; they do not call the planner.</span>
+                    </div>
+                    <div className="role-chat-card">
+                      <strong>Reviewer</strong>
+                      <span>Raises questions and evidence gaps. The planner decides which employee continues.</span>
+                    </div>
+                    <div className="role-chat-card">
+                      <strong>Messages</strong>
+                      <span>Use human-language summaries with artifact links. Do not send all raw text at once.</span>
+                    </div>
+                  </div>
+                  <div className="role-message-list">
+                    <header>Human-language updates</header>
+                    {selectedRoleMessages.map((message) => (
+                      <div className="role-message-card" key={`${message.node_id ?? message.role}-${message.timestamp}`}>
+                        <div>
+                          <strong>{message.role}</strong>
+                          <span>{message.role_kind}</span>
+                        </div>
+                        <p>{truncate(message.message, 420)}</p>
+                        {message.artifact_refs.length > 0 && (
+                          <small>{message.artifact_refs.slice(0, 3).map((artifact) => artifact.path).join(" · ")}</small>
+                        )}
+                      </div>
+                    ))}
+                    {!selectedRoleMessages.length && <small>No team chat updates from this role yet.</small>}
+                  </div>
+                  <div className="role-selected-tasks">
+                    <header>{selectedRoleSummary.tasks.length ? "Current routed work" : "No routed work yet"}</header>
+                    {selectedRoleSummary.tasks.slice(0, 4).map((task) => (
+                      <button
+                        className={`role-internal-task ${selectedNodeId === task.id ? "selected" : ""}`}
+                        key={task.id}
+                        onClick={() => {
+                          setSelectedNodeId(task.id)
+                          setSelectedEdgeId("")
+                          setCanvasMode("task")
+                        }}
+                        type="button"
+                      >
+                        <span>{taskTypeLabel(boardTaskById.get(task.id) ?? task)}</span>
+                        <strong>{task.name}</strong>
+                      </button>
+                    ))}
+                    {!selectedRoleSummary.tasks.length && <small>Waiting for planner assignment or a worker request.</small>}
+                  </div>
+                </div>
+              )}
+            </section>
+
+            <section className="role-agent-strip" aria-label="Role agents">
+              <div className="task-section-head">
+                <div>
+                  <h2>Role Agents</h2>
+                  <p>
+                    {routedRoleCount} routed role(s)
+                    {onDemandRoleCount ? ` · ${onDemandRoleCount} standby role(s)` : ""}
+                  </p>
+                </div>
+                <Button variant="secondary" onClick={() => taskBoard.refetch()} type="button" title="Refresh runtime state">
+                  <RefreshCcw size={14} />
+                  Refresh
+                </Button>
+              </div>
+              <div className="role-agent-list">
+                {roleSummaries.map((role) => {
+                  const kind = roleKindForSummary(role)
+                  return (
+                    <div className={`role-agent-tile${role.onDemand ? " role-agent-tile-ondemand" : ""}`} key={role.role}>
+                      <span className="role-pill" style={{ background: `${roleColor(role.role)}22`, color: roleColor(role.role) }}>
+                        {kind === "literature" ? <Search size={12} /> : <UsersRound size={12} />}
+                        {role.role}
+                      </span>
+                      <strong>{role.onDemand ? role.standbyLabel ?? "standby" : `${role.active} active`}</strong>
+                      <small>{roleScopeForSummary(role)}</small>
+                      <em>{rolePermissionChips(role).join(" · ")}</em>
+                    </div>
+                  )
+                })}
+                {!roleSummaries.length && (
+                  <div className="role-agent-empty">
+                    <UsersRound size={16} />
+                    <span>No role agents on this board yet.</span>
+                  </div>
+                )}
+              </div>
+            </section>
+
             <div className="workflow-terminal">
               <div className="workflow-terminal-head">
                 <div className="workflow-terminal-title">
                   <Terminal size={14} />
                   <strong>Terminal</strong>
-                  {draft?.status && <span className={statusClass(draft.status)}>{draft.status}</span>}
                   <span className={statusClass(executionState)}>{executionStateLabel(executionState)}</span>
                 </div>
                 <div className="workflow-terminal-filters" aria-label="Terminal event filters">
@@ -2624,14 +3278,14 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
         ) : (
           <div className="empty-state">
             <GitBranch size={28} />
-            <h1>Create or generate a research workflow</h1>
-            <p>Start from a template or ask ARIS to generate a DAG from the research goal.</p>
+            <h1>Create or generate an orchestration</h1>
+            <p>Start from a template or ask ARIS to plan role-agent work from the initial goal.</p>
           </div>
         )}
       </section>
 
       <aside className="orchestrator-right side-panel">
-        <h2>{selectedEdge ? "Edge Editor" : "Node Editor"}</h2>
+        <h2>{selectedEdge ? "Edge Editor" : "Task Editor"}</h2>
         {draft && selectedEdge ? (
           <>
             <div className="selected-skill">
@@ -2647,7 +3301,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
               </span>
             </div>
             <p className="muted">
-              This edge means the target Agent or Gate waits for the source node to finish.
+              This dependency means the target task waits for the source task to finish.
             </p>
             <div className="handoff-preview-box">
               <div className="handoff-preview-head">
@@ -2684,7 +3338,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
             <div className="selected-skill">
               <div className="node-editor-title">
                 <span className={`node-kind node-kind-${selectedNode.skill === "research-lit" && selectedNode.dynamic_parent_id ? "research" : selectedNode.type}`}>
-                  {selectedNode.type === "human_gate" ? <ClipboardCheck size={13} /> : <Cpu size={13} />}
+                  {selectedNode.type === "input" ? <FileText size={13} /> : selectedNode.type === "human_gate" ? <ClipboardCheck size={13} /> : <Cpu size={13} />}
                   {nodeKindLabel(selectedNode)}
                 </span>
                 <strong>{selectedNode.id}</strong>
@@ -2697,126 +3351,6 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                 </span>
               )}
             </div>
-            {(selectedNode.session_path || selectedNode.dynamic_parent_id || selectedNode.status === "waiting_dynamic_dependency") && (
-              <div className="dynamic-node-box">
-                {selectedNode.session_path && <p>session {selectedNode.session_path}</p>}
-                {selectedNode.dynamic_parent_id && <p>planned from {selectedNode.dynamic_parent_id}</p>}
-                {selectedNode.status === "waiting_dynamic_dependency" && <p>waiting for literature</p>}
-                {selectedNode.dynamic_reason && <p>{selectedNode.dynamic_reason}</p>}
-                {selectedNode.research_request && <pre>{jsonPreview(selectedNode.research_request, 900)}</pre>}
-              </div>
-            )}
-            <div className="session-inspector">
-              <div className="runtime-card-head">
-                <span>
-                  <Terminal size={14} />
-                  Session Inspector
-                </span>
-                <Badge>{selectedSession.data?.kind ?? "node"}</Badge>
-              </div>
-              <div className="runtime-kv">
-                <span>session</span>
-                <b>{selectedSession.data?.session_id ?? selectedRuntimeSessionId ?? "none"}</b>
-                <span>events</span>
-                <b>{selectedSession.data?.events.length ?? 0}</b>
-                <span>artifacts</span>
-                <b>{selectedSession.data?.artifact_refs.length ?? selectedNodeRuntimeArtifacts.length}</b>
-              </div>
-              {selectedBlockedSession && (
-                <div className="blocked-session-box">
-                  <strong>blocked by dynamic dependency</strong>
-                  <span>{String(selectedBlockedSession["reason"] ?? "waiting for literature")}</span>
-                  <small>{jsonPreview(selectedBlockedSession["blocked_by"] ?? [], 220)}</small>
-                </div>
-              )}
-              {(selectedSession.data?.artifact_refs.length ? selectedSession.data.artifact_refs : selectedNodeRuntimeArtifacts).slice(0, 4).map((artifact) => (
-                <button
-                  className="session-artifact-row"
-                  key={artifact.path}
-                  onClick={() =>
-                    setArtifactPreview({
-                      workspace: draft.workspace,
-                      path: artifact.path,
-                      nodeId: selectedNode.id,
-                      nodeName: selectedNode.name,
-                      artifact: artifactsByPath.get(artifact.path),
-                    })
-                  }
-                  type="button"
-                >
-                  <FileText size={13} />
-                  <span>{artifact.path}</span>
-                </button>
-              ))}
-            </div>
-            <div className="node-editor-actions">
-              <Button
-                variant="secondary"
-                onClick={() => runNode.mutate({ workflow: draft, nodeId: selectedNode.id })}
-                disabled={!isExecutableNode(selectedNode) || runNode.isPending || rerunNode.isPending}
-                type="button"
-                title="Save current node settings, then run only this node"
-              >
-                <Play size={15} />
-                Save & run
-              </Button>
-              <Button
-                variant="secondary"
-                onClick={() => rerunNode.mutate({ workflow: draft, nodeId: selectedNode.id })}
-                disabled={!isExecutableNode(selectedNode) || runNode.isPending || rerunNode.isPending}
-                type="button"
-                title="Save current node settings, then rerun this node and reset downstream nodes"
-              >
-                <RefreshCcw size={15} />
-                Save & rerun
-              </Button>
-              <Button
-                variant="secondary"
-                onClick={() => approveNode.mutate({ workflow: draft, nodeId: selectedNode.id })}
-                disabled={selectedNode.status !== "waiting_approval" || approveNode.isPending}
-                type="button"
-              >
-                <CheckCircle2 size={15} />
-                Approve
-              </Button>
-              <Button
-                variant="secondary"
-                onClick={() =>
-                  selectedNode.status === "skipped"
-                    ? restoreNode.mutate({ workflow: draft, nodeId: selectedNode.id })
-                    : skipNode.mutate({ workflow: draft, nodeId: selectedNode.id })
-                }
-                disabled={skipNode.isPending || restoreNode.isPending}
-                type="button"
-                title={selectedNode.status === "skipped" ? "Restore this skipped node to queued" : "Skip this node"}
-              >
-                {selectedNode.status === "skipped" && <RefreshCcw size={15} />}
-                {selectedNode.status === "skipped" ? "Restore" : "Skip"}
-              </Button>
-            </div>
-            {isExecutableNode(selectedNode) && (
-              <div className="node-run-settings">
-                <div>
-                  <label>Run model</label>
-                  <Select
-                    value={selectedNode.model ?? ""}
-                    onChange={(event) =>
-                      updateNode(selectedNode.id, (node) => {
-                        node.model = event.target.value || null
-                      })
-                    }
-                  >
-                    <option value="">{nodeModelDefaultLabel}</option>
-                    {nodeModelOptions.map((modelOption) => (
-                      <option key={modelOption} value={modelOption}>
-                        {modelProviderLabels.get(modelOption) ? `${modelOption} · ${modelProviderLabels.get(modelOption)}` : modelOption}
-                      </option>
-                    ))}
-                  </Select>
-                </div>
-                <p className="muted">This value is saved before Save & run / Save & rerun starts the node.</p>
-              </div>
-            )}
             <label>Type</label>
             <Select
               value={selectedNode.type === "sub_agent" ? "agent" : selectedNode.type}
@@ -2824,6 +3358,32 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                 updateNode(selectedNode.id, (node) => {
                   const nextType = event.target.value as WorkflowNodeInfo["type"]
                   node.type = nextType
+                  if (nextType === "input") {
+                    node.role = "global input"
+                    node.skill = null
+                    node.config_file = null
+                    node.model = null
+                    node.effort = null
+                    node.gate = "none"
+                    node.timeout_seconds = null
+                    node.retry = null
+                    node.failure_policy = "halt"
+                    node.fanout = null
+                    node.task_type = "input"
+                    node.status = "succeeded"
+                    node.assignee_role = null
+                    node.review_status = "not_required"
+                    applyRoleProtocolDefaults(node, "worker")
+                    node.scope = ""
+                    node.outputs = node.outputs.length ? node.outputs : [{ name: "user_context", type: "text" }]
+                    node.depends_on = []
+                    for (const item of draft.graph_json.nodes) {
+                      if (item.id !== node.id && item.type !== "input" && !item.depends_on.includes(node.id)) {
+                        item.depends_on.push(node.id)
+                      }
+                    }
+                    return
+                  }
                   if (nextType === "human_gate") {
                     node.role = node.role || "human approval"
                     node.skill = null
@@ -2835,21 +3395,29 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                     node.retry = null
                     node.failure_policy = "halt"
                     node.fanout = null
+                    node.task_type = "gate"
+                    applyRoleProtocolDefaults(node, "gate")
                   } else if (nextType === "agent") {
                     node.role = node.role === "human approval" || node.role === "executor" ? "planner" : node.role
-                    node.skill = null
                     node.config_file = null
                     node.gate = "none"
                     node.timeout_seconds = null
                     node.retry = null
                     node.failure_policy = "halt"
                     node.fanout = null
+                    if (node.task_type === "input" || node.task_type === "gate") node.task_type = "planning"
+                    node.skill = node.skill || defaultSkillForTask(node.task_type, node.role, node.name) || null
+                    applyRoleProtocolDefaults(node, "planner")
                   } else if (node.role === "human approval" || node.role === "planner") {
                     node.role = "executor"
+                    if (node.task_type === "input" || node.task_type === "gate") node.task_type = "analysis"
+                    node.skill = node.skill || defaultSkillForTask(node.task_type, node.role, node.name) || null
+                    applyRoleProtocolDefaults(node, "worker")
                   }
                 })
               }
             >
+              <option value="input">Input</option>
               <option value="agent">Agent</option>
               <option value="human_gate">Gate</option>
             </Select>
@@ -2857,54 +3425,101 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
             <Input value={selectedNode.name} onChange={(event) => updateNode(selectedNode.id, (node) => (node.name = event.target.value))} />
             <label>Role</label>
             <Input value={selectedNode.role} onChange={(event) => updateNode(selectedNode.id, (node) => (node.role = event.target.value))} />
-            {selectedNode.type === "sub_agent" && (
-              <>
-                <label>
-                  Agent Profile
-                  <small className="inline-hint"> executor defaults</small>
-                </label>
+            {selectedNode.type !== "input" && (
+              <div className="team-protocol-editor">
+                <div className="field-head">
+                  <label>Team protocol</label>
+                  <Badge>{inferRoleKindForNode(selectedNode)}</Badge>
+                </div>
                 <Select
-                  value={selectedNode.config_file ?? ""}
+                  value={inferRoleKindForNode(selectedNode)}
                   onChange={(event) =>
                     updateNode(selectedNode.id, (node) => {
-                      node.config_file = event.target.value || null
+                      applyRoleProtocolDefaults(node, event.target.value as TeamRoleKind)
                     })
                   }
                 >
-                  <option value="">Default agent (no profile)</option>
-                  {(agentConfigs.data ?? []).map((config) => (
-                    <option key={config.id} value={config.path}>
-                      {config.name}
-                      {config.role ? ` - ${config.role}` : ""}
+                  {roleKindOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
                     </option>
                   ))}
                 </Select>
-                {selectedNodeConfig && (
-                  <div className="role-preview">
-                    <div className="role-preview-head">
-                      <span
-                        className="role-pill"
-                        style={{
-                          background: `${roleColor(selectedNodeConfig.id)}22`,
-                          color: roleColor(selectedNodeConfig.id),
-                        }}
-                      >
-                        <Sparkles size={11} />
-                        {selectedNodeConfig.name}
-                      </span>
-                      {selectedNodeConfig.skill && <small>/{selectedNodeConfig.skill}</small>}
-                      {selectedNodeConfig.model && <small>model: {selectedNodeConfig.model}</small>}
-                      {selectedNodeConfig.effort && <small>effort: {selectedNodeConfig.effort}</small>}
-                    </div>
-                    {selectedNodeConfig.system_prompt ? (
-                      <p>{truncate(selectedNodeConfig.system_prompt, 180)}</p>
-                    ) : selectedNodeConfig.role ? (
-                      <p className="muted">{selectedNodeConfig.role}</p>
-                    ) : null}
-                  </div>
-                )}
+                <Textarea
+                  rows={2}
+                  value={selectedNode.scope || defaultScopeForRoleKind(inferRoleKindForNode(selectedNode))}
+                  onChange={(event) => updateNode(selectedNode.id, (node) => (node.scope = event.target.value))}
+                  placeholder="Core responsibility range"
+                />
+                <div className="protocol-toggle-grid">
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={Boolean(selectedNode.can_ask_questions)}
+                      onChange={(event) => updateNode(selectedNode.id, (node) => (node.can_ask_questions = event.target.checked))}
+                    />
+                    Can ask
+                  </label>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={Boolean(selectedNode.can_clone_workers)}
+                      onChange={(event) => updateNode(selectedNode.id, (node) => (node.can_clone_workers = event.target.checked))}
+                    />
+                    Clone workers
+                  </label>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={Boolean(selectedNode.peer_access)}
+                      onChange={(event) => updateNode(selectedNode.id, (node) => (node.peer_access = event.target.checked))}
+                    />
+                    Peer access
+                  </label>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={Boolean(selectedNode.reports_to_chat ?? true)}
+                      onChange={(event) => updateNode(selectedNode.id, (node) => (node.reports_to_chat = event.target.checked))}
+                    />
+                    Chat report
+                  </label>
+                </div>
+              </div>
+            )}
+            <label>Task type</label>
+            <Select
+              value={selectedNode.task_type ?? (selectedNode.type === "human_gate" ? "gate" : "analysis")}
+              onChange={(event) =>
+                updateNode(selectedNode.id, (node) => {
+                  node.task_type = event.target.value as WorkflowNodeInfo["task_type"]
+                  if (isExecutableNode(node)) {
+                    node.skill = defaultSkillForTask(node.task_type, node.role, node.name) || node.skill || null
+                  }
+                })
+              }
+            >
+              <option value="input">input</option>
+              <option value="goal">goal</option>
+              <option value="planning">planning</option>
+              <option value="research">research</option>
+              <option value="analysis">analysis</option>
+              <option value="coding">coding</option>
+              <option value="writing">writing</option>
+              <option value="review">review</option>
+              <option value="gate">gate</option>
+            </Select>
+            <label>Objective</label>
+            <Textarea
+              rows={3}
+              value={selectedNode.objective ?? ""}
+              onChange={(event) => updateNode(selectedNode.id, (node) => (node.objective = event.target.value))}
+              placeholder="What this task should accomplish"
+            />
+            {isExecutableNode(selectedNode) && (
+              <>
                 <label>
-                  Skill
+                  Inherited skill
                   {selectedNodeConfig?.skill && !selectedNode.skill && (
                     <small className="inline-hint"> profile default /{selectedNodeConfig.skill}</small>
                   )}
@@ -2920,7 +3535,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                   <option value="">
                     {selectedNodeConfig?.skill
                       ? `Use profile default (/${selectedNodeConfig.skill})`
-                      : "Ad-hoc agent"}
+                      : "Auto by role/task"}
                   </option>
                   {(skills.data ?? []).map((skill) => (
                     <option key={skill.id} value={skill.id}>
@@ -2928,314 +3543,53 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
                     </option>
                   ))}
                 </Select>
-              </>
-            )}
-            <div className="field-head">
-              <label>{selectedNode.type === "human_gate" ? "Gate instructions" : "Prompt"}</label>
-              <Button
-                variant="secondary"
-                onClick={() =>
-                  optimizeNodePrompt.mutate({
-                    workflow: draft,
-                    nodeId: selectedNode.id,
-                    instructions: promptOptimizationNote,
-                    model: selectedNode.model ?? selectedNodeConfig?.model ?? settings.data?.model ?? null,
-                  })
-                }
-                disabled={!selectedNode.prompt.trim() || optimizeNodePrompt.isPending}
-                type="button"
-                title="Ask the configured LLM to improve this node prompt"
-              >
-                <Wand2 size={14} />
-                {optimizeNodePrompt.isPending ? "Optimizing" : "Optimize prompt"}
-              </Button>
-            </div>
-            <Textarea
-              rows={selectedNode.type === "human_gate" ? 5 : 8}
-              value={selectedNode.prompt}
-              onChange={(event) => updateNode(selectedNode.id, (node) => (node.prompt = event.target.value))}
-            />
-            <div className="prompt-optimizer-row">
-              <Input
-                value={promptOptimizationNote}
-                onChange={(event) => setPromptOptimizationNote(event.target.value)}
-                placeholder="Optional focus, e.g. stricter output format, shorter prompt, add success criteria"
-              />
-            </div>
-            {optimizeNodePrompt.error && <p className="error-text">{optimizeNodePrompt.error.message}</p>}
-            {promptSuggestion?.nodeId === selectedNode.id && (
-              <div className="prompt-suggestion">
-                <div className="prompt-suggestion-head">
-                  <strong>Optimized prompt suggestion</strong>
-                  <div>
-                    <Button
-                      variant="secondary"
-                      onClick={() => {
-                        updateNode(selectedNode.id, (node) => {
-                          node.prompt = promptSuggestion.prompt
-                        })
-                        setPromptSuggestion(null)
-                      }}
-                      type="button"
-                    >
-                      Apply
-                    </Button>
-                    <Button variant="ghost" onClick={() => setPromptSuggestion(null)} type="button">
-                      Discard
-                    </Button>
-                  </div>
-                </div>
-                <pre>{promptSuggestion.prompt}</pre>
-              </div>
-            )}
-            {selectedNode.type === "sub_agent" && (
-              <>
-                <label>Gate</label>
+                <label>Model</label>
                 <Select
-                  value={selectedNode.gate}
-                  onChange={(event) => updateNode(selectedNode.id, (node) => (node.gate = event.target.value as WorkflowGate))}
+                  value={selectedNode.model ?? ""}
+                  onChange={(event) =>
+                    updateNode(selectedNode.id, (node) => {
+                      node.model = event.target.value || null
+                    })
+                  }
                 >
-                  <option value="none">none</option>
-                  <option value="before">before</option>
-                  <option value="after">after</option>
-                  <option value="both">both</option>
+                  <option value="">{nodeModelDefaultLabel}</option>
+                  {nodeModelOptions.map((modelOption) => (
+                    <option key={modelOption} value={modelOption}>
+                      {modelProviderLabels.get(modelOption)
+                        ? `${modelOption} · ${modelProviderLabels.get(modelOption)}`
+                        : modelOption}
+                    </option>
+                  ))}
                 </Select>
               </>
             )}
+            <div className="field-head">
+              <label>
+                {selectedNode.type === "input"
+                  ? "Input content"
+                  : selectedNode.type === "human_gate"
+                    ? "Gate instructions"
+                    : "Optional supplemental instructions"}
+              </label>
+            </div>
+            <Textarea
+              rows={selectedNode.type === "human_gate" || selectedNode.type === "input" ? 5 : 8}
+              value={selectedNode.prompt}
+              onChange={(event) => updateNode(selectedNode.id, (node) => (node.prompt = event.target.value))}
+              placeholder={
+                selectedNode.type === "input"
+                  ? "Add global context, constraints, files, requirements, or notes. All non-input tasks inherit this as upstream input."
+                  : isExecutableNode(selectedNode)
+                    ? "Optional. Leave empty to let the inherited skill drive the task from objective, inputs, outputs, and criteria."
+                    : ""
+              }
+            />
             <label>Depends on</label>
             <Input
               value={joinList(selectedNode.depends_on)}
               onChange={(event) => updateNode(selectedNode.id, (node) => (node.depends_on = splitList(event.target.value)))}
               placeholder="planner, literature"
             />
-            {isExecutableNode(selectedNode) && (
-              <details className="advanced-node-settings">
-                <summary>
-                  <SlidersHorizontal size={14} />
-                  Advanced node settings
-                </summary>
-                <div className="two-col">
-                  <div>
-                    <label>Effort</label>
-                    <Input
-                      value={selectedNode.effort ?? ""}
-                      onChange={(event) =>
-                        updateNode(selectedNode.id, (node) => {
-                          node.effort = event.target.value || null
-                        })
-                      }
-                      placeholder={
-                        selectedNodeConfig?.effort ? `Profile default: ${selectedNodeConfig.effort}` : "Default"
-                      }
-                    />
-                  </div>
-                </div>
-                {selectedNode.type === "sub_agent" && (
-                  <>
-                    <div className="two-col">
-                      <div>
-                        <label>Timeout seconds</label>
-                        <Input
-                          value={selectedNode.timeout_seconds ?? ""}
-                          onChange={(event) =>
-                            updateNode(selectedNode.id, (node) => {
-                              const value = event.target.value.trim()
-                              node.timeout_seconds = value ? Number(value) : null
-                            })
-                          }
-                          placeholder={selectedNodeConfig?.timeout_seconds ? `Profile default: ${selectedNodeConfig.timeout_seconds}` : "Default"}
-                        />
-                      </div>
-                      <div>
-                        <label>Failure policy</label>
-                        <Select
-                          value={selectedNode.failure_policy ?? "halt"}
-                          onChange={(event) =>
-                            updateNode(selectedNode.id, (node) => {
-                              node.failure_policy = event.target.value as WorkflowNodeInfo["failure_policy"]
-                            })
-                          }
-                        >
-                          <option value="halt">halt</option>
-                          <option value="skip_descendants">skip descendants</option>
-                          <option value="continue">continue</option>
-                        </Select>
-                      </div>
-                    </div>
-                    <div className="two-col">
-                      <div>
-                        <label>Retry attempts</label>
-                        <Input
-                          value={selectedNode.retry?.max_attempts ?? ""}
-                          onChange={(event) =>
-                            updateNode(selectedNode.id, (node) => {
-                              const value = event.target.value.trim()
-                              node.retry = value
-                                ? {
-                                    max_attempts: Number(value),
-                                    backoff_seconds: node.retry?.backoff_seconds ?? 0,
-                                    on: node.retry?.on ?? [],
-                                  }
-                                : null
-                            })
-                          }
-                          placeholder="1"
-                        />
-                      </div>
-                      <div>
-                        <label>Retry backoff seconds</label>
-                        <Input
-                          value={selectedNode.retry?.backoff_seconds ?? ""}
-                          onChange={(event) =>
-                            updateNode(selectedNode.id, (node) => {
-                              const value = event.target.value.trim()
-                              node.retry = {
-                                max_attempts: node.retry?.max_attempts ?? 2,
-                                backoff_seconds: value ? Number(value) : 0,
-                                on: node.retry?.on ?? [],
-                              }
-                            })
-                          }
-                          placeholder="0"
-                        />
-                      </div>
-                    </div>
-                    <label>Retry on</label>
-                    <Input
-                      value={joinList(selectedNode.retry?.on ?? [])}
-                      onChange={(event) =>
-                        updateNode(selectedNode.id, (node) => {
-                          const on = splitList(event.target.value)
-                          node.retry = on.length || node.retry
-                            ? {
-                                max_attempts: node.retry?.max_attempts ?? 2,
-                                backoff_seconds: node.retry?.backoff_seconds ?? 0,
-                                on,
-                              }
-                            : null
-                        })
-                      }
-                      placeholder="timeout, rate limit"
-                    />
-                    <div className="fanout-config">
-                      <label>Dynamic fan-out</label>
-                      <Select
-                        value={selectedNode.fanout ? "on" : "off"}
-                        onChange={(event) =>
-                          updateNode(selectedNode.id, (node) => {
-                            node.fanout =
-                              event.target.value === "on"
-                                ? {
-                                    source: node.fanout?.source ?? node.depends_on[0] ?? null,
-                                    path: node.fanout?.path ?? "keyword_groups",
-                                    name_template: node.fanout?.name_template ?? "Literature search: {{item.name}}",
-                                    max_items: node.fanout?.max_items ?? 12,
-                                    empty_policy: node.fanout?.empty_policy ?? "fail",
-                                  }
-                                : null
-                          })
-                        }
-                      >
-                        <option value="off">off</option>
-                        <option value="on">expand from upstream JSON</option>
-                      </Select>
-                      {selectedNode.fanout && (
-                        <>
-                          <div className="two-col">
-                            <div>
-                              <label>Source node</label>
-                              <Select
-                                value={selectedNode.fanout.source ?? ""}
-                                onChange={(event) =>
-                                  updateNode(selectedNode.id, (node) => {
-                                    if (!node.fanout) return
-                                    node.fanout.source = event.target.value || null
-                                  })
-                                }
-                              >
-                                <option value="">First dependency</option>
-                                {draft.graph_json.nodes
-                                  .filter((node) => node.id !== selectedNode.id)
-                                  .map((node) => (
-                                    <option key={node.id} value={node.id}>
-                                      {node.id}
-                                    </option>
-                                  ))}
-                              </Select>
-                            </div>
-                            <div>
-                              <label>JSON path</label>
-                              <Input
-                                value={selectedNode.fanout.path}
-                                onChange={(event) =>
-                                  updateNode(selectedNode.id, (node) => {
-                                    if (!node.fanout) return
-                                    node.fanout.path = event.target.value
-                                  })
-                                }
-                                placeholder="keyword_groups"
-                              />
-                            </div>
-                          </div>
-                          <label>Name template</label>
-                          <Input
-                            value={selectedNode.fanout.name_template}
-                            onChange={(event) =>
-                              updateNode(selectedNode.id, (node) => {
-                                if (!node.fanout) return
-                                node.fanout.name_template = event.target.value
-                              })
-                            }
-                            placeholder="Literature search: {{item.name}}"
-                          />
-                          <div className="two-col">
-                            <div>
-                              <label>Max items</label>
-                              <Input
-                                value={selectedNode.fanout.max_items}
-                                onChange={(event) =>
-                                  updateNode(selectedNode.id, (node) => {
-                                    if (!node.fanout) return
-                                    const value = Number(event.target.value)
-                                    node.fanout.max_items = Number.isFinite(value) ? value : 12
-                                  })
-                                }
-                                type="number"
-                                min={1}
-                              />
-                            </div>
-                            <div>
-                              <label>Empty result</label>
-                              <Select
-                                value={selectedNode.fanout.empty_policy ?? "fail"}
-                                onChange={(event) =>
-                                  updateNode(selectedNode.id, (node) => {
-                                    if (!node.fanout) return
-                                    node.fanout.empty_policy = event.target.value as "fail" | "succeed"
-                                  })
-                                }
-                              >
-                                <option value="fail">fail node</option>
-                                <option value="succeed">succeed with none</option>
-                              </Select>
-                            </div>
-                          </div>
-                          <p className="muted small">
-                            Prompt placeholders: {"{{item.name}}"}, {"{{item.keywords}}"}, {"{{item}}"}, {"{{number}}"}.
-                          </p>
-                        </>
-                      )}
-                      {selectedNode.fanout_parent_id && (
-                        <div className="fanout-preview">
-                          <strong>Generated from {selectedNode.fanout_parent_id}</strong>
-                          <pre>{jsonPreview(selectedNode.fanout_item)}</pre>
-                        </div>
-                      )}
-                    </div>
-                  </>
-                )}
-              </details>
-            )}
             {selectedNode.error && <p className="error-text">{selectedNode.error}</p>}
             <div className="node-editor-danger-zone">
               <Button variant="destructive" onClick={() => removeNode(selectedNode.id)} type="button">
@@ -3244,7 +3598,7 @@ function OrchestratorPage({ workspace }: { workspace: string }) {
             </div>
           </>
         ) : (
-          <p className="muted">Select a DAG node to edit it.</p>
+          <p className="muted">Select a task to edit it.</p>
         )}
       </aside>
       <NodeArtifactDialog preview={artifactPreview} onClose={() => setArtifactPreview(null)} />
@@ -3333,7 +3687,7 @@ function SkillsPage({ workspace, onRunCreated }: { workspace: string; onRunCreat
       </section>
 
       <aside className="side-panel">
-        <h2>Launch Run</h2>
+        <h2>Launch Start Runtime</h2>
         {selected ? (
           <>
             <div className="selected-skill">
@@ -3514,7 +3868,7 @@ function ArtifactsPage({ workspace }: { workspace: string }) {
       <div className="panel-head">
         <div>
           <h1>Artifacts</h1>
-          <p>Workspace files that ARIS workflows commonly create or consume.</p>
+          <p>Workspace files that ARIS orchestrations commonly create or consume.</p>
         </div>
         <Button variant="secondary" onClick={() => artifacts.refetch()} type="button">
           <RefreshCcw size={16} />

@@ -121,6 +121,13 @@ export type TeamRoleSpec = {
   id: string
   name: string
   role?: string
+  kind?: TeamRoleKind | null
+  scope?: string
+  can_ask_questions?: boolean | null
+  can_clone_workers?: boolean | null
+  can_call_planner?: boolean | null
+  peer_access?: boolean | null
+  reports_to_chat?: boolean | null
   config_file?: string | null
   skill?: string | null
   prompt?: string
@@ -219,6 +226,10 @@ export type WorkflowNodeStatus =
   | "cancelled"
 
 export type WorkflowGate = "none" | "before" | "after" | "both"
+export type TaskType = "input" | "goal" | "planning" | "research" | "analysis" | "coding" | "writing" | "review" | "gate"
+export type TaskBoardColumn = "backlog" | "ready" | "running" | "review" | "rework" | "done" | "blocked"
+export type TaskReviewStatus = "not_required" | "pending" | "passed" | "rework"
+export type TeamRoleKind = "planner" | "reviewer" | "literature" | "writer" | "citation" | "worker" | "gate"
 
 export type WorkflowPort = string | {
   name: string
@@ -247,7 +258,7 @@ export type WorkflowFanOut = {
 
 export type WorkflowNodeInfo = {
   id: string
-  type: "agent" | "sub_agent" | "human_gate"
+  type: "input" | "agent" | "sub_agent" | "human_gate"
   name: string
   role: string
   skill?: string | null
@@ -282,6 +293,22 @@ export type WorkflowNodeInfo = {
   team_id?: string | null
   team_instance_id?: string | null
   team_role_id?: string | null
+  team_role_kind?: TeamRoleKind | null
+  scope?: string
+  can_ask_questions?: boolean | null
+  can_clone_workers?: boolean | null
+  can_call_planner?: boolean | null
+  peer_access?: boolean | null
+  reports_to_chat?: boolean | null
+  task_type?: TaskType
+  objective?: string
+  acceptance_criteria?: string[]
+  assignee_role?: string | null
+  assigned_to?: string | null
+  claimed_by?: string | null
+  review_status?: TaskReviewStatus
+  review_notes?: string
+  priority?: number
 }
 
 export type WorkflowEdgeInfo = {
@@ -444,6 +471,8 @@ export type WorkflowEvent = {
     | "planner"
     | "delta"
     | "session"
+    | "team_message"
+    | "artifact"
     | "approval"
   message: string
   node_id?: string | null
@@ -515,6 +544,22 @@ export type WorkflowHandoff = {
   has_structured_output: boolean
 }
 
+export type TeamMessage = {
+  workflow_id: string
+  timestamp: string
+  node_id?: string | null
+  run_id?: string | null
+  role: string
+  role_kind: TeamRoleKind
+  scope: string
+  message: string
+  artifact_refs: ArtifactIndexEntry[]
+  can_ask_questions: boolean
+  can_clone_workers: boolean
+  can_call_planner: boolean
+  peer_access: boolean
+}
+
 export type WorkflowRuntimeResponse = {
   workflow_id: string
   runtime_policy: RuntimePolicy
@@ -525,6 +570,62 @@ export type WorkflowRuntimeResponse = {
   dynamic_nodes: WorkflowNodeInfo[]
   artifact_index: ArtifactIndexEntry[]
   handoffs: WorkflowHandoff[]
+  team_messages: TeamMessage[]
+}
+
+export type TaskBoardTask = {
+  id: string
+  name: string
+  task_type: TaskType
+  column: TaskBoardColumn
+  status: WorkflowNodeStatus
+  role: string
+  skill?: string | null
+  objective: string
+  prompt: string
+  inputs: WorkflowPort[]
+  outputs: WorkflowPort[]
+  depends_on: string[]
+  acceptance_criteria: string[]
+  assignee_role?: string | null
+  assigned_to?: string | null
+  claimed_by?: string | null
+  review_status: TaskReviewStatus
+  review_notes: string
+  priority: number
+  artifact_refs: ArtifactIndexEntry[]
+  dynamic_parent_id?: string | null
+  dynamic_reason?: string | null
+  team_id?: string | null
+  team_role_id?: string | null
+  team_role_kind?: TeamRoleKind | null
+  scope?: string
+  can_ask_questions?: boolean | null
+  can_clone_workers?: boolean | null
+  can_call_planner?: boolean | null
+  peer_access?: boolean | null
+  reports_to_chat?: boolean | null
+  run_id?: string | null
+  error?: string | null
+}
+
+export type TaskBoardColumnSummary = {
+  id: TaskBoardColumn
+  title: string
+  task_ids: string[]
+}
+
+export type TaskBoardResponse = {
+  id: string
+  workspace: string
+  title: string
+  goal: string
+  status: WorkflowStatus
+  tasks: TaskBoardTask[]
+  columns: TaskBoardColumnSummary[]
+  dependencies: WorkflowEdgeInfo[]
+  artifact_index: ArtifactIndexEntry[]
+  runtime_summary: RuntimeSummary
 }
 
 export type SessionRuntimeView = {

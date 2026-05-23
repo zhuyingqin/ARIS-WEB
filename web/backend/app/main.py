@@ -42,6 +42,9 @@ from .models import (
     RunOutput,
     SessionRuntimeView,
     SkillInfo,
+    TaskBoardResponse,
+    TaskClaimRequest,
+    TaskReviewRequest,
     TeamConfig,
     TeamConfigRequest,
     UpdateGlobalSettingsRequest,
@@ -397,6 +400,112 @@ async def workflow_runtime(workflow_id: str, workspace: str = Query(...)) -> Wor
         return workflow_manager.runtime(workspace_path, workflow_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/task-boards", response_model=list[WorkflowRecord])
+async def task_boards(workspace: str | None = Query(None)) -> list[WorkflowRecord]:
+    return await workflows(workspace)
+
+
+@app.post("/api/task-boards", response_model=WorkflowRecord)
+async def create_task_board(request: CreateWorkflowRequest) -> WorkflowRecord:
+    return await create_workflow(request)
+
+
+@app.post("/api/task-boards/generate", response_model=WorkflowRecord)
+async def generate_task_board(request: GenerateWorkflowRequest) -> WorkflowRecord:
+    return await generate_workflow(request)
+
+
+@app.get("/api/task-boards/{board_id}", response_model=WorkflowRecord)
+async def get_task_board_endpoint(board_id: str, workspace: str = Query(...)) -> WorkflowRecord:
+    return await get_workflow_endpoint(board_id, workspace)
+
+
+@app.patch("/api/task-boards/{board_id}", response_model=WorkflowRecord)
+async def update_task_board_endpoint(
+    board_id: str,
+    request: UpdateWorkflowRequest,
+    workspace: str = Query(...),
+) -> WorkflowRecord:
+    return await update_workflow_endpoint(board_id, request, workspace)
+
+
+@app.delete("/api/task-boards/{board_id}")
+async def delete_task_board_endpoint(board_id: str, workspace: str = Query(...)) -> dict[str, bool]:
+    return await delete_workflow_endpoint(board_id, workspace)
+
+
+@app.post("/api/task-boards/{board_id}/refine", response_model=WorkflowRecord)
+async def refine_task_board(
+    board_id: str,
+    request: RefineWorkflowRequest,
+    workspace: str = Query(...),
+) -> WorkflowRecord:
+    return await refine_workflow(board_id, request, workspace)
+
+
+@app.get("/api/task-boards/{board_id}/runtime", response_model=WorkflowRuntimeResponse)
+async def task_board_runtime(board_id: str, workspace: str = Query(...)) -> WorkflowRuntimeResponse:
+    return await workflow_runtime(board_id, workspace)
+
+
+@app.get("/api/task-boards/{board_id}/task-board", response_model=TaskBoardResponse)
+async def task_board_view(board_id: str, workspace: str = Query(...)) -> TaskBoardResponse:
+    workspace_path = _workspace_or_404(workspace)
+    try:
+        return workflow_manager.task_board(workspace_path, board_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/task-boards/{board_id}/execute", response_model=WorkflowRecord)
+async def execute_task_board(board_id: str, workspace: str = Query(...)) -> WorkflowRecord:
+    workspace_path = _workspace_or_404(workspace)
+    try:
+        record = workflow_manager.get(workspace_path, board_id)
+        restart = bool(record and record.status in {"paused", "failed", "cancelled", "succeeded"})
+        return await workflow_manager.execute(
+            workspace_path,
+            board_id,
+            auto_approve_executable=True,
+            restart=restart,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/task-boards/{board_id}/pause", response_model=WorkflowRecord)
+async def pause_task_board(board_id: str, workspace: str = Query(...)) -> WorkflowRecord:
+    return await pause_workflow(board_id, workspace)
+
+
+@app.post("/api/task-boards/{board_id}/resume", response_model=WorkflowRecord)
+async def resume_task_board(board_id: str, workspace: str = Query(...)) -> WorkflowRecord:
+    return await resume_workflow(board_id, workspace)
+
+
+@app.post("/api/task-boards/{board_id}/cancel", response_model=WorkflowRecord)
+async def cancel_task_board(board_id: str, workspace: str = Query(...)) -> WorkflowRecord:
+    return await cancel_workflow(board_id, workspace)
+
+
+@app.post("/api/task-boards/{board_id}/tasks/{task_id}/claim", response_model=WorkflowRecord)
+async def claim_task(board_id: str, task_id: str, request: TaskClaimRequest, workspace: str = Query(...)) -> WorkflowRecord:
+    workspace_path = _workspace_or_404(workspace)
+    try:
+        return await workflow_manager.claim_task(workspace_path, board_id, task_id, request)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/task-boards/{board_id}/tasks/{task_id}/review", response_model=WorkflowRecord)
+async def review_task(board_id: str, task_id: str, request: TaskReviewRequest, workspace: str = Query(...)) -> WorkflowRecord:
+    workspace_path = _workspace_or_404(workspace)
+    try:
+        return await workflow_manager.review_task(workspace_path, board_id, task_id, request)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/workflows/{workflow_id}/decisions", response_model=list[PlannerDecisionRecord])

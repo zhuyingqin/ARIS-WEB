@@ -9,6 +9,24 @@ allowed-tools: Bash(*), Read, Write
 
 Search query: $ARGUMENTS
 
+## ARIS Web Runner Usage
+
+For reproducible OpenAlex exports, prefer `/openalex-search`. It is bundled
+with `scripts/openalex_works_export.py` and writes complete CSV/JSONL metadata.
+
+When Bash/shell execution is disabled in the ARIS Web runner, use `WebFetch`
+directly against the OpenAlex Works API instead of trying to run
+`openalex_fetch.py`:
+
+```text
+https://api.openalex.org/works?search=<encoded query>&per-page=10&sort=relevance_score:desc
+https://api.openalex.org/works?filter=title_and_abstract.search:<encoded topic>,from_publication_date:2022-01-01,type:article&per-page=10
+```
+
+Save the extracted title, abstract, DOI, authors, venue, publication year,
+citation count, OpenAlex ID, topics, and raw URL provenance into the declared
+node artifact under `ARIS_SUBAGENT_DIR`.
+
 ## Role & Positioning
 
 This skill uses OpenAlex as a **comprehensive open academic graph** source:

@@ -133,6 +133,7 @@ def build_aris_command(
     prompt: str,
     model: str | None = None,
     session_path: str | None = None,
+    allowed_tools: list[str] | None = None,
 ) -> list[str]:
     aris_bin = resolve_aris_binary()
     if aris_bin:
@@ -153,7 +154,7 @@ def build_aris_command(
     command.extend([
         "--permission-mode=workspace-write",
         "--allowedTools",
-        ",".join(SAFE_WORKSPACE_TOOLS),
+        ",".join(allowed_tools or SAFE_WORKSPACE_TOOLS),
         "--output-format=json",
     ])
     if model:
@@ -212,7 +213,7 @@ class RunManager:
         prompt = build_aris_prompt(skill, request)
         effective_model = request.model or effective_model_override()
         model_label = effective_model or "runtime default"
-        command = build_aris_command(workspace, prompt, effective_model, request.session_path)
+        command = build_aris_command(workspace, prompt, effective_model, request.session_path, request.allowed_tools)
         now = utc_now()
         record = RunRecord(
             id=run_id,
@@ -299,6 +300,8 @@ class RunManager:
         env["ARIS_META_LOGGING"] = "content"
         env["ARIS_SESSION_ID"] = run_id
         env["ARIS_META_LOG_PATH"] = str(runtime_events_path)
+        executor_provider = env.get("EXECUTOR_PROVIDER") or "anthropic"
+        executor_base_url = env.get("EXECUTOR_BASE_URL") or env.get("ANTHROPIC_BASE_URL") or env.get("DEEPSEEK_BASE_URL")
         if Path(command[0]).name.lower() in {"aris", "aris.exe"} and not _command_available(command[0], env):
             message = "Neither aris nor cargo was found; install ARIS-Code or Rust/Cargo first"
             update_run(workspace, run_id, status="failed", finished_at=utc_now(), error=message)
@@ -322,7 +325,13 @@ class RunManager:
                 timestamp=utc_now(),
                 stream="system",
                 message=f"Run started (model: {run_model})",
-                payload={"model": run_model, "skill": run_skill, "effort": run_effort},
+                payload={
+                    "model": run_model,
+                    "skill": run_skill,
+                    "effort": run_effort,
+                    "executor_provider": executor_provider,
+                    "executor_base_url": executor_base_url,
+                },
             ),
         )
         runtime_tail_task = asyncio.create_task(
@@ -443,6 +452,8 @@ class RunManager:
                     continue
             elif name == "stderr":
                 text = clean_terminal_text(text)
+                if is_provider_selection_diagnostic(text):
+                    continue
                 message = text
                 if is_nonfatal_diagnostic(text):
                     event_stream = "system"
@@ -649,6 +660,18 @@ def is_nonfatal_diagnostic(text: str) -> bool:
             "rate limit",
             "premature eof",
             "continuing without",
+        )
+    )
+
+
+def is_provider_selection_diagnostic(text: str) -> bool:
+    normalized = clean_terminal_text(text).lower()
+    return any(
+        token in normalized
+        for token in (
+            "deepseek not selected:",
+            "deepseek config not found",
+            "using anthropic executor",
         )
     )
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "OpenAlex Search"
+  short_description: "Export OpenAlex titles and abstracts."
+  default_prompt: "Use OpenAlex Search to design reproducible OpenAlex works queries and download titles, abstracts, and metadata for every query expression."
