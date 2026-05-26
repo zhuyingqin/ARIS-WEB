@@ -49,6 +49,100 @@ def workflow_artifact_index_path(workspace: Path, workflow_id: str) -> Path:
     return workflow_runtime_dir(workspace, workflow_id) / "artifact_index.json"
 
 
+def research_state_path(workspace: Path, workflow_id: str) -> Path:
+    return workflow_path(workspace, workflow_id) / "RESEARCH_STATE.md"
+
+
+def research_state_template(title: str = "", goal: str = "") -> str:
+    title = title.strip() or "Untitled workflow"
+    goal = goal.strip() or "(none)"
+    return "\n".join(
+        [
+            "# Research State",
+            "",
+            f"Workflow: {title}",
+            f"Goal: {goal}",
+            "",
+            "## Target Spec",
+            f"- Goal: {goal}",
+            "- Venue: (not set)",
+            "- Non-goals: (none recorded yet)",
+            "- Must-not-claim-yet: (none recorded yet)",
+            "",
+            "## Team Roles",
+            "- Planner: decides the next owner from team updates and research state.",
+            "- Literature Scout: searches queued evidence questions, preferably with a low-cost model.",
+            "- Reviewer: checks target fit, claim discipline, and whether the team is drifting.",
+            "- Writer: continuously revises the paper from accepted evidence and exposes missing support.",
+            "",
+            "## Current Direction",
+            f"- Initial goal: {goal}",
+            "",
+            "## Search Queue",
+            "- (none recorded yet)",
+            "",
+            "## Writing Queue",
+            "- (none recorded yet)",
+            "",
+            "## Review Queue",
+            "- (none recorded yet)",
+            "",
+            "## Problem Board",
+            "- (none recorded yet)",
+            "",
+            "## Accepted Claims",
+            "- (none recorded yet)",
+            "",
+            "## Open Gaps",
+            "- (none recorded yet)",
+            "",
+            "## Important Papers",
+            "- (none recorded yet)",
+            "",
+            "## Failed / Abandoned Routes",
+            "- (none recorded yet)",
+            "",
+            "## Next Recommended Actions",
+            "- (none recorded yet)",
+            "",
+            "## Draft Evolution Notes",
+            "- (none recorded yet)",
+            "",
+            "## Team Handoff Log",
+            "- (none recorded yet)",
+            "",
+            "## Recent Progress Log",
+            "- (none recorded yet)",
+            "",
+        ]
+    )
+
+
+def ensure_research_state(workspace: Path, workflow_id: str, *, title: str = "", goal: str = "") -> Path:
+    path = research_state_path(workspace, workflow_id)
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(research_state_template(title, goal), encoding="utf-8")
+    return path
+
+
+def read_research_state(workspace: Path, workflow_id: str) -> str:
+    path = research_state_path(workspace, workflow_id)
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def compact_research_state_pack(workspace: Path, workflow_id: str, *, limit: int = 8000) -> str:
+    text = read_research_state(workspace, workflow_id).strip()
+    if not text:
+        return "(research state not initialized)"
+    return text[-limit:] if len(text) > limit else text
+
+
 def ensure_workflow_state(workspace: Path) -> None:
     workflows_dir(workspace).mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(workflow_db_path(workspace)) as conn:

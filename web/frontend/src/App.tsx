@@ -65,6 +65,7 @@ import type {
   SkillInfo,
   TaskBoardResponse,
   TaskBoardTask,
+  TeamMessage,
   TeamRoleKind,
   WorkflowEvent,
   WorkflowGate,
@@ -91,14 +92,16 @@ const workflowTemplateOptions = [
   { value: "paper_introduction", label: "Paper introduction" },
 ] as const
 
-type WorkflowEventFilter = "all" | "aris" | "workflow" | "node" | "planner" | "runtime" | "errors"
+type WorkflowEventFilter = "all" | "aris" | "workflow" | "node" | "planner" | "team" | "problems" | "runtime" | "errors"
 
 const workflowEventFilterOptions: { value: WorkflowEventFilter; label: string }[] = [
   { value: "all", label: "All" },
   { value: "aris", label: "ARIS" },
-  { value: "workflow", label: "Runtime" },
+  { value: "workflow", label: "Workflow" },
   { value: "node", label: "Tasks" },
   { value: "planner", label: "Planner" },
+  { value: "team", label: "Team" },
+  { value: "problems", label: "Problems" },
   { value: "runtime", label: "Runtime" },
   { value: "errors", label: "Errors" },
 ]
@@ -541,8 +544,109 @@ function workflowEventPayloadText(event: WorkflowEvent) {
   }
 }
 
+function workflowEventSearchText(event: WorkflowEvent) {
+  const payload = workflowEventPayloadText(event)
+  return `${event.message} ${event.node_id ?? ""} ${event.run_id ?? ""} ${payload}`.trim()
+}
+
 function isArisOutputEvent(event: WorkflowEvent) {
   return ["aris", "thinking", "tool", "result", "stdout", "stderr"].includes(event.event_type)
+}
+
+function isTeamWorkflowEvent(event: WorkflowEvent) {
+  return ["planner", "delta", "session", "team_message", "artifact", "approval"].includes(event.event_type)
+}
+
+const PROBLEM_ID_PATTERN = /pb-[a-z0-9]{8,}/i
+const PROBLEM_ID_GLOBAL_PATTERN = /pb-[a-z0-9]{8,}/gi
+
+function problemIdFromText(value?: string | null) {
+  if (!value) return ""
+  return value.match(PROBLEM_ID_PATTERN)?.[0] ?? ""
+}
+
+function workflowEventProblemId(event: WorkflowEvent) {
+  return problemIdFromText(workflowEventSearchText(event))
+}
+
+function eventPolicyAllowed(event: WorkflowEvent): boolean | null {
+  const policy = event.payload?.["policy_result"]
+  if (!policy || typeof policy !== "object" || !("allowed" in policy)) return null
+  const allowed = (policy as { allowed?: unknown }).allowed
+  return typeof allowed === "boolean" ? allowed : null
+}
+
+function isPlannerRejectionEvent(event: WorkflowEvent) {
+  return (
+    event.message.includes("PlannerDeltaRejected")
+    || event.message.includes("dynamic node cap reached")
+    || eventPolicyAllowed(event) === false
+  )
+}
+
+function isLowValuePlannerEvent(event: WorkflowEvent) {
+  const normalized = event.message.toLowerCase()
+  return (
+    isPlannerRejectionEvent(event)
+    || normalized.includes("planner checked dynamic dag: no applicable changes")
+    || normalized.includes("plannerdeltanoop")
+  )
+}
+
+function isResolvedOrNonBlockingText(value: string) {
+  const normalized = value.toLowerCase()
+  return (
+    normalized.includes("resolved_by=")
+    || normalized.includes("[resolved]")
+    || /\bpass\b/.test(normalized)
+    || normalized.includes("blockers: none")
+    || normalized.includes("blocking issues: none")
+    || normalized.includes("no blocker")
+    || normalized.includes("no blocking")
+    || normalized.includes("non-blocking")
+    || normalized.includes("非阻塞")
+    || normalized.includes("阻塞项：无")
+    || normalized.includes("阻塞项: 无")
+    || normalized.includes("无阻塞")
+  )
+}
+
+function isMachineDiagnosticText(value: string) {
+  const normalized = value.toLowerCase()
+  return (
+    normalized.includes("tool call")
+    || normalized.includes("read_file call")
+    || normalized.includes("read_file result")
+    || normalized.includes("grep_search call")
+    || normalized.includes("grep_search result")
+    || normalized.includes("glob_search result")
+    || normalized.includes("todowrite result")
+    || normalized.includes("assistant stream produced no content")
+    || normalized.includes("sessionturncompleted")
+    || normalized.includes("research state updated")
+    || normalized.includes("run `aris")
+    || normalized.includes("aris --help")
+    || normalized.includes("llm call ")
+    || normalized.includes("anthropic api returned")
+    || normalized.includes("context window exceeds limit")
+    || normalized.includes("run failed with exit code")
+    || normalized.includes("run still active")
+    || normalized.includes("run queued")
+    || normalized.includes("run started")
+    || normalized.includes("node queued for rerun")
+    || normalized.includes("node started:")
+    || normalized.includes("node completed and auto")
+    || normalized.includes("node attached to run")
+    || normalized.includes("node failed:")
+    || normalized.includes("finished with status skipped")
+    || normalized.includes("obsolete failed duplicate")
+    || normalized.includes("invalid_request_error")
+  )
+}
+
+function isProblemWorkflowEvent(event: WorkflowEvent) {
+  const text = workflowEventSearchText(event).toLowerCase()
+  return Boolean(problemIdFromText(text)) || text.includes("problem board") || text.includes("问题板")
 }
 
 function isProviderDiagnosticNoise(message: string) {
@@ -551,6 +655,7 @@ function isProviderDiagnosticNoise(message: string) {
     normalized.includes("deepseek not selected:")
     || normalized.includes("deepseek config not found")
     || normalized.includes("using anthropic executor")
+    || isMachineDiagnosticText(message)
   )
 }
 
@@ -566,6 +671,8 @@ function workflowEventMatchesFilter(event: WorkflowEvent, filter: WorkflowEventF
   if (filter === "workflow") return event.event_type === "workflow"
   if (filter === "node") return event.event_type === "node" || event.event_type === "run"
   if (filter === "planner") return event.event_type === "planner"
+  if (filter === "team") return isTeamWorkflowEvent(event)
+  if (filter === "problems") return isProblemWorkflowEvent(event)
   if (filter === "runtime") return ["delta", "session", "team_message", "artifact", "approval"].includes(event.event_type)
   if (filter === "errors") return isWorkflowErrorEvent(event)
   return true
@@ -694,7 +801,7 @@ const LITERATURE_ROLE = "literature scout"
 const REVIEWER_ROLE = "reviewer"
 const LITERATURE_SKILLS = new Set(["research-lit", "openalex-search"])
 
-type CanvasMode = "role" | "task"
+type CanvasMode = "office" | "role" | "task"
 
 type FanoutStackGroup = {
   key: string
@@ -719,6 +826,60 @@ type RoleSummary = {
 
 type RoleKind = TeamRoleKind
 
+type ProblemLaneStatus = "active" | "review" | "closed"
+
+type ProblemLaneTask = {
+  id: string
+  name: string
+  role: string
+  roleKind: TeamRoleKind
+  status: string
+}
+
+type ProblemLane = {
+  id: string
+  title: string
+  latestReason: string
+  status: ProblemLaneStatus
+  tasks: ProblemLaneTask[]
+  primaryTaskId: string
+  latestTime: number
+}
+
+type CollaborationEventSummary = {
+  actor: string
+  title: string
+  detail: string
+  problemId: string
+  nodeId: string
+  tone: "planner" | "problem" | "worker" | "reviewer" | "runtime"
+}
+
+type CollaborationSignal = {
+  key: string
+  timestamp: string
+  summary: CollaborationEventSummary
+}
+
+type OfficeDeskStatus = "running" | "review" | "blocked" | "done" | "idle"
+
+type OfficeRoleDesk = {
+  role: string
+  kind: TeamRoleKind
+  status: OfficeDeskStatus
+  statusLabel: string
+  taskName: string
+  taskStatus: string
+  total: number
+  active: number
+  review: number
+  done: number
+  left: string
+  top: string
+  selected: boolean
+  taskId: string
+}
+
 const roleKindOptions: { value: TeamRoleKind; label: string }[] = [
   { value: "planner", label: "Planner" },
   { value: "reviewer", label: "Reviewer" },
@@ -732,7 +893,7 @@ const roleKindOptions: { value: TeamRoleKind; label: string }[] = [
 function defaultScopeForRoleKind(kind: TeamRoleKind) {
   if (kind === "planner") return "解释问题、拆任务、读员工的人话进展，并决定下一步交给谁。员工不能反向调用规划员。"
   if (kind === "reviewer") return "只提出质量问题、证据缺口和返工建议；由规划员决定继续指派给哪个员工。"
-  if (kind === "literature") return "按请求检索/整理文献证据，写回可引用 artifact；不主动提问，不把全文一次性交给规划员。"
+  if (kind === "literature") return "按固定 OpenAlex 流程检索文献，维护高相关 CSV 表格，并写回可引用证据 artifact。"
   if (kind === "citation") return "把已确认文献插入草稿并修正引用格式；只执行任务，可复制帮手处理批量引用。"
   if (kind === "writer") return "根据已有材料写作和改写论文片段；只执行任务，用人话报告结果、风险和 artifact 链接。"
   if (kind === "gate") return "人工确认点，只做通过/暂停/返工判断。"
@@ -777,6 +938,18 @@ function inferRoleKindForNode(node: WorkflowNodeInfo): TeamRoleKind {
   if (/review|reviewer|critic|审查|审阅/.test(text)) return "reviewer"
   if (isCitationRoleText(text)) return "citation"
   if (isLiteratureRoleText(text) || isLiteratureSkill(node.skill)) return "literature"
+  if (/write|writer|draft|author|paper-write|写作|撰写|改写/.test(text)) return "writer"
+  return "worker"
+}
+
+function inferRoleKindForTask(task: TaskBoardTask): TeamRoleKind {
+  if (task.team_role_kind) return task.team_role_kind
+  const text = `${task.team_role_id ?? ""} ${task.assignee_role ?? ""} ${task.role} ${task.name} ${task.skill ?? ""} ${task.task_type}`.toLowerCase()
+  if (/gate|approval|checkpoint|人工|审批/.test(text)) return "gate"
+  if (/planner|manager|coordinator|plan|outline|规划|计划/.test(text)) return "planner"
+  if (/review|reviewer|critic|审查|审阅/.test(text)) return "reviewer"
+  if (isCitationRoleText(text)) return "citation"
+  if (isLiteratureRoleText(text) || isLiteratureSkill(task.skill)) return "literature"
   if (/write|writer|draft|author|paper-write|写作|撰写|改写/.test(text)) return "writer"
   return "worker"
 }
@@ -1070,6 +1243,352 @@ function jsonPreview(value: unknown, max = 420) {
     text = String(value)
   }
   return truncate(text, max)
+}
+
+function problemIdFromResearchRequest(request?: Record<string, unknown> | null) {
+  const direct = request?.["problem_id"]
+  return typeof direct === "string" ? problemIdFromText(direct) : ""
+}
+
+function problemIdForNode(node: WorkflowNodeInfo, task?: TaskBoardTask) {
+  return (
+    problemIdFromText(node.dynamic_parent_id)
+    || problemIdFromText(task?.dynamic_parent_id)
+    || problemIdFromResearchRequest(node.research_request)
+    || problemIdFromText(node.dynamic_reason)
+    || problemIdFromText(task?.dynamic_reason)
+    || problemIdFromText(node.objective)
+    || problemIdFromText(task?.objective)
+    || problemIdFromText(node.prompt)
+    || problemIdFromText(task?.prompt)
+    || problemIdFromText(node.review_notes)
+    || problemIdFromText(task?.review_notes)
+  )
+}
+
+function problemIdForTask(task: TaskBoardTask) {
+  return (
+    problemIdFromText(task.dynamic_parent_id)
+    || problemIdFromText(task.dynamic_reason)
+    || problemIdFromText(task.objective)
+    || problemIdFromText(task.prompt)
+    || problemIdFromText(task.review_notes)
+  )
+}
+
+function cleanProblemTitle(value: string, problemId: string) {
+  const escapedProblemId = problemId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  const cleaned = value
+    .replace(new RegExp(escapedProblemId, "ig"), "")
+    .replace(/PlannerDeltaRejected/ig, "")
+    .replace(/PlannerDecisionRecorded/ig, "")
+    .replace(/Planner checked dynamic DAG: no applicable changes/ig, "")
+    .replace(/task board dynamic node cap reached/ig, "")
+    .replace(/Node failed:/ig, "")
+    .replace(/planner triaged problem board issue/ig, "")
+    .replace(/problem board/ig, "")
+    .replace(/问题板/g, "")
+    .replace(/\s*[:：-]\s*/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+  return cleaned ? truncate(cleaned, 132) : "Awaiting planner triage"
+}
+
+function humanSignalDetail(value: string, limit = 180) {
+  const cleaned = value
+    .replace(PROBLEM_ID_GLOBAL_PATTERN, "the issue")
+    .replace(/\bPB-(\d+)\b/gi, "review item $1")
+    .replace(/`?\.aris\/web\/workflows\/[^`\s]+`?/g, "the referenced artifact")
+    .replace(/\bissue-[a-z0-9-]+/gi, "the issue")
+    .replace(/\s+/g, " ")
+    .trim()
+  return truncate(cleaned, limit)
+}
+
+function humanProblemTitle(value: string, problemId: string) {
+  const cleaned = cleanProblemTitle(value, problemId)
+  const normalized = cleaned.toLowerCase()
+  if (normalized.includes("placeholder") || normalized.includes("占位符")) {
+    return "Replace unresolved draft placeholders"
+  }
+  if (normalized.includes("aris evaluation") || normalized.includes("ablation") || normalized.includes("citation accuracy")) {
+    return "Remove unsupported ARIS evaluation claims"
+  }
+  if (normalized.includes("blocking") || normalized.includes("rework") || normalized.includes("reviewer feedback")) {
+    return "Resolve reviewer blocking comments"
+  }
+  if (normalized.includes("revise") || normalized.includes("修订") || normalized.includes("修改")) {
+    return "Revise introduction after review"
+  }
+  if (normalized.includes("citation") || normalized.includes("引用")) {
+    return "Verify citation evidence and format"
+  }
+  if (normalized.includes("literature") || normalized.includes("文献")) {
+    return "Gather literature evidence"
+  }
+  if (normalized.includes("approval")) {
+    return "Waiting for human approval"
+  }
+  if (normalized.includes("planner") && normalized.includes("route")) {
+    return "Waiting for planner route"
+  }
+  return cleaned
+}
+
+function laneStatusFromTasks(tasks: ProblemLaneTask[]): ProblemLaneStatus {
+  if (!tasks.length) return "active"
+  const reviewerTasks = tasks.filter((task) => task.roleKind === "reviewer")
+  const reviewerOpen = reviewerTasks.some((task) => !["succeeded", "skipped", "cancelled"].includes(task.status))
+  if (reviewerOpen) return "review"
+  const workerOpen = tasks.some((task) => ["queued", "running", "blocked", "waiting_dynamic_dependency", "waiting_approval"].includes(task.status))
+  if (workerOpen) return "active"
+  if (reviewerTasks.some((task) => task.status === "succeeded")) return "closed"
+  return tasks.every((task) => ["succeeded", "skipped", "cancelled"].includes(task.status)) ? "closed" : "active"
+}
+
+function problemLaneStatusLabel(status: ProblemLaneStatus) {
+  if (status === "review") return "reviewing"
+  if (status === "closed") return "closed"
+  return "needs work"
+}
+
+function roleKindLabel(kind: TeamRoleKind) {
+  if (kind === "planner") return "Planner"
+  if (kind === "literature") return "Literature"
+  if (kind === "writer") return "Writer"
+  if (kind === "reviewer") return "Reviewer"
+  if (kind === "citation") return "Citation"
+  if (kind === "gate") return "Approval"
+  return "Worker"
+}
+
+function taskStatusLabel(status: string) {
+  if (status === "running") return "working"
+  if (status === "queued" || status === "ready") return "queued"
+  if (status === "waiting_approval") return "needs approval"
+  if (status === "waiting_dynamic_dependency") return "waiting"
+  if (status === "succeeded") return "done"
+  if (status === "skipped") return "superseded"
+  if (status === "failed") return "failed"
+  return status.replace(/_/g, " ")
+}
+
+function problemLaneOwner(lane: ProblemLane) {
+  const openTask = lane.tasks.find((task) => !["succeeded", "skipped", "cancelled"].includes(task.status))
+  if (openTask) return `${roleKindLabel(openTask.roleKind)} ${taskStatusLabel(openTask.status)}`
+  if (lane.tasks.some((task) => task.roleKind === "reviewer" && task.status === "succeeded")) return "Reviewer passed"
+  if (lane.tasks.length) return "Resolved by team"
+  return "Waiting for planner"
+}
+
+function problemLaneRoute(lane: ProblemLane) {
+  const roles = Array.from(new Set(lane.tasks.map((task) => roleKindLabel(task.roleKind)))).slice(0, 4)
+  return roles.length ? roles.join(" → ") : "No route yet"
+}
+
+function problemTaskChipLabel(task: ProblemLaneTask) {
+  return roleKindLabel(task.roleKind)
+}
+
+function humanizePlannerAction(nextAction: string | undefined, activeProblemCount: number, waitingApprovalCount = 0) {
+  const text = nextAction || ""
+  const normalized = text.toLowerCase()
+  if (waitingApprovalCount > 0 && activeProblemCount === 0) return "Final introduction is waiting for approval"
+  if (normalized.includes("human approval")) return "Human approval is needed before the team continues"
+  if (normalized.includes("queued node")) return "Team tasks are ready to run"
+  if (normalized.includes("problem board")) return "Planner is routing open Problem Board items"
+  return text || "No planner action yet"
+}
+
+function humanizePlannerRationale(value: string | undefined) {
+  const text = value || ""
+  const normalized = text.toLowerCase()
+  if (!text) return "No planner decision has been recorded yet."
+  if (normalized.includes("plannerdecisionrecorded")) return "Planner recorded a routing decision."
+  if (normalized.includes("queued team work")) return "The planner found queued team work and routed follow-up tasks to the right role."
+  if (normalized.includes("problem board")) return "The planner is turning Problem Board items into focused role tasks."
+  if (normalized.includes("dynamic node cap")) return "The planner reached the follow-up task limit; resolved or duplicate items are hidden from the open board."
+  return truncate(text, 220)
+}
+
+function officeDeskStatus(role: RoleSummary): OfficeDeskStatus {
+  if (role.running > 0) return "running"
+  if (role.blocked > 0) return "blocked"
+  if (role.review > 0) return "review"
+  if (role.done > 0 && role.total > 0) return "done"
+  return "idle"
+}
+
+function officeDeskStatusLabel(status: OfficeDeskStatus) {
+  if (status === "running") return "working"
+  if (status === "blocked") return "blocked"
+  if (status === "review") return "reviewing"
+  if (status === "done") return "done"
+  return "standby"
+}
+
+function officeSlotForKind(kind: TeamRoleKind, index: number) {
+  const slots: Record<TeamRoleKind, { left: string; top: string }> = {
+    planner: { left: "50%", top: "24%" },
+    literature: { left: "24%", top: "48%" },
+    writer: { left: "75%", top: "48%" },
+    reviewer: { left: "50%", top: "70%" },
+    citation: { left: "25%", top: "72%" },
+    worker: { left: "74%", top: "72%" },
+    gate: { left: "50%", top: "86%" },
+  }
+  const slot = slots[kind] ?? slots.worker
+  if (index === 0) return slot
+  const offsetX = index % 2 === 0 ? -10 : 10
+  const offsetY = 8 + Math.floor(index / 2) * 8
+  return {
+    left: `calc(${slot.left} + ${offsetX}%)`,
+    top: `calc(${slot.top} + ${offsetY}%)`,
+  }
+}
+
+function activeTaskForRole(role: RoleSummary, taskById: Map<string, TaskBoardTask>) {
+  const rank = (task: WorkflowNodeInfo) => {
+    const status = taskById.get(task.id)?.status ?? task.status
+    if (status === "running") return 0
+    if (status === "queued") return 1
+    if (status === "waiting_dynamic_dependency" || status === "blocked") return 2
+    if (status === "waiting_approval") return 3
+    if (status === "succeeded") return 5
+    return 4
+  }
+  return [...role.tasks].sort((a, b) => rank(a) - rank(b))[0]
+}
+
+function isCollaborationSignalEvent(event: WorkflowEvent) {
+  if (isProviderDiagnosticNoise(event.message)) return false
+  if (isMachineDiagnosticText(workflowEventSearchText(event))) return false
+  if (isLowValuePlannerEvent(event)) return false
+  if (isProblemWorkflowEvent(event)) {
+    return false
+  }
+  if (isTeamWorkflowEvent(event)) return true
+  if (event.event_type === "workflow") return /\b(started|succeeded|failed|cancelled|paused|updated)\b/i.test(event.message)
+  if (event.event_type === "node") return /\b(started|succeeded|failed|completed|waiting|blocked)\b/i.test(event.message)
+  return false
+}
+
+function collaborationEventSummary(event: WorkflowEvent): CollaborationEventSummary {
+  const payload = event.payload ?? {}
+  const problemId = workflowEventProblemId(event)
+  const nodeId = event.node_id ?? (typeof payload["node_id"] === "string" ? payload["node_id"] : "")
+  if (event.event_type === "planner" || event.event_type === "delta") {
+    const action = typeof payload["action"] === "string" ? payload["action"].replace("_", " ") : "route"
+    const humanTitle = problemId ? humanProblemTitle(event.message, problemId) : ""
+    return {
+      actor: "Planner",
+      title: humanTitle ? `Routed: ${humanTitle}` : action === "route" ? "Planner routed follow-up work" : `Planner ${action}`,
+      detail: humanSignalDetail(humanizePlannerRationale(String(payload["reason"] ?? event.message))),
+      problemId,
+      nodeId,
+      tone: "planner",
+    }
+  }
+  if (event.event_type === "team_message") {
+    const role = typeof payload["role"] === "string" ? payload["role"] : "Role agent"
+    const roleKind = typeof payload["role_kind"] === "string" ? payload["role_kind"] : ""
+    const roleLabel = roleKind ? roleKindLabel(roleKind as TeamRoleKind) : role
+    const lowered = event.message.toLowerCase()
+    const title =
+      roleKind === "reviewer" && /\bpass\b/i.test(event.message)
+        ? "Review passed"
+        : roleKind === "reviewer" && (lowered.includes("rework") || lowered.includes("not pass"))
+          ? "Review requested rework"
+          : roleKind === "writer"
+            ? "Draft revised"
+            : roleKind === "literature"
+              ? "Evidence delivered"
+              : roleKind
+                ? `${roleLabel} update`
+                : "Team update"
+    return {
+      actor: roleLabel,
+      title,
+      detail: humanSignalDetail(event.message),
+      problemId,
+      nodeId,
+      tone: roleKind === "reviewer" ? "reviewer" : "worker",
+    }
+  }
+  if (isProblemWorkflowEvent(event)) {
+    const title = problemId ? humanProblemTitle(event.message, problemId) : "Problem Board updated"
+    return {
+      actor: "Problem Board",
+      title,
+      detail: humanSignalDetail(event.message),
+      problemId,
+      nodeId,
+      tone: "problem",
+    }
+  }
+  if (event.event_type === "node" || event.event_type === "run") {
+    const lowered = event.message.toLowerCase()
+    const title =
+      lowered.includes("waiting") && lowered.includes("approval")
+        ? "Waiting for approval"
+        : lowered.includes("completed") || lowered.includes("succeeded")
+          ? "Task completed"
+          : lowered.includes("failed")
+            ? "Task failed"
+            : event.message
+    return {
+      actor: nodeId || "Task",
+      title,
+      detail: nodeId ? `Task ${nodeId}` : humanSignalDetail(event.message, 120),
+      problemId,
+      nodeId,
+      tone: "worker",
+    }
+  }
+  return {
+    actor: event.event_type === "workflow" ? "Runtime" : event.event_type,
+    title: event.message,
+    detail: humanSignalDetail(jsonPreview(payload, 180) || event.message),
+    problemId,
+    nodeId,
+    tone: "runtime",
+  }
+}
+
+function collaborationTeamMessageSummary(message: TeamMessage): CollaborationEventSummary {
+  const roleLabel = roleKindLabel(message.role_kind)
+  const lowered = message.message.toLowerCase()
+  const title =
+    message.role_kind === "reviewer" && /\bpass\b/i.test(message.message)
+      ? "Review passed"
+      : message.role_kind === "reviewer" && (lowered.includes("blocking") || lowered.includes("rework") || lowered.includes("not pass"))
+        ? "Review requested rework"
+        : message.role_kind === "writer"
+          ? "Draft revised"
+          : message.role_kind === "literature"
+            ? "Evidence delivered"
+            : message.role_kind === "planner"
+              ? "Planner update"
+              : `${roleLabel} update`
+  return {
+    actor: roleLabel,
+    title,
+    detail: humanSignalDetail(message.message),
+    problemId: problemIdFromText(message.message),
+    nodeId: message.node_id ?? "",
+    tone: message.role_kind === "reviewer" ? "reviewer" : message.role_kind === "planner" ? "planner" : "worker",
+  }
+}
+
+function collaborationDisplayDetail(summary: CollaborationEventSummary) {
+  if (summary.title === "Review passed") return "Reviewer cleared the routed issue."
+  if (summary.title === "Review requested rework") return "Reviewer found a blocking evidence gap."
+  if (summary.title === "Draft revised") return "Writer produced an updated introduction artifact."
+  if (summary.title === "Evidence delivered") return "Literature Scout handed off verified evidence."
+  if (summary.title.includes("Human checkpoint")) return "Waiting for human approval."
+  if (summary.title === "Workflow updated") return "Workflow state changed."
+  if (summary.tone === "planner") return "Planner updated the team route."
+  return summary.detail
 }
 
 function handoffKey(source: string, target: string) {
@@ -1434,8 +1953,9 @@ function TaskBoardsPage({ workspace }: { workspace: string }) {
   const [flowPanelCollapsed, setFlowPanelCollapsed] = useState(false)
   const [generatorCollapsed, setGeneratorCollapsed] = useState(true)
   const [canvasToolsCollapsed, setCanvasToolsCollapsed] = useState(true)
-  const [canvasMode, setCanvasMode] = useState<CanvasMode>("role")
+  const [canvasMode, setCanvasMode] = useState<CanvasMode>("office")
   const [selectedRole, setSelectedRole] = useState("")
+  const [officeDetailRole, setOfficeDetailRole] = useState("")
   const [roleNodePositions, setRoleNodePositions] = useState<Record<string, { x: number; y: number }>>({})
   const [expandedFanoutGroups, setExpandedFanoutGroups] = useState<Set<string>>(() => new Set())
   const [fanoutStackPositions, setFanoutStackPositions] = useState<Record<string, { x: number; y: number }>>({})
@@ -2022,7 +2542,9 @@ function TaskBoardsPage({ workspace }: { workspace: string }) {
       workflow: events.filter((event) => event.event_type === "workflow").length,
       node: events.filter((event) => event.event_type === "node" || event.event_type === "run").length,
       planner: events.filter((event) => event.event_type === "planner").length,
-      runtime: events.filter((event) => ["delta", "session", "approval"].includes(event.event_type)).length,
+      team: events.filter(isTeamWorkflowEvent).length,
+      problems: events.filter(isProblemWorkflowEvent).length,
+      runtime: events.filter((event) => ["delta", "session", "team_message", "artifact", "approval"].includes(event.event_type)).length,
       errors: events.filter(isWorkflowErrorEvent).length,
     }),
     [events],
@@ -2076,6 +2598,137 @@ function TaskBoardsPage({ workspace }: { workspace: string }) {
   const boardTasks = taskBoard.data?.tasks ?? EMPTY_TASK_BOARD_TASKS
   const boardTaskById = useMemo(() => new Map(boardTasks.map((task) => [task.id, task])), [boardTasks])
   const boardColumns = taskBoard.data?.columns ?? EMPTY_TASK_BOARD_COLUMNS
+  const problemLanes = useMemo<ProblemLane[]>(() => {
+    type MutableLane = Omit<ProblemLane, "status"> & { taskIds: Set<string> }
+    const lanes = new Map<string, MutableLane>()
+
+    const ensureLane = (problemId: string, candidateTitle = "", latestReason = "", latestTime = 0) => {
+      const title = candidateTitle ? humanProblemTitle(candidateTitle, problemId) : "Waiting for planner route"
+      const lane = lanes.get(problemId) ?? {
+        id: problemId,
+        title,
+        latestReason: latestReason || candidateTitle,
+        tasks: [],
+        taskIds: new Set<string>(),
+        primaryTaskId: "",
+        latestTime: 0,
+      }
+      if (title !== "Waiting for planner route" && lane.title === "Waiting for planner route") lane.title = title
+      if (latestReason && (!lane.latestReason || latestTime >= lane.latestTime)) lane.latestReason = latestReason
+      lane.latestTime = Math.max(lane.latestTime, latestTime)
+      lanes.set(problemId, lane)
+      return lane
+    }
+
+    for (const event of events) {
+      const eventText = workflowEventSearchText(event)
+      if (isLowValuePlannerEvent(event)) continue
+      if (isMachineDiagnosticText(eventText) || isResolvedOrNonBlockingText(eventText)) continue
+      const problemId = workflowEventProblemId(event)
+      if (!problemId) continue
+      ensureLane(problemId, event.message, event.message, Number.isFinite(Date.parse(event.timestamp)) ? Date.parse(event.timestamp) : 0)
+    }
+
+    for (const node of draft?.graph_json.nodes ?? []) {
+      const task = boardTaskById.get(node.id)
+      const problemId = problemIdForNode(node, task)
+      if (!problemId) continue
+      const lane = ensureLane(
+        problemId,
+        node.dynamic_reason || task?.dynamic_reason || node.objective || task?.objective || node.name,
+        node.dynamic_reason || task?.dynamic_reason || node.objective || task?.objective || "",
+      )
+      if (lane.taskIds.has(node.id)) continue
+      const roleKind = task?.team_role_kind ?? node.team_role_kind ?? inferRoleKindForNode(node)
+      lane.taskIds.add(node.id)
+      lane.tasks.push({
+        id: node.id,
+        name: node.name,
+        role: canonicalRoleForNode(node, task),
+        roleKind,
+        status: task?.status ?? node.status,
+      })
+    }
+
+    for (const task of boardTasks) {
+      const problemId = problemIdForTask(task)
+      if (!problemId) continue
+      const lane = ensureLane(
+        problemId,
+        task.dynamic_reason || task.objective || task.name,
+        task.dynamic_reason || task.objective || "",
+      )
+      if (lane.taskIds.has(task.id)) continue
+      lane.taskIds.add(task.id)
+      lane.tasks.push({
+        id: task.id,
+        name: task.name,
+        role: task.assignee_role || task.team_role_id || task.role || "worker",
+        roleKind: inferRoleKindForTask(task),
+        status: task.status,
+      })
+    }
+
+    const statusRank: Record<ProblemLaneStatus, number> = { active: 0, review: 1, closed: 2 }
+    const taskRank = (status: string) => {
+      if (status === "running") return 0
+      if (status === "queued" || status === "ready") return 1
+      if (status === "blocked" || status === "waiting_dynamic_dependency") return 2
+      if (status === "waiting_approval") return 3
+      if (status === "failed") return 4
+      return 5
+    }
+
+    return Array.from(lanes.values())
+      .map((lane) => {
+        const tasks = [...lane.tasks].sort((a, b) => taskRank(a.status) - taskRank(b.status) || a.name.localeCompare(b.name))
+        const status = laneStatusFromTasks(tasks)
+        return {
+          id: lane.id,
+          title: lane.title,
+          latestReason: lane.latestReason,
+          status,
+          tasks,
+          primaryTaskId: tasks.find((task) => taskRank(task.status) < 5)?.id ?? tasks[0]?.id ?? "",
+          latestTime: lane.latestTime,
+        }
+      })
+      .sort((a, b) => statusRank[a.status] - statusRank[b.status] || b.latestTime - a.latestTime || a.id.localeCompare(b.id))
+  }, [boardTaskById, boardTasks, draft?.graph_json.nodes, events])
+  const activeProblemCount = problemLanes.filter((lane) => lane.status !== "closed").length
+  const openProblemLanes = useMemo(() => problemLanes.filter((lane) => lane.status !== "closed"), [problemLanes])
+  const resolvedProblemLanes = useMemo(() => problemLanes.filter((lane) => lane.status === "closed"), [problemLanes])
+  const auditableResolvedProblemLanes = useMemo(
+    () => resolvedProblemLanes.filter((lane) => !isMachineDiagnosticText(lane.title) && !isMachineDiagnosticText(lane.latestReason)),
+    [resolvedProblemLanes],
+  )
+  const collaborationSignals = useMemo<CollaborationSignal[]>(() => {
+    const signals = new Map<string, CollaborationSignal>()
+    for (const event of events.filter(isCollaborationSignalEvent).slice(-16)) {
+      const summary = collaborationEventSummary(event)
+      const key = `event:${event.timestamp}:${event.event_type}:${event.node_id ?? ""}:${event.message}`
+      signals.set(key, { key, timestamp: event.timestamp, summary })
+    }
+    for (const message of (runtime.data?.team_messages ?? []).slice(-16)) {
+      if (isMachineDiagnosticText(message.message)) continue
+      const key = `message:${message.timestamp}:${message.node_id ?? ""}:${message.role}:${message.message}`
+      if (signals.has(key)) continue
+      signals.set(key, {
+        key,
+        timestamp: message.timestamp,
+        summary: collaborationTeamMessageSummary(message),
+      })
+    }
+    return Array.from(signals.values())
+      .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
+      .slice(0, 10)
+  }, [events, runtime.data?.team_messages])
+  const plannerActionLabel = humanizePlannerAction(
+    runtimeSummary?.next_action,
+    activeProblemCount,
+    runtimeSummary?.waiting_approval_count ?? 0,
+  )
+  const plannerRationaleLabel = humanizePlannerRationale(runtime.data?.latest_decision?.rationale)
   const roleSummaries = useMemo(() => {
     const roles = new Map<string, RoleSummary>()
     for (const node of draft?.graph_json.nodes ?? []) {
@@ -2492,7 +3145,6 @@ function TaskBoardsPage({ workspace }: { workspace: string }) {
                         setSelectedNodeId(task.id)
                         setSelectedEdgeId("")
                         setSelectedRole(role.role)
-                        setCanvasMode("task")
                       }}
                       title={task.objective || task.prompt || task.name}
                       type="button"
@@ -2584,6 +3236,44 @@ function TaskBoardsPage({ workspace }: { workspace: string }) {
     () => (runtime.data?.team_messages ?? []).slice(-3).reverse(),
     [runtime.data?.team_messages],
   )
+  const officeRoleDesks = useMemo<OfficeRoleDesk[]>(() => {
+    const kindCounts = new Map<TeamRoleKind, number>()
+    return roleSummaries.map((role) => {
+      const kind = roleKindForSummary(role)
+      const index = kindCounts.get(kind) ?? 0
+      kindCounts.set(kind, index + 1)
+      const slot = officeSlotForKind(kind, index)
+      const task = activeTaskForRole(role, boardTaskById)
+      const boardTask = task ? boardTaskById.get(task.id) : undefined
+      const status = officeDeskStatus(role)
+      return {
+        role: role.role,
+        kind,
+        status,
+        statusLabel: officeDeskStatusLabel(status),
+        taskName: task?.name ?? (role.onDemand ? role.standbyLabel ?? "Waiting for routed work" : "No routed work"),
+        taskStatus: boardTask?.status ?? task?.status ?? (role.onDemand ? "standby" : "idle"),
+        total: role.total,
+        active: role.active,
+        review: role.review,
+        done: role.done,
+        left: slot.left,
+        top: slot.top,
+        selected: selectedRole === role.role,
+        taskId: task?.id ?? "",
+      }
+    })
+  }, [boardTaskById, roleSummaries, selectedRole])
+  const officeDetailDesk = officeRoleDesks.find((desk) => desk.role === officeDetailRole)
+  const officeUploadKinds = useMemo<TeamRoleKind[]>(() => {
+    const visibleKinds = new Set(officeRoleDesks.map((desk) => desk.kind))
+    return (["planner", "literature", "writer", "citation", "worker", "reviewer"] as TeamRoleKind[]).filter((kind) =>
+      visibleKinds.has(kind),
+    )
+  }, [officeRoleDesks])
+  const officeActiveDesks = officeRoleDesks.filter((desk) => desk.status === "running" || desk.status === "review" || desk.status === "blocked").length
+  const officeProblemCards = openProblemLanes.slice(0, 3)
+  const officeTimeline = collaborationSignals.slice(0, 5)
 
   const flowEdges: WorkflowCanvasEdge[] = useMemo(
     () => {
@@ -2679,12 +3369,12 @@ function TaskBoardsPage({ workspace }: { workspace: string }) {
     setRoleCanvasNodes((nodes) => applyNodeChanges(nonRemovingChanges, nodes))
   }, [])
   const onEdgesChange = useCallback((changes: EdgeChange[]) => {
-    if (canvasMode === "role") return
+    if (canvasMode !== "task") return
     const removed = changes.filter((change) => change.type === "remove").map((change) => change.id)
     if (removed.length) removeEdges(removed)
   }, [canvasMode])
   const onConnect = useCallback((connection: Connection) => {
-    if (canvasMode === "role") return
+    if (canvasMode !== "task") return
     if (!connection.source || !connection.target || connection.source === connection.target) return
     const edgeId = `${connection.source}->${connection.target}`
     updateDraft((workflow) => {
@@ -2930,6 +3620,173 @@ function TaskBoardsPage({ workspace }: { workspace: string }) {
               </div>
             </section>
 
+            <section className="collab-workbench" aria-label="Team collaboration workbench">
+              <div className="collab-workbench-head">
+                <div>
+                  <h2>Team Collaboration</h2>
+                  <p>{activeProblemCount ? "Open handoffs need routing" : "All blockers are cleared"}</p>
+                </div>
+                <div className="collab-workbench-meta">
+                  <span>{activeProblemCount} blocker(s)</span>
+                  <span>{collaborationSignals.length} update(s)</span>
+                </div>
+              </div>
+              <div className="collab-workbench-grid">
+                <div className="collab-panel problem-board-panel">
+                  <div className="collab-panel-head">
+                    <span>
+                      <ClipboardCheck size={14} />
+                      Problem Board
+                    </span>
+                    <b>{activeProblemCount ? `${activeProblemCount} open` : "clear"}</b>
+                  </div>
+                  <div className="problem-lane-list">
+                    {openProblemLanes.slice(0, 5).map((lane, index) => (
+                      <button
+                        className={`problem-lane problem-lane-${lane.status}`}
+                        disabled={!lane.primaryTaskId}
+                        key={lane.id}
+                        onClick={() => {
+                          if (!lane.primaryTaskId) return
+                          setSelectedNodeId(lane.primaryTaskId)
+                          setSelectedEdgeId("")
+                          setCanvasMode("task")
+                          const node = draft.graph_json.nodes.find((item) => item.id === lane.primaryTaskId)
+                          if (node) setSelectedRole(canonicalRoleForNode(node, boardTaskById.get(node.id)))
+                        }}
+                        title={lane.latestReason || lane.title}
+                        type="button"
+                      >
+                        <div className="problem-lane-head">
+                          <strong>{lane.status === "closed" ? "Resolved issue" : `Issue ${index + 1}`}</strong>
+                          <span className={`problem-status problem-status-${lane.status}`}>{problemLaneStatusLabel(lane.status)}</span>
+                        </div>
+                        <p>{lane.title}</p>
+                        <div className="problem-lane-meta">
+                          <span>{problemLaneOwner(lane)}</span>
+                          <span>{problemLaneRoute(lane)}</span>
+                        </div>
+                        <div className="problem-task-strip">
+                          {lane.tasks.slice(0, 4).map((task) => (
+                            <span
+                              className="problem-task-chip"
+                              key={task.id}
+                              style={{ borderColor: `${roleColor(task.role)}55` }}
+                              title={task.name}
+                            >
+                              <b>{problemTaskChipLabel(task)}</b>
+                              <em>{taskStatusLabel(task.status)}</em>
+                            </span>
+                          ))}
+                          {!lane.tasks.length && <small>Waiting for planner route</small>}
+                          {lane.tasks.length > 4 && <small>+{lane.tasks.length - 4} more</small>}
+                        </div>
+                      </button>
+                    ))}
+                    {!activeProblemCount && (
+                      <div className="problem-empty">
+                        <CheckCircle2 size={16} />
+                        <span>No open blockers. The latest resolved handoffs are kept below as audit history.</span>
+                      </div>
+                    )}
+                    {!activeProblemCount && auditableResolvedProblemLanes.length > 0 && (
+                      <div className="problem-history-list" aria-label="Recently resolved Problem Board history">
+                        <span>Recently resolved</span>
+                        {auditableResolvedProblemLanes.slice(0, 3).map((lane) => (
+                          <button
+                            className="problem-history-row"
+                            disabled={!lane.primaryTaskId}
+                            key={lane.id}
+                            onClick={() => {
+                              if (!lane.primaryTaskId) return
+                              setSelectedNodeId(lane.primaryTaskId)
+                              setSelectedEdgeId("")
+                              setCanvasMode("task")
+                              const node = draft.graph_json.nodes.find((item) => item.id === lane.primaryTaskId)
+                              if (node) setSelectedRole(canonicalRoleForNode(node, boardTaskById.get(node.id)))
+                            }}
+                            title={`${lane.title} (${lane.id})`}
+                            type="button"
+                          >
+                            <strong>{lane.title}</strong>
+                            <small>{problemLaneRoute(lane)}</small>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="collab-panel planner-focus-panel">
+                  <div className="collab-panel-head">
+                    <span>
+                      <GitBranch size={14} />
+                      Planner Focus
+                    </span>
+                    <b>{runtimeSummary?.dynamic_node_count ?? 0} routed</b>
+                  </div>
+                  <div className="planner-focus-stack">
+                    <span>Next action</span>
+                    <strong>{plannerActionLabel}</strong>
+                    <span>Latest rationale</span>
+                    <p>{plannerRationaleLabel}</p>
+                  </div>
+                  <div className="planner-focus-kpis">
+                    <span>
+                      <b>{runtimeSummary?.delta_count ?? 0}</b>
+                      changes
+                    </span>
+                    <span>
+                      <b>{runtimeSummary?.policy_rejection_count ?? 0}</b>
+                      rejected
+                    </span>
+                  </div>
+                </div>
+
+                <div className="collab-panel collab-timeline-panel">
+                  <div className="collab-panel-head">
+                    <span>
+                      <Activity size={14} />
+                      Collaboration Timeline
+                    </span>
+                    <b>{collaborationSignals.length} shown</b>
+                  </div>
+                  <div className="collab-timeline-list">
+                    {collaborationSignals.map(({ key, timestamp, summary }) => (
+                      <button
+                        className={`collab-event collab-event-${summary.tone}`}
+                        disabled={!summary.nodeId}
+                        key={key}
+                        onClick={() => {
+                          if (!summary.nodeId) return
+                          setSelectedNodeId(summary.nodeId)
+                          setSelectedEdgeId("")
+                          setCanvasMode("task")
+                          const node = draft.graph_json.nodes.find((item) => item.id === summary.nodeId)
+                          if (node) setSelectedRole(canonicalRoleForNode(node, boardTaskById.get(node.id)))
+                        }}
+                        title={summary.detail}
+                        type="button"
+                      >
+                        <span className="collab-event-time">{timestamp.slice(11, 19)}</span>
+                        <div>
+                          <strong>{summary.actor}</strong>
+                          <p>{summary.title}</p>
+                          <small>{collaborationDisplayDetail(summary)}</small>
+                        </div>
+                      </button>
+                    ))}
+                    {!collaborationSignals.length && (
+                      <div className="problem-empty">
+                        <Activity size={16} />
+                        <span>No collaboration signals yet.</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </section>
+
             <section className="role-flow-surface" aria-label="Role orchestration flow">
               <div className="task-section-head">
                 <div>
@@ -2941,6 +3798,14 @@ function TaskBoardsPage({ workspace }: { workspace: string }) {
                 </div>
                 <div className="task-board-actions">
                   <div className="canvas-mode-toggle" aria-label="Canvas mode">
+                    <button
+                      className={canvasMode === "office" ? "active" : ""}
+                      onClick={() => setCanvasMode("office")}
+                      type="button"
+                    >
+                      <Activity size={14} />
+                      Office View
+                    </button>
                     <button
                       className={canvasMode === "role" ? "active" : ""}
                       onClick={() => setCanvasMode("role")}
@@ -2973,10 +3838,10 @@ function TaskBoardsPage({ workspace }: { workspace: string }) {
                   <Button
                     variant="secondary"
                     onClick={organizeWorkflow}
-                    disabled={!draft.graph_json.nodes.length || canvasMode === "role"}
+                    disabled={!draft.graph_json.nodes.length || canvasMode !== "task"}
                     type="button"
                     aria-label="Organize task dependency flow"
-                    title={canvasMode === "role" ? "Switch to Task Dependencies to organize task nodes" : "Organize task dependency flow"}
+                    title={canvasMode === "task" ? "Organize task dependency flow" : "Switch to Task Dependencies to organize task nodes"}
                   >
                     <SlidersHorizontal size={15} />
                     Organize
@@ -2997,105 +3862,363 @@ function TaskBoardsPage({ workspace }: { workspace: string }) {
                   </Button>
                 </div>
               </div>
-              <div className="flow-shell role-flow-shell">
-                {roleRuntimeLive && (
-                  <div className="role-live-overlay" aria-live="polite">
-                    <div className="role-live-overlay-head">
-                      <span className="role-live-dot" />
-                      <strong>Live dialogue</strong>
-                      <small>{runtimeSummary?.next_action ?? "runtime active"}</small>
+              {canvasMode === "office" ? (
+                <div className={`office-shell office-shell-${executionState}`}>
+                  <div className="office-stage" aria-label="Animated team office">
+                    <div className="office-room-fixtures" aria-hidden="true">
+                      <span className="office-wall-shelf">
+                        <i />
+                        <i />
+                        <i />
+                        <i />
+                      </span>
+                      <span className="office-coffee-counter">
+                        <i />
+                        <i />
+                        <i />
+                      </span>
+                      <span className="office-wall-board">
+                        <i />
+                        <i />
+                        <i />
+                      </span>
+                      <span className="office-window">
+                        <i />
+                        <i />
+                      </span>
+                      <span className="office-plant">
+                        <i />
+                        <i />
+                        <i />
+                      </span>
+                      <span className="office-floor-rug" />
+                      <span className="office-floor-path" />
                     </div>
-                    <div className="role-live-message-strip">
-                      {latestTeamMessages.length ? (
-                        latestTeamMessages.map((message) => (
-                          <span key={`${message.node_id ?? message.role}-${message.timestamp}`}>
-                            <b>{message.role}</b>
-                            {truncate(message.message, 120)}
-                          </span>
-                        ))
-                      ) : (
-                        <span>
-                          <b>{runtimeSummary?.active_node_ids[0] ?? "team"}</b>
-                          waiting for the next human-language update
+                    <div className="office-room-title">
+                      <strong>ARIS Office</strong>
+                      <span>{officeActiveDesks} active · {activeProblemCount} open issue(s)</span>
+                    </div>
+                    <div className="office-animation-layer" aria-hidden="true">
+                      <span className="office-walk-path" />
+                      <span className="office-mobile-agent">
+                        <span className="office-mobile-shadow" />
+                        <span className="office-mobile-document" />
+                        <span className="office-person office-person-moving office-person-worker">
+                          <span className="office-person-head" />
+                          <span className="office-person-hair" />
+                          <span className="office-person-body" />
+                          <span className="office-person-arm office-person-arm-left" />
+                          <span className="office-person-arm office-person-arm-right" />
+                          <span className="office-person-leg office-person-leg-left" />
+                          <span className="office-person-leg office-person-leg-right" />
                         </span>
+                      </span>
+                      <span className="office-shared-board">
+                        <strong>Shared Workboard</strong>
+                        <small>{runtimeSummary?.artifact_count ?? 0} artifacts</small>
+                        <i />
+                        <i />
+                        <i />
+                      </span>
+                      {officeUploadKinds.map((kind) => (
+                        <span className={`office-upload-channel office-upload-channel-${kind}`} key={kind}>
+                          <span className={`office-upload-track office-upload-track-${kind}`} />
+                          <span className={`office-upload-file office-upload-file-${kind}`} />
+                        </span>
+                      ))}
+                      <span className="office-task-bubble office-task-bubble-a">
+                        <strong>{officeTimeline[0]?.summary.actor ?? "Planner"}</strong>
+                        <small>{officeTimeline[0]?.summary.title ?? runtimeSummary?.next_action ?? "planning next route"}</small>
+                      </span>
+                      <span className="office-task-bubble office-task-bubble-b">
+                        <strong>{activeProblemCount ? "Problem Board" : "Board clear"}</strong>
+                        <small>{officeProblemCards[0]?.title ?? "no open blockers"}</small>
+                      </span>
+                      <span className="office-task-bubble office-task-bubble-c">
+                        <strong>{officeTimeline[1]?.summary.actor ?? "Reviewer"}</strong>
+                        <small>{officeTimeline[1]?.summary.title ?? "checking output"}</small>
+                      </span>
+                    </div>
+                    <div className="office-problem-board">
+                      <div className="office-board-head">
+                        <span>
+                          <ClipboardCheck size={14} />
+                          Problem Board
+                        </span>
+                        <b>{activeProblemCount}</b>
+                      </div>
+                      <div className="office-problem-list">
+                        {officeProblemCards.map((lane) => (
+                          <button
+                            className={`office-problem-card office-problem-card-${lane.status}`}
+                            disabled={!lane.primaryTaskId}
+                            key={lane.id}
+                            onClick={() => {
+                              if (!lane.primaryTaskId) return
+                              setSelectedNodeId(lane.primaryTaskId)
+                              setSelectedEdgeId("")
+                              setCanvasMode("task")
+                              const node = draft.graph_json.nodes.find((item) => item.id === lane.primaryTaskId)
+                              if (node) setSelectedRole(canonicalRoleForNode(node, boardTaskById.get(node.id)))
+                            }}
+                            type="button"
+                          >
+                            <strong>{lane.title}</strong>
+                            <span>{problemLaneStatusLabel(lane.status)}</span>
+                            <small>{problemLaneRoute(lane)}</small>
+                          </button>
+                        ))}
+                        {!officeProblemCards.length && <small>No open board issues</small>}
+                      </div>
+                    </div>
+                    <div className="office-metrics">
+                      <span>Today</span>
+                      <strong>{executionStateLabel(executionState)}</strong>
+                      <div>
+                        <b>{runtimeSummary?.active_node_count ?? 0}</b>
+                        <small>running</small>
+                        <b>{runtimeSummary?.terminal_node_count ?? 0}</b>
+                        <small>done</small>
+                      </div>
+                    </div>
+                    {officeRoleDesks.map((desk) => (
+                      <button
+                        className={`office-desk office-desk-${desk.kind} office-desk-${desk.status}${desk.selected ? " office-desk-selected" : ""}`}
+                        key={desk.role}
+                        onClick={() => {
+                          setSelectedRole(desk.role)
+                          setOfficeDetailRole(desk.role)
+                          setSelectedNodeId(desk.taskId)
+                          setSelectedEdgeId("")
+                        }}
+                        style={{ left: desk.left, top: desk.top }}
+                        title={desk.taskName}
+                        type="button"
+                      >
+                        <span className="office-desk-shadow" />
+                        <span className="office-desk-surface">
+                          <span className={`office-work-activity office-work-activity-${desk.kind}`}>
+                            <span className="office-paper-stack">
+                              <span className="office-paper office-paper-a" />
+                              <span className="office-paper office-paper-b" />
+                              <span className="office-paper office-paper-c" />
+                            </span>
+                            <span className="office-keyboard">
+                              <i />
+                              <i />
+                              <i />
+                              <i />
+                            </span>
+                            <span className="office-manuscript">
+                              <i />
+                              <i />
+                              <i />
+                            </span>
+                            <span className="office-review-sheet">
+                              <i />
+                              <i />
+                              <i />
+                            </span>
+                            <span className="office-pen" />
+                            <span className="office-search-lens" />
+                            <span className="office-plan-board-mini">
+                              <i />
+                              <i />
+                              <i />
+                            </span>
+                            <span className="office-upload-spark" />
+                          </span>
+                          <span className="office-screen" />
+                          <span className="office-agent">
+                            <span className={`office-person office-person-seated office-person-${desk.kind}`}>
+                              <span className="office-person-head" />
+                              <span className="office-person-hair" />
+                              <span className="office-person-body" />
+                              <span className="office-person-arm office-person-arm-left" />
+                              <span className="office-person-arm office-person-arm-right" />
+                              <span className="office-person-leg office-person-leg-left" />
+                              <span className="office-person-leg office-person-leg-right" />
+                              <span className={`office-person-prop office-person-prop-${desk.kind === "reviewer" ? "check" : desk.kind === "literature" ? "search" : desk.kind === "planner" ? "board" : "doc"}`} />
+                            </span>
+                          </span>
+                        </span>
+                        <span className="office-desk-card">
+                          <span className="office-desk-topline">
+                            <strong>{desk.role}</strong>
+                            <em>{desk.statusLabel}</em>
+                          </span>
+                          <span className="office-current-task">{desk.taskName}</span>
+                          <span className="office-desk-kpis">
+                            <b>{desk.active}</b> active
+                            <b>{desk.review}</b> review
+                            <b>{desk.done}</b> done
+                          </span>
+                          <span className="office-task-status">{desk.taskStatus}</span>
+                        </span>
+                      </button>
+                    ))}
+                    <div className="office-status-dock" aria-label="Office role status">
+                      {officeRoleDesks.map((desk) => (
+                        <button
+                          className={`office-status-tile office-status-tile-${desk.kind}${officeDetailRole === desk.role ? " office-status-tile-selected" : ""}`}
+                          key={`office-status-${desk.role}`}
+                          onClick={() => {
+                            setSelectedRole(desk.role)
+                            setOfficeDetailRole((current) => (current === desk.role ? "" : desk.role))
+                            setSelectedNodeId(desk.taskId)
+                            setSelectedEdgeId("")
+                          }}
+                          type="button"
+                        >
+                          <strong>{desk.role}</strong>
+                          <em>{desk.statusLabel}</em>
+                        </button>
+                      ))}
+                      {officeDetailDesk && (
+                        <div className={`office-status-detail office-status-detail-${officeDetailDesk.kind}`}>
+                          <div>
+                            <strong>{officeDetailDesk.role}</strong>
+                            <em>{officeDetailDesk.taskStatus}</em>
+                          </div>
+                          <p>{officeDetailDesk.taskName}</p>
+                          <span>
+                            <b>{officeDetailDesk.active}</b> active
+                            <b>{officeDetailDesk.review}</b> review
+                            <b>{officeDetailDesk.done}</b> done
+                          </span>
+                        </div>
                       )}
                     </div>
+                    <div className="office-feed">
+                      <div className="office-feed-head">
+                        <Activity size={14} />
+                        <strong>Live Work</strong>
+                      </div>
+                      {officeTimeline.map(({ key, timestamp, summary }) => (
+                        <button
+                          className={`office-feed-item office-feed-item-${summary.tone}`}
+                          disabled={!summary.nodeId}
+                          key={key}
+                          onClick={() => {
+                            if (!summary.nodeId) return
+                            setSelectedNodeId(summary.nodeId)
+                            setSelectedEdgeId("")
+                            setCanvasMode("task")
+                            const node = draft.graph_json.nodes.find((item) => item.id === summary.nodeId)
+                            if (node) setSelectedRole(canonicalRoleForNode(node, boardTaskById.get(node.id)))
+                          }}
+                          type="button"
+                        >
+                          <span>{timestamp.slice(11, 19)}</span>
+                          <strong>{summary.actor}</strong>
+                          <small>{summary.title}</small>
+                        </button>
+                      ))}
+                      {!officeTimeline.length && <small>No team activity yet.</small>}
+                    </div>
                   </div>
-                )}
-                <ReactFlow
-                  nodes={canvasMode === "role" ? roleCanvasNodes : canvasNodes}
-                  edges={canvasMode === "role" ? roleFlowEdges : flowEdges}
-                  nodeTypes={workflowNodeTypes}
-                  edgeTypes={workflowEdgeTypes}
-                  onNodesChange={canvasMode === "role" ? onRoleNodesChange : onNodesChange}
-                  onEdgesChange={onEdgesChange}
-                  onInit={(instance) => {
-                    flowInstanceRef.current = instance
-                  }}
-                  fitView
-                  fitViewOptions={{ padding: 0.18 }}
-                  deleteKeyCode={canvasMode === "role" ? null : ["Backspace", "Delete"]}
-                  elementsSelectable
-                  nodesConnectable={canvasMode === "task"}
-                  nodesDraggable
-                  onlyRenderVisibleElements
-                  onConnect={onConnect}
-                  onNodeClick={(_, node) => {
-                    if (canvasMode === "role" && node.id.startsWith(ROLE_NODE_PREFIX)) {
-                      const role = roleFromNodeId(node.id)
-                      setSelectedRole(role)
-                      setSelectedNodeId(roleSummaries.find((item) => item.role === role)?.tasks[0]?.id ?? "")
+                </div>
+              ) : (
+                <div className="flow-shell role-flow-shell">
+                  {roleRuntimeLive && (
+                    <div className="role-live-overlay" aria-live="polite">
+                      <div className="role-live-overlay-head">
+                        <span className="role-live-dot" />
+                        <strong>Live dialogue</strong>
+                        <small>{runtimeSummary?.next_action ?? "runtime active"}</small>
+                      </div>
+                      <div className="role-live-message-strip">
+                        {latestTeamMessages.length ? (
+                          latestTeamMessages.map((message) => (
+                            <span key={`${message.node_id ?? message.role}-${message.timestamp}`}>
+                              <b>{message.role}</b>
+                              {truncate(message.message, 120)}
+                            </span>
+                          ))
+                        ) : (
+                          <span>
+                            <b>{runtimeSummary?.active_node_ids[0] ?? "team"}</b>
+                            waiting for the next human-language update
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                  <ReactFlow
+                    nodes={canvasMode === "role" ? roleCanvasNodes : canvasNodes}
+                    edges={canvasMode === "role" ? roleFlowEdges : flowEdges}
+                    nodeTypes={workflowNodeTypes}
+                    edgeTypes={workflowEdgeTypes}
+                    onNodesChange={canvasMode === "role" ? onRoleNodesChange : onNodesChange}
+                    onEdgesChange={onEdgesChange}
+                    onInit={(instance) => {
+                      flowInstanceRef.current = instance
+                    }}
+                    fitView
+                    fitViewOptions={{ padding: 0.18 }}
+                    deleteKeyCode={canvasMode === "role" ? null : ["Backspace", "Delete"]}
+                    elementsSelectable
+                    nodesConnectable={canvasMode === "task"}
+                    nodesDraggable
+                    onlyRenderVisibleElements
+                    onConnect={onConnect}
+                    onNodeClick={(_, node) => {
+                      if (canvasMode === "role" && node.id.startsWith(ROLE_NODE_PREFIX)) {
+                        const role = roleFromNodeId(node.id)
+                        setSelectedRole(role)
+                        setSelectedNodeId(roleSummaries.find((item) => item.role === role)?.tasks[0]?.id ?? "")
+                        setSelectedEdgeId("")
+                        return
+                      }
+                      if (isFanoutStackNodeId(node.id)) {
+                        const key = node.id.slice(FANOUT_STACK_NODE_PREFIX.length)
+                        if (key.endsWith(":expanded-control")) return
+                        expandFanoutGroup(key)
+                        setSelectedEdgeId("")
+                        return
+                      }
+                      setSelectedNodeId(node.id)
                       setSelectedEdgeId("")
-                      return
-                    }
-                    if (isFanoutStackNodeId(node.id)) {
-                      const key = node.id.slice(FANOUT_STACK_NODE_PREFIX.length)
-                      if (key.endsWith(":expanded-control")) return
-                      expandFanoutGroup(key)
+                    }}
+                    onEdgeClick={(_, edge) => {
+                      if (canvasMode === "role" || isStackEdgeId(edge.id)) return
+                      setSelectedEdgeId(edge.id)
+                      setSelectedNodeId("")
+                    }}
+                    onNodeDragStart={() => setIsDraggingNode(true)}
+                    onNodeDragStop={(_, node) => {
+                      setIsDraggingNode(false)
+                      if (canvasMode === "role" && node.id.startsWith(ROLE_NODE_PREFIX)) {
+                        const role = roleFromNodeId(node.id)
+                        setRoleNodePositions((current) => ({
+                          ...current,
+                          [role]: { x: node.position.x, y: node.position.y },
+                        }))
+                        setSelectedRole(role)
+                        return
+                      }
+                      if (isFanoutStackNodeId(node.id)) {
+                        const key = node.id.slice(FANOUT_STACK_NODE_PREFIX.length)
+                        setFanoutStackPositions((current) => ({
+                          ...current,
+                          [key]: { x: node.position.x, y: node.position.y },
+                        }))
+                        return
+                      }
+                      updateNode(node.id, (item) => {
+                        item.position = { x: node.position.x, y: node.position.y }
+                      })
+                    }}
+                    onPaneClick={() => {
                       setSelectedEdgeId("")
-                      return
-                    }
-                    setSelectedNodeId(node.id)
-                    setSelectedEdgeId("")
-                  }}
-                  onEdgeClick={(_, edge) => {
-                    if (canvasMode === "role" || isStackEdgeId(edge.id)) return
-                    setSelectedEdgeId(edge.id)
-                    setSelectedNodeId("")
-                  }}
-                  onNodeDragStart={() => setIsDraggingNode(true)}
-                  onNodeDragStop={(_, node) => {
-                    setIsDraggingNode(false)
-                    if (canvasMode === "role" && node.id.startsWith(ROLE_NODE_PREFIX)) {
-                      const role = roleFromNodeId(node.id)
-                      setRoleNodePositions((current) => ({
-                        ...current,
-                        [role]: { x: node.position.x, y: node.position.y },
-                      }))
-                      setSelectedRole(role)
-                      return
-                    }
-                    if (isFanoutStackNodeId(node.id)) {
-                      const key = node.id.slice(FANOUT_STACK_NODE_PREFIX.length)
-                      setFanoutStackPositions((current) => ({
-                        ...current,
-                        [key]: { x: node.position.x, y: node.position.y },
-                      }))
-                      return
-                    }
-                    updateNode(node.id, (item) => {
-                      item.position = { x: node.position.x, y: node.position.y }
-                    })
-                  }}
-                  onPaneClick={() => {
-                    setSelectedEdgeId("")
-                  }}
-                >
-                  <Background />
-                  {canvasMode === "task" && <MiniMap pannable zoomable />}
-                  <Controls />
-                </ReactFlow>
-              </div>
+                    }}
+                  >
+                    <Background />
+                    {canvasMode === "task" && <MiniMap pannable zoomable />}
+                    <Controls />
+                  </ReactFlow>
+                </div>
+              )}
               {selectedRoleSummary && (
                 <div className="role-internal-flow-panel">
                   <div className="role-internal-flow-head">
@@ -3153,7 +4276,6 @@ function TaskBoardsPage({ workspace }: { workspace: string }) {
                         onClick={() => {
                           setSelectedNodeId(task.id)
                           setSelectedEdgeId("")
-                          setCanvasMode("task")
                         }}
                         type="button"
                       >

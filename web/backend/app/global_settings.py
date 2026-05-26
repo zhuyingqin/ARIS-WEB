@@ -40,6 +40,7 @@ DEFAULT_MODELS: dict[str, str] = {
     "glm": "GLM-5",
     "minimax": "MiniMax-M2.7",
     "kimi": "kimi-k2.5",
+    "deepseek": "deepseek-v4-pro",
 }
 
 DEFAULT_MODEL_OPTIONS: dict[str, list[str]] = {
@@ -49,6 +50,7 @@ DEFAULT_MODEL_OPTIONS: dict[str, list[str]] = {
     "glm": ["GLM-5", "GLM-5-Turbo"],
     "minimax": ["MiniMax-M2.7", "MiniMax-M2.7-highspeed"],
     "kimi": ["kimi-k2.5"],
+    "deepseek": ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"],
     "custom": [],
 }
 
@@ -406,6 +408,7 @@ def get_global_settings(home: Path = WEB_HOME) -> GlobalSettings:
 def update_global_settings(request: UpdateGlobalSettingsRequest, home: Path = WEB_HOME) -> GlobalSettings:
     current = _read_raw(home)
     profiles = _profiles_from_raw(current)
+    role_models = current.get("role_models") if isinstance(current.get("role_models"), dict) else None
     provider = normalize_provider(request.provider)
     profile = profiles.get(provider, _clean_profile({}, provider))
     api_key = str(profile.get("api_key") or "")
@@ -435,6 +438,8 @@ def update_global_settings(request: UpdateGlobalSettingsRequest, home: Path = WE
         "updated_at": updated_at,
         "providers": profiles,
     }
+    if role_models:
+        data["role_models"] = role_models
     _write_raw(data, home)
     return get_global_settings(home)
 
@@ -708,6 +713,22 @@ def effective_model_override(home: Path = WEB_HOME) -> str | None:
     if model:
         return model
     return DEFAULT_MODELS.get(provider)
+
+
+def role_model_override(role_kind: str, home: Path = WEB_HOME) -> str | None:
+    raw = _read_raw(home)
+    role_models = raw.get("role_models")
+    if not isinstance(role_models, dict):
+        return None
+    role = str(role_kind or "").strip().lower()
+    if not role:
+        return None
+    value = str(role_models.get(role) or "").strip()
+    if value:
+        return value
+    if role == "citation":
+        return str(role_models.get("writer") or "").strip() or None
+    return None
 
 
 def effective_effort_override(home: Path = WEB_HOME, model: str | None = None) -> str | None:

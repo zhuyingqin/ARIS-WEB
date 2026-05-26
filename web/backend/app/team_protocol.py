@@ -36,7 +36,7 @@ def default_scope_for_kind(kind: str) -> str:
     if kind == "reviewer":
         return "Raise quality questions, evidence gaps, and rework suggestions; leave routing decisions to the planner."
     if kind == "literature":
-        return "Search and organize literature evidence, then report concise findings with artifact references."
+        return "Run the fixed OpenAlex literature workflow, maintain a high-relevance CSV, and report concise evidence with artifact references."
     if kind == "writer":
         return "Write or revise paper text from available materials, reporting results, risks, and artifact links."
     if kind == "citation":

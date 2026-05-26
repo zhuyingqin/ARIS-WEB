@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import hashlib
 import json
 import os
 import re
 import ssl
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from copy import deepcopy
@@ -23,7 +26,9 @@ from .global_settings import (
     get_planner_llm_settings,
     planner_llm_summary,
     openai_compatible_settings,
+    role_model_override,
 )
+from .config import WEB_HOME
 from .models import (
     ArtifactIndexEntry,
     CreateRunRequest,
@@ -68,16 +73,21 @@ from .workflow_storage import (
     append_workflow_event,
     append_planner_decision,
     append_workflow_delta,
+    compact_research_state_pack,
     delete_workflow,
+    ensure_research_state,
     get_workflow,
     insert_workflow,
     list_planner_decisions,
     list_workflows,
     list_workflow_deltas,
     read_artifact_index,
+    read_research_state,
     replay_workflow_events,
+    research_state_path,
     update_workflow,
     write_artifact_index,
+    workflow_runtime_dir,
 )
 
 try:
@@ -148,6 +158,14 @@ def _safe_node_slug(value: object, fallback: str) -> str:
     return slug[:42].strip("-") or fallback
 
 
+def preferred_literature_skill(known_skills: set[str] | None = None) -> str:
+    if known_skills is None or "openalex-search" in known_skills:
+        return "openalex-search"
+    if "research-lit" in known_skills:
+        return "research-lit"
+    return "openalex-search"
+
+
 def default_skill_for_node(node: WorkflowNode, known_skills: set[str] | None = None) -> str | None:
     if node.type not in EXECUTABLE_NODE_TYPES:
         return None
@@ -156,8 +174,12 @@ def default_skill_for_node(node: WorkflowNode, known_skills: set[str] | None = N
     haystack = f"{node.role} {node.assignee_role or ''} {node.name} {node.objective}".lower()
     if re.search(r"\b(planner|manager)\b|规划员|计划员", haystack):
         return None
-    if "openalex" in haystack and (known_skills is None or "openalex-search" in known_skills):
-        return "openalex-search"
+    if (
+        node.team_role_kind == "literature"
+        or "openalex" in haystack
+        or re.search(r"\b(literature|research-lit|search|scout|survey|related work|prior work)\b|文献|调研", haystack)
+    ):
+        return preferred_literature_skill(known_skills)
     candidate = DEFAULT_SKILL_BY_TASK_TYPE.get(node.task_type)
     if candidate and (known_skills is None or candidate in known_skills):
         return candidate
@@ -175,6 +197,21 @@ def workflow_event_type_for_run_stream(stream: str) -> str:
     if stream in {"stdout", "stderr"}:
         return stream
     return "run"
+
+
+def _compact_workflow_event_payload(payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+    compact = dict(payload)
+    if isinstance(compact.get("events"), list):
+        compact["events_count"] = len(compact["events"])
+        compact.pop("events", None)
+    if isinstance(compact.get("tool_uses"), list):
+        compact["tool_uses_count"] = len(compact["tool_uses"])
+    if isinstance(compact.get("tool_results"), list):
+        compact["tool_results_count"] = len(compact["tool_results"])
+        compact.pop("tool_results", None)
+    return compact
 
 
 def expand_replayed_workflow_event(event: WorkflowEvent) -> list[WorkflowEvent]:
@@ -197,7 +234,7 @@ def expand_replayed_workflow_event(event: WorkflowEvent) -> list[WorkflowEvent]:
     ]
 
 
-def concrete_output_paths(outputs) -> list[Path]:
+def concrete_output_paths(outputs, *, required_only: bool = False) -> list[Path]:
     """Collect file paths that an agent must produce.
 
     Accepts either the legacy ``list[str]`` form or the new ``list[PortSpec]``.
@@ -209,12 +246,16 @@ def concrete_output_paths(outputs) -> list[Path]:
     paths: list[Path] = []
     for output in outputs:
         # PortSpec or legacy str — normalize to (name, port_type).
+        required = True
         if hasattr(output, "name") and hasattr(output, "type"):
             name = (output.name or "").strip()
             port_type = output.type
+            required = getattr(output, "required", True)
         else:
             name = str(output).strip()
             port_type = "text"
+        if required_only and not required:
+            continue
         if not name or " or " in name or "," in name:
             continue
         if port_type == "file":
@@ -244,12 +285,95 @@ def workflow_output_relative_path(workspace: Path, workflow_id: str, node: Workf
         return output_path.as_posix()
 
 
+def _looks_like_high_relevance_literature_path(path: Path) -> bool:
+    return path.name == "high_relevance_literature.csv"
+
+
+def high_relevance_literature_row_count(path: Path) -> int:
+    """Count retained citation rows in the curated literature CSV."""
+
+    try:
+        if not path.exists() or path.stat().st_size == 0:
+            return 0
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+            reader = csv.DictReader(fh)
+            if not reader.fieldnames:
+                return 0
+            count = 0
+            for row in reader:
+                if not any(str(value or "").strip() for value in row.values()):
+                    continue
+                title = str(row.get("title") or "").strip()
+                decision = str(row.get("relevance_decision") or "").strip().lower()
+                if not title:
+                    continue
+                if decision in {"low", "exclude", "excluded", "irrelevant", "off-topic", "off_topic", "no"}:
+                    continue
+                count += 1
+            return count
+    except OSError:
+        return 0
+
+
+def openalex_candidate_row_count(path: Path) -> int:
+    """Count downloaded OpenAlex candidate rows in the title/abstract CSV."""
+
+    try:
+        if not path.exists() or path.stat().st_size == 0:
+            return 0
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+            reader = csv.DictReader(fh)
+            if not reader.fieldnames:
+                return 0
+            count = 0
+            for row in reader:
+                if str(row.get("title") or "").strip() or str(row.get("openalex_id") or "").strip():
+                    count += 1
+            return count
+    except OSError:
+        return 0
+
+
+def literature_output_validation_errors(workspace: Path, workflow_id: str, node: WorkflowNode) -> list[str]:
+    if node.skill not in LITERATURE_SKILLS and node.team_role_kind != "literature":
+        return []
+    declared = [path for path in concrete_output_paths(node.outputs) if _looks_like_high_relevance_literature_path(path)]
+    if not declared:
+        return []
+    errors: list[str] = []
+    for output_path in declared:
+        resolved = workflow_output_path(workspace, workflow_id, node, output_path)
+        if resolved.exists():
+            retained_rows = high_relevance_literature_row_count(resolved)
+            if retained_rows == 0:
+                errors.append(f"{workflow_output_relative_path(workspace, workflow_id, node, output_path)} has no retained high-relevance literature rows")
+            elif retained_rows < MIN_OPENALEX_EVIDENCE_ROWS:
+                errors.append(
+                    f"{workflow_output_relative_path(workspace, workflow_id, node, output_path)} has only {retained_rows} retained row(s); "
+                    f"need at least {MIN_OPENALEX_EVIDENCE_ROWS} for a stable evidence handoff"
+                )
+    result_path = workflow_output_path(workspace, workflow_id, node, Path("literature_result.json"))
+    if result_path.exists():
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            result = {}
+        status = str(result.get("status") or "").strip().lower() if isinstance(result, dict) else ""
+        if status in {"inconclusive", "failed", "error"}:
+            errors.append(f"{workflow_output_relative_path(workspace, workflow_id, node, Path('literature_result.json'))} status is {status}")
+    return errors
+
+
+def node_output_validation_errors(workspace: Path, workflow_id: str, node: WorkflowNode) -> list[str]:
+    return literature_output_validation_errors(workspace, workflow_id, node)
+
+
 def reconcile_declared_outputs(workspace: Path, workflow_id: str, node: WorkflowNode, *, not_before: str | None = None) -> list[dict[str, str]]:
     """Move declared outputs accidentally written at workspace root into the node attempt dir."""
 
     moved: list[dict[str, str]] = []
     workspace_root = workspace.resolve()
-    for output_path in concrete_output_paths(node.outputs):
+    for output_path in concrete_output_paths(node.outputs, required_only=True):
         if output_path.is_absolute() or (output_path.parts and output_path.parts[0] == ".aris"):
             continue
         expected = workflow_output_path(workspace, workflow_id, node, output_path).resolve()
@@ -271,6 +395,65 @@ def reconcile_declared_outputs(workspace: Path, workflow_id: str, node: Workflow
             }
         )
     return moved
+
+
+DECLARED_OUTPUT_ALIASES = {
+    "INTRO_REVIEW.md": [
+        "REVIEW_REPORT.md",
+        "INTRODUCTION_REVIEW.md",
+        "INTRODUCTION_REVIEW_REPORT.md",
+        "INTRO_REVIEW_REPORT.md",
+    ],
+    "FINAL_INTRO_REVIEW.md": [
+        "REVIEW_REPORT.md",
+        "FINAL_REVIEW.md",
+        "FINAL_INTRODUCTION_REVIEW.md",
+        "INTRODUCTION_FINAL_REVIEW.md",
+    ],
+    "REVIEW_REPORT.md": [
+        "REVIEW_RESOLUTION.md",
+        "REVIEW.md",
+        "INTRODUCTION_REVIEW.md",
+        "INTRO_REVIEW.md",
+        "FINAL_REVIEW.md",
+    ],
+    "WRITING_UPDATE.md": [
+        "WRITER_UPDATE.md",
+        "REVISION_UPDATE.md",
+        "INTRO_REVISION_SUMMARY.md",
+    ],
+}
+
+
+def materialize_declared_output_aliases(workspace: Path, workflow_id: str, node: WorkflowNode) -> list[dict[str, str]]:
+    """Copy common agent-written alias files into their declared output names."""
+
+    materialized: list[dict[str, str]] = []
+    workspace_root = workspace.resolve()
+    attempt_dir = node_attempt_dir(workspace, workflow_id, node).resolve()
+    for output_path in concrete_output_paths(node.outputs, required_only=True):
+        expected = workflow_output_path(workspace, workflow_id, node, output_path).resolve()
+        if expected.exists() or expected.name not in DECLARED_OUTPUT_ALIASES:
+            continue
+        if workspace_root not in [expected, *expected.parents]:
+            continue
+        for alias_name in DECLARED_OUTPUT_ALIASES[expected.name]:
+            alias = (attempt_dir / alias_name).resolve()
+            if workspace_root not in [alias, *alias.parents]:
+                continue
+            if not alias.exists() or not alias.is_file() or alias == expected:
+                continue
+            expected.parent.mkdir(parents=True, exist_ok=True)
+            expected.write_bytes(alias.read_bytes())
+            materialized.append(
+                {
+                    "from": alias.relative_to(workspace_root).as_posix(),
+                    "to": expected.relative_to(workspace_root).as_posix(),
+                    "reason": "declared_output_alias",
+                }
+            )
+            break
+    return materialized
 
 
 def workflow_node_session_path(workspace: Path, workflow_id: str, node_id: str) -> Path:
@@ -423,6 +606,822 @@ def sync_literature_result_to_wiki(workspace: Path, workflow_id: str, node: Work
     (wiki / "query_pack.md").write_text("\n".join(pack_lines), encoding="utf-8")
 
 
+def _openalex_abstract_text(inverted_index: Any) -> str:
+    if not isinstance(inverted_index, dict):
+        return ""
+    positioned: list[tuple[int, str]] = []
+    for word, positions in inverted_index.items():
+        if not isinstance(positions, list):
+            continue
+        for position in positions:
+            try:
+                positioned.append((int(position), str(word)))
+            except (TypeError, ValueError):
+                continue
+    positioned.sort(key=lambda item: item[0])
+    return " ".join(word for _position, word in positioned)
+
+
+def _openalex_work_abstract(work: dict[str, Any]) -> str:
+    abstract = _openalex_abstract_text(work.get("abstract_inverted_index"))
+    if abstract:
+        return abstract
+    return str(work.get("abstract") or "").strip()
+
+
+def _openalex_authors(work: dict[str, Any], *, limit: int = 8) -> str:
+    cached_authors = str(work.get("authors") or "").strip()
+    if cached_authors:
+        return cached_authors
+    names: list[str] = []
+    for authorship in work.get("authorships") or []:
+        if not isinstance(authorship, dict):
+            continue
+        author = authorship.get("author")
+        if isinstance(author, dict):
+            name = str(author.get("display_name") or "").strip()
+            if name:
+                names.append(name)
+        if len(names) >= limit:
+            break
+    suffix = " et al." if len(work.get("authorships") or []) > limit else ""
+    return "; ".join(names) + suffix
+
+
+def _openalex_source_name(work: dict[str, Any]) -> str:
+    cached_venue = str(work.get("venue") or "").strip()
+    if cached_venue:
+        return cached_venue
+    location = work.get("primary_location")
+    if not isinstance(location, dict):
+        return ""
+    source = location.get("source")
+    if not isinstance(source, dict):
+        return ""
+    return str(source.get("display_name") or "").strip()
+
+
+def _openalex_landing_url(work: dict[str, Any]) -> str:
+    cached_url = str(work.get("url") or "").strip()
+    if cached_url:
+        return cached_url
+    location = work.get("primary_location")
+    if isinstance(location, dict):
+        landing = str(location.get("landing_page_url") or "").strip()
+        if landing:
+            return landing
+    doi = str(work.get("doi") or "").strip()
+    return doi
+
+
+def _query_terms(query: str) -> list[str]:
+    stop = {
+        "and",
+        "or",
+        "the",
+        "for",
+        "with",
+        "from",
+        "that",
+        "this",
+        "paper",
+        "papers",
+        "academic",
+        "review",
+        "reviewed",
+        "reviewing",
+        "write",
+        "citation",
+        "citations",
+        "evidence",
+        "literature",
+        "claim",
+        "claims",
+        "introduction",
+        "aris",
+        "team",
+        "teams",
+        "identity",
+        "framework",
+        "production",
+        "coordinating",
+        "planner",
+        "scout",
+        "writer",
+        "reviewer",
+        "problem",
+        "board",
+    }
+    terms = []
+    for term in re.findall(r"[A-Za-z][A-Za-z0-9-]{2,}", query.lower()):
+        if term not in stop and term not in terms:
+            terms.append(term)
+    return terms[:16]
+
+
+def _fallback_openalex_queries(base_query: str, node: WorkflowNode) -> list[dict[str, str]]:
+    haystack = " ".join([base_query, node.name, node.objective, node.prompt]).lower()
+    candidates: list[str] = []
+
+    def add(query: str) -> None:
+        query = re.sub(r"\s+", " ", query).strip()
+        if len(query) < 8:
+            return
+        if query.lower() not in {item.lower() for item in candidates}:
+            candidates.append(query)
+
+    add(base_query)
+    terms = _query_terms(base_query)
+    if terms:
+        add(" ".join(terms[:8]))
+    if any(token in haystack for token in ("multi-agent", "agent", "agents", "research", "writing", "paper", "scientific")):
+        add("PaperOrchestrator LLM orchestrated multi-agent scientific paper writing")
+        add("Agent Laboratory LLM agents research assistants")
+        add("CAMEL communicative agents large language model society")
+        add("ChatDev communicative agents software development")
+        add("AutoGen multi-agent conversation framework large language models")
+        add("AI-assisted academic writing literature review")
+        add("multi-agent automated scientific paper writing")
+        add("multi-agent scientific writing")
+        add("AI agents academic writing")
+        add("automated scientific writing literature review")
+    if any(token in haystack for token in ("workflow", "planner", "orchestration", "problem board", "long-horizon", "long horizon")):
+        add("multi-agent workflow orchestration research")
+        add("human AI collaborative scientific writing workflow")
+    return [
+        {
+            "name": _safe_node_slug(query, f"fallback-{index}"),
+            "search": query,
+        }
+        for index, query in enumerate(candidates[:12], start=1)
+    ]
+
+
+def _work_matches_query(work: dict[str, Any], query: str) -> tuple[bool, str]:
+    terms = _query_terms(query)
+    if not terms:
+        return True, "OpenAlex relevance-ranked result for routed query"
+    title = str(work.get("title") or work.get("display_name") or "")
+    abstract = _openalex_work_abstract(work)
+    haystack = f"{title}\n{abstract}".lower()
+    query_lower = query.lower()
+    named_system_requirements = {
+        "paperorchestrator": "paperorchestrator",
+        "agent laboratory": "agent laboratory",
+        "camel": "camel",
+        "chatdev": "chatdev",
+        "autogen": "autogen",
+    }
+    for query_token, required_token in named_system_requirements.items():
+        if query_token in query_lower and required_token not in haystack:
+            return False, f"Missing named-system match for {required_token}"
+    if any(token in query_lower for token in ("writing", "paper writing", "scientific writing", "academic writing")):
+        writing_hits = [
+            token
+            for token in ("writing", "paper", "manuscript", "academic", "scientific", "literature review", "research assistant")
+            if token in haystack
+        ]
+        agent_hits = [
+            token
+            for token in ("llm", "large language model", "agent", "agents", "multi-agent", "artificial intelligence", "ai", "automated")
+            if token in haystack
+        ]
+        if not writing_hits or not agent_hits:
+            return False, "Missing combined writing/scientific and AI-agent relevance signals"
+    hits = [term for term in terms if term in haystack]
+    threshold = 1 if len(terms) <= 2 else min(3, max(2, len(terms) // 4))
+    if len(hits) >= threshold:
+        return True, f"Matched query terms: {', '.join(hits[:6])}"
+    return False, f"Insufficient title/abstract overlap for query terms: {', '.join(terms[:6])}"
+
+
+def _load_or_create_openalex_query_plan(workspace: Path, workflow_id: str, node: WorkflowNode, query_plan_path: Path) -> dict[str, Any]:
+    if query_plan_path.exists():
+        try:
+            raw = json.loads(query_plan_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                queries = raw.get("queries")
+                if isinstance(queries, list) and queries:
+                    return raw
+        except (json.JSONDecodeError, OSError):
+            pass
+    query = research_query_from_request(node.research_request) or node.objective or node.name
+    queries = _fallback_openalex_queries(query, node) or [
+        {
+            "name": _safe_node_slug(query, "routed-literature-gap"),
+            "search": query,
+        }
+    ]
+    plan = {
+        "project": _safe_node_slug(workflow_id, "aris-literature"),
+        "description": f"Backend OpenAlex plan generated for literature node {node.id}",
+        "shared": {
+            "filter": "type:article",
+            "sort": "relevance_score:desc",
+        },
+        "queries": queries,
+        "screening": {
+            "retain": "Backend keeps OpenAlex works whose title/abstract overlaps the routed claim gap.",
+            "dedupe": "DOI first, then OpenAlex ID/title.",
+        },
+    }
+    query_plan_path.parent.mkdir(parents=True, exist_ok=True)
+    query_plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+    return plan
+
+
+def _openalex_fetch_works_page(
+    query: dict[str, Any],
+    shared: dict[str, Any],
+    *,
+    per_page: int = 200,
+    cursor: str | None = None,
+    timeout: float = 20.0,
+) -> tuple[list[dict[str, Any]], int, str | None]:
+    params: dict[str, str] = {
+        "per-page": str(max(1, min(200, per_page))),
+        "select": OPENALEX_SELECT_FIELDS,
+    }
+    search = str(query.get("search") or query.get("q") or "").strip()
+    if search:
+        params["search"] = search
+    filters = []
+    for value in (shared.get("filter"), query.get("filter")):
+        value_text = str(value or "").strip()
+        if value_text:
+            filters.append(value_text)
+    if filters:
+        params["filter"] = ",".join(filters)
+    sort = str(query.get("sort") or shared.get("sort") or "").strip()
+    if sort:
+        params["sort"] = sort
+    if cursor:
+        params["cursor"] = cursor
+    mailto = os.environ.get("OPENALEX_MAILTO")
+    if mailto:
+        params["mailto"] = mailto
+    api_key = os.environ.get("OPENALEX_API_KEY")
+    if api_key:
+        params["api_key"] = api_key
+    url = f"{OPENALEX_WORKS_ENDPOINT}?{urllib.parse.urlencode(params)}"
+    request = urllib.request.Request(url, headers={"User-Agent": "ARIS-Web/1.0 (OpenAlex literature evidence gate)"})
+    context = ssl.create_default_context(cafile=certifi.where()) if certifi else None
+    for attempt in range(OPENALEX_HTTP_RETRY_COUNT + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429 or attempt >= OPENALEX_HTTP_RETRY_COUNT:
+                raise
+            retry_after = str(exc.headers.get("Retry-After") or "").strip()
+            try:
+                delay = float(retry_after)
+            except ValueError:
+                delay = 2.0 * (attempt + 1)
+            time.sleep(max(1.0, min(OPENALEX_HTTP_RETRY_MAX_SECONDS, delay)))
+    results = payload.get("results") if isinstance(payload, dict) else []
+    meta = payload.get("meta") if isinstance(payload, dict) else {}
+    count = int(meta.get("count") or 0) if isinstance(meta, dict) else 0
+    next_cursor = str(meta.get("next_cursor") or "").strip() if isinstance(meta, dict) else ""
+    return [item for item in results if isinstance(item, dict)], count, next_cursor or None
+
+
+def _openalex_fetch_works(query: dict[str, Any], shared: dict[str, Any], *, per_page: int = 20, timeout: float = 20.0) -> tuple[list[dict[str, Any]], int]:
+    works, count, _next_cursor = _openalex_fetch_works_page(query, shared, per_page=per_page, timeout=timeout)
+    return works, count
+
+
+def _openalex_fetch_candidate_works(
+    query: dict[str, Any],
+    shared: dict[str, Any],
+    *,
+    target: int | None = None,
+    page_size: int | None = None,
+    timeout: float = 20.0,
+) -> tuple[list[dict[str, Any]], int, list[str]]:
+    """Download the top OpenAlex candidates with cursor pagination."""
+
+    target = target or OPENALEX_CANDIDATE_TARGET_PER_QUERY
+    page_size = page_size or OPENALEX_CANDIDATE_PAGE_SIZE
+    works: list[dict[str, Any]] = []
+    reported_count = 0
+    failures: list[str] = []
+    cursor: str | None = "*"
+    seen_cursors: set[str] = set()
+    while len(works) < target and cursor:
+        if cursor in seen_cursors:
+            failures.append("OpenAlex cursor repeated; stopped pagination early")
+            break
+        seen_cursors.add(cursor)
+        try:
+            page, count, next_cursor = _openalex_fetch_works_page(
+                query,
+                shared,
+                per_page=min(page_size, target - len(works)),
+                cursor=cursor,
+                timeout=timeout,
+            )
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            failures.append(str(exc))
+            break
+        if reported_count == 0:
+            reported_count = count
+        if not page:
+            break
+        works.extend(page)
+        cursor = next_cursor
+    return works[:target], reported_count, failures
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _cached_openalex_work_from_candidate_row(row: dict[str, str], source_path: Path, workspace: Path) -> dict[str, Any] | None:
+    title = str(row.get("title") or "").strip()
+    if not title:
+        return None
+    try:
+        source_ref = source_path.resolve().relative_to(workspace.resolve()).as_posix()
+    except ValueError:
+        source_ref = str(source_path)
+    return {
+        "id": str(row.get("openalex_id") or "").strip(),
+        "doi": str(row.get("doi") or "").strip(),
+        "title": title,
+        "display_name": title,
+        "publication_year": _safe_int(row.get("year"), 0) or None,
+        "cited_by_count": _safe_int(row.get("cited_by_count"), 0),
+        "authors": str(row.get("authors") or "").strip(),
+        "venue": str(row.get("venue") or "").strip(),
+        "url": str(row.get("url") or "").strip(),
+        "abstract": str(row.get("abstract") or "").strip(),
+        "primary_location": {
+            "landing_page_url": str(row.get("url") or "").strip(),
+            "source": {"display_name": str(row.get("venue") or "").strip()},
+        },
+        "_cache_source_path": source_ref,
+        "_cache_source_query": str(row.get("query") or "").strip(),
+    }
+
+
+def _cached_openalex_candidate_works(
+    workspace: Path,
+    query_text: str,
+    *,
+    current_candidate_csv_path: Path,
+    target: int,
+) -> list[dict[str, Any]]:
+    """Reuse prior OpenAlex candidate tables when the live API is rate-limited."""
+
+    workflows_root = workspace / ".aris" / "web" / "workflows"
+    if not workflows_root.exists():
+        return []
+    current_resolved = current_candidate_csv_path.resolve()
+
+    def mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    cached: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    try:
+        candidate_paths = sorted(
+            workflows_root.rglob("openalex_candidates_title_abstract.csv"),
+            key=mtime,
+            reverse=True,
+        )
+    except OSError:
+        return []
+    for path in candidate_paths:
+        if path.resolve() == current_resolved:
+            continue
+        try:
+            if path.stat().st_size <= len(OPENALEX_CANDIDATE_ABSTRACT_CSV_HEADER) + 2:
+                continue
+            with path.open("r", encoding="utf-8", newline="") as fh:
+                rows = list(csv.DictReader(fh))
+        except OSError:
+            continue
+        for row in rows:
+            work = _cached_openalex_work_from_candidate_row(row, path, workspace)
+            if work is None:
+                continue
+            keep, _reason = _work_matches_query(work, query_text)
+            if not keep:
+                continue
+            key = (work.get("doi") or work.get("id") or work.get("title") or "").lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cached.append(work)
+            if len(cached) >= target:
+                return cached
+    return cached
+
+
+def backfill_openalex_literature_outputs(workspace: Path, workflow_id: str, node: WorkflowNode) -> dict[str, Any] | None:
+    if os.environ.get("ARIS_WEB_DISABLE_OPENALEX_BACKFILL") == "1":
+        return None
+    if node.skill not in LITERATURE_SKILLS and node.team_role_kind != "literature":
+        return None
+    declared_outputs = {path.name for path in concrete_output_paths(node.outputs)}
+    if not declared_outputs.intersection(
+        {
+            "literature_result.json",
+            "high_relevance_literature.csv",
+            "openalex_candidates_title_abstract.csv",
+            "openalex_query_plan.json",
+        }
+    ):
+        return None
+    csv_path = workflow_output_path(workspace, workflow_id, node, Path("high_relevance_literature.csv"))
+    candidate_csv_path = workflow_output_path(workspace, workflow_id, node, Path("openalex_candidates_title_abstract.csv"))
+    candidate_jsonl_path = workflow_output_path(workspace, workflow_id, node, Path("openalex_candidates_raw.jsonl"))
+    batch_csv_path = workflow_output_path(workspace, workflow_id, node, Path("openalex_abstract_review_batches.csv"))
+    result_path = workflow_output_path(workspace, workflow_id, node, Path("literature_result.json"))
+    query_plan_path = workflow_output_path(workspace, workflow_id, node, Path("openalex_query_plan.json"))
+    if (
+        csv_path.exists()
+        and high_relevance_literature_row_count(csv_path) > 0
+        and candidate_csv_path.exists()
+        and batch_csv_path.exists()
+        and result_path.exists()
+    ):
+        return None
+
+    plan = _load_or_create_openalex_query_plan(workspace, workflow_id, node, query_plan_path)
+    shared = plan.get("shared") if isinstance(plan.get("shared"), dict) else {}
+    queries = [item for item in plan.get("queries") or [] if isinstance(item, dict)]
+    rows: list[dict[str, str]] = []
+    papers: list[dict[str, Any]] = []
+    candidate_rows: list[dict[str, str]] = []
+    raw_candidate_records: list[dict[str, Any]] = []
+    batch_rows: list[dict[str, str]] = []
+    query_stats: list[dict[str, Any]] = []
+    failures: list[str] = []
+    seen: set[str] = set()
+
+    def run_queries(query_batch: list[dict[str, Any]], *, start_index: int = 1) -> None:
+        nonlocal rows, papers, candidate_rows, raw_candidate_records, batch_rows, failures, query_stats
+        for index, query in enumerate(query_batch[:12], start=start_index):
+            query_text = str(query.get("search") or query.get("filter") or query.get("name") or "").strip()
+            if not query_text:
+                continue
+            query_name = str(query.get("name") or f"query-{index}").strip() or f"query-{index}"
+            try:
+                works, reported_count, page_failures = _openalex_fetch_candidate_works(query, shared)
+            except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+                failures.append(f"{query.get('name') or index}: {exc}")
+                works, reported_count, page_failures = [], 0, []
+            failures.extend(f"{query.get('name') or index}: {failure}" for failure in page_failures)
+            if not works:
+                cached_works = _cached_openalex_candidate_works(
+                    workspace,
+                    query_text,
+                    current_candidate_csv_path=candidate_csv_path,
+                    target=OPENALEX_CANDIDATE_TARGET_PER_QUERY,
+                )
+                if cached_works:
+                    works = cached_works
+                    reported_count = max(reported_count, len(cached_works))
+                    failures.append(
+                        f"{query_name}: live OpenAlex returned no candidates; reused "
+                        f"{len(cached_works)} cached OpenAlex candidate row(s)"
+                    )
+            retained_for_query = 0
+            high_matches_for_query = 0
+            duplicate_for_query = 0
+            abstract_count = 0
+            query_batch_count = 0
+            for batch_start in range(0, len(works), OPENALEX_ABSTRACT_REVIEW_BATCH_SIZE):
+                query_batch_count += 1
+                batch_works = works[batch_start : batch_start + OPENALEX_ABSTRACT_REVIEW_BATCH_SIZE]
+                parallel_wave = ((query_batch_count - 1) // OPENALEX_ABSTRACT_REVIEW_MAX_PARALLEL) + 1
+                parallel_slot = ((query_batch_count - 1) % OPENALEX_ABSTRACT_REVIEW_MAX_PARALLEL) + 1
+                batch_abstract_count = 0
+                batch_high_count = 0
+                batch_retained_count = 0
+                for offset, work in enumerate(batch_works, start=1):
+                    rank = batch_start + offset
+                    keep, reason = _work_matches_query(work, query_text)
+                    title = str(work.get("title") or work.get("display_name") or "").strip()
+                    doi = str(work.get("doi") or "").strip()
+                    openalex_id = str(work.get("id") or "").strip()
+                    abstract = _openalex_work_abstract(work)
+                    if abstract:
+                        abstract_count += 1
+                        batch_abstract_count += 1
+                    decision = "high" if keep and title else "excluded"
+                    candidate_rows.append(
+                        {
+                            "query": query_text,
+                            "query_name": query_name,
+                            "rank": str(rank),
+                            "title": title,
+                            "year": str(work.get("publication_year") or ""),
+                            "authors": _openalex_authors(work),
+                            "venue": _openalex_source_name(work),
+                            "doi": doi,
+                            "openalex_id": openalex_id,
+                            "cited_by_count": str(work.get("cited_by_count") or 0),
+                            "screening_decision": decision,
+                            "screening_reason": reason if title else "Missing title",
+                            "url": _openalex_landing_url(work),
+                            "abstract": abstract[:2000],
+                        }
+                    )
+                    raw_candidate_records.append(
+                        {
+                            "query": query_text,
+                            "query_name": query_name,
+                            "rank": rank,
+                            "abstract_review_batch_id": f"{query_name}-{query_batch_count:03d}",
+                            "parallel_wave": parallel_wave,
+                            "parallel_slot": parallel_slot,
+                            "screening_decision": decision,
+                            "screening_reason": reason if title else "Missing title",
+                            "work": work,
+                        }
+                    )
+                    if not keep or not title:
+                        continue
+                    high_matches_for_query += 1
+                    batch_high_count += 1
+                    if len(rows) >= OPENALEX_RETAINED_TOTAL_LIMIT or retained_for_query >= OPENALEX_RETAINED_PER_QUERY_LIMIT:
+                        continue
+                    dedupe_key = (doi or openalex_id or title.lower()).lower()
+                    if dedupe_key in seen:
+                        duplicate_for_query += 1
+                        continue
+                    seen.add(dedupe_key)
+                    row = {
+                        "query": query_text,
+                        "title": title,
+                        "year": str(work.get("publication_year") or ""),
+                        "authors": _openalex_authors(work),
+                        "venue": _openalex_source_name(work),
+                        "doi": doi,
+                        "openalex_id": openalex_id,
+                        "cited_by_count": str(work.get("cited_by_count") or 0),
+                        "relevance_decision": "high",
+                        "relevance_reason": reason,
+                        "supports_claim": f"Candidate support for routed literature gap: {query_text}",
+                        "gap_addressed": research_query_from_request(node.research_request) or node.objective or node.name,
+                        "url": _openalex_landing_url(work),
+                        "abstract": abstract[:2000],
+                    }
+                    rows.append(row)
+                    papers.append(
+                        {
+                            "title": title,
+                            "year": work.get("publication_year"),
+                            "doi": doi,
+                            "openalex_id": openalex_id,
+                            "venue": row["venue"],
+                            "query": query_text,
+                            "relevance_reason": reason,
+                        }
+                    )
+                    retained_for_query += 1
+                    batch_retained_count += 1
+                if batch_works:
+                    batch_rows.append(
+                        {
+                            "query": query_text,
+                            "query_name": query_name,
+                            "batch_id": f"{query_name}-{query_batch_count:03d}",
+                            "batch_index": str(query_batch_count),
+                            "parallel_wave": str(parallel_wave),
+                            "parallel_slot": str(parallel_slot),
+                            "start_rank": str(batch_start + 1),
+                            "end_rank": str(batch_start + len(batch_works)),
+                            "candidate_count": str(len(batch_works)),
+                            "abstract_count": str(batch_abstract_count),
+                            "screened_high_count": str(batch_high_count),
+                            "retained_count": str(batch_retained_count),
+                            "status": "reviewed",
+                        }
+                    )
+            if not works and reported_count == 0:
+                failures.append(f"{query.get('name') or index}: OpenAlex reported zero works")
+            query_stats.append(
+                {
+                    "name": query_name,
+                    "search": query_text,
+                    "reported_count": reported_count,
+                    "downloaded_count": len(works),
+                    "downloaded_abstract_count": abstract_count,
+                    "abstract_review_batch_count": query_batch_count,
+                    "abstract_review_batch_size": OPENALEX_ABSTRACT_REVIEW_BATCH_SIZE,
+                    "abstract_review_max_parallel": OPENALEX_ABSTRACT_REVIEW_MAX_PARALLEL,
+                    "abstract_review_parallel_wave_count": (
+                        ((query_batch_count - 1) // OPENALEX_ABSTRACT_REVIEW_MAX_PARALLEL) + 1 if query_batch_count else 0
+                    ),
+                    "screened_high_count": high_matches_for_query,
+                    "deduped_duplicate_count": duplicate_for_query,
+                    "retained_count": retained_for_query,
+                    "target_download_count": OPENALEX_CANDIDATE_TARGET_PER_QUERY,
+                }
+            )
+
+    run_queries(queries, start_index=1)
+    if len(rows) < MIN_OPENALEX_EVIDENCE_ROWS:
+        base_query = research_query_from_request(node.research_request) or node.objective or node.name
+        fallback_queries = _fallback_openalex_queries(base_query, node)
+        existing_searches = {
+            str(query.get("search") or query.get("filter") or query.get("name") or "").strip().lower()
+            for query in queries
+        }
+        fallback_queries = [
+            query for query in fallback_queries
+            if str(query.get("search") or "").strip().lower() not in existing_searches
+        ]
+        if fallback_queries:
+            plan["backend_fallback_queries"] = fallback_queries
+            query_plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+            run_queries(fallback_queries, start_index=len(queries) + 1)
+
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=HIGH_RELEVANCE_LITERATURE_COLUMNS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    candidate_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with candidate_csv_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=OPENALEX_CANDIDATE_ABSTRACT_COLUMNS)
+        writer.writeheader()
+        for row in candidate_rows:
+            writer.writerow(row)
+    batch_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with batch_csv_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=OPENALEX_ABSTRACT_REVIEW_BATCH_COLUMNS)
+        writer.writeheader()
+        for row in batch_rows:
+            writer.writerow(row)
+    with candidate_jsonl_path.open("w", encoding="utf-8") as fh:
+        for record in raw_candidate_records:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    status = "ok" if len(rows) >= MIN_OPENALEX_EVIDENCE_ROWS else "inconclusive"
+    try:
+        csv_rel = csv_path.resolve().relative_to(workspace.resolve()).as_posix()
+        candidate_csv_rel = candidate_csv_path.resolve().relative_to(workspace.resolve()).as_posix()
+        candidate_jsonl_rel = candidate_jsonl_path.resolve().relative_to(workspace.resolve()).as_posix()
+        batch_csv_rel = batch_csv_path.resolve().relative_to(workspace.resolve()).as_posix()
+        query_plan_rel = query_plan_path.resolve().relative_to(workspace.resolve()).as_posix()
+    except ValueError:
+        csv_rel = str(csv_path)
+        candidate_csv_rel = str(candidate_csv_path)
+        candidate_jsonl_rel = str(candidate_jsonl_path)
+        batch_csv_rel = str(batch_csv_path)
+        query_plan_rel = str(query_plan_path)
+    downloaded_count = len(candidate_rows)
+    downloaded_abstract_count = sum(1 for row in candidate_rows if row.get("abstract"))
+    abstract_review_batch_count = len(batch_rows)
+    payload = {
+        "query": research_query_from_request(node.research_request) or node.objective or node.name,
+        "status": status,
+        "papers": papers,
+        "findings": [
+            (
+                "Backend OpenAlex evidence gate downloaded "
+                f"{downloaded_count} candidate work(s) ({downloaded_abstract_count} with abstracts) "
+                f"across {abstract_review_batch_count} abstract review batch(es) "
+                f"and retained {len(rows)} high-relevance paper(s)."
+            )
+        ] if rows else [],
+        "gaps": failures
+        if failures
+        else (
+            []
+            if status == "ok"
+            else ["OpenAlex returned too few high-relevance retained papers for a stable Writer handoff."]
+        ),
+        "sources": [paper.get("doi") or paper.get("openalex_id") for paper in papers if paper.get("doi") or paper.get("openalex_id")],
+        "csv_path": csv_rel,
+        "candidate_csv_path": candidate_csv_rel,
+        "candidate_jsonl_path": candidate_jsonl_rel,
+        "abstract_review_batches_path": batch_csv_rel,
+        "query_plan_path": query_plan_rel,
+        "query_stats": query_stats,
+        "candidate_count": downloaded_count,
+        "candidate_abstract_count": downloaded_abstract_count,
+        "candidate_target_per_query": OPENALEX_CANDIDATE_TARGET_PER_QUERY,
+        "abstract_review_batch_count": abstract_review_batch_count,
+        "abstract_review_batch_size": OPENALEX_ABSTRACT_REVIEW_BATCH_SIZE,
+        "abstract_review_max_parallel": OPENALEX_ABSTRACT_REVIEW_MAX_PARALLEL,
+        "wiki_refs": [],
+        "artifact_refs": [csv_rel, candidate_csv_rel, batch_csv_rel, query_plan_rel],
+        "workflow_id": workflow_id,
+        "node_id": node.id,
+        "generated_by": "backend_openalex_backfill",
+    }
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {
+        "status": status,
+        "retained_count": len(rows),
+        "candidate_count": downloaded_count,
+        "candidate_abstract_count": downloaded_abstract_count,
+        "abstract_review_batch_count": abstract_review_batch_count,
+        "csv_path": csv_rel,
+        "candidate_csv_path": candidate_csv_rel,
+        "abstract_review_batches_path": batch_csv_rel,
+        "query_plan_path": query_plan_rel,
+        "query_stats": query_stats,
+        "failures": failures[-5:],
+    }
+
+
+def current_workflow_literature_evidence(workspace: Path, record: WorkflowRecord) -> dict[str, Any]:
+    refs: list[dict[str, Any]] = []
+    total_rows = 0
+    for node in record.graph_json.nodes:
+        if node.skill not in LITERATURE_SKILLS and node.team_role_kind != "literature":
+            continue
+        csv_path = workflow_output_path(workspace, record.id, node, Path("high_relevance_literature.csv"))
+        rows = high_relevance_literature_row_count(csv_path)
+        if rows <= 0:
+            continue
+        try:
+            rel = csv_path.resolve().relative_to(workspace.resolve()).as_posix()
+        except ValueError:
+            rel = str(csv_path)
+        result_path = workflow_output_path(workspace, record.id, node, Path("literature_result.json"))
+        try:
+            result_rel = result_path.resolve().relative_to(workspace.resolve()).as_posix() if result_path.exists() else ""
+        except ValueError:
+            result_rel = str(result_path)
+        refs.append(
+            {
+                "node_id": node.id,
+                "csv_path": rel,
+                "literature_result_path": result_rel,
+                "row_count": rows,
+                "status": node.status,
+            }
+        )
+        total_rows += rows
+    return {"valid": total_rows > 0, "row_count": total_rows, "refs": refs}
+
+
+def node_declares_openalex_literature_contract(node: WorkflowNode) -> bool:
+    if node.skill not in LITERATURE_SKILLS and node.team_role_kind != "literature":
+        return False
+    output_names = {path.name for path in concrete_output_paths(node.outputs)}
+    return {
+        "literature_result.json",
+        "high_relevance_literature.csv",
+        "openalex_query_plan.json",
+    }.issubset(output_names)
+
+
+def writer_requires_literature_evidence(record: WorkflowRecord, node: WorkflowNode) -> bool:
+    text_id = f"{node.id} {node.name} {node.objective}".lower()
+    if node.id.startswith("ask-") or "answer the routed team question" in text_id or node.name.lower().startswith("answer:"):
+        return False
+    role_kind = node.team_role_kind or ""
+    if role_kind not in {"writer", "citation"} and node.skill not in {"paper-write"}:
+        return False
+    haystack = " ".join(
+        [
+            record.title,
+            record.goal,
+            node.id,
+            node.name,
+            node.objective,
+            node.prompt,
+            json.dumps(node.research_request or {}, ensure_ascii=False),
+        ]
+    ).lower()
+    if node.id in {"draft-introduction", "revise-introduction"}:
+        return True
+    return bool(
+        ("introduction" in haystack or "引言" in haystack)
+        and re.search(
+            r"\b(citation|citations|cite|reference|references|literature|prior work|related work|evidence|unsupported|claim|claims)\b|文献|引用|证据|参考文献|不支持",
+            haystack,
+        )
+    )
+
+
+def writer_literature_gate_query(record: WorkflowRecord, node: WorkflowNode) -> str:
+    request_query = research_query_from_request(node.research_request)
+    if request_query:
+        return f"{request_query} introduction claim citation evidence"
+    goal = _clean_gap_query(record.goal, fallback=record.title or "paper introduction")
+    objective = _clean_gap_query(node.objective or node.name, fallback="writer introduction")
+    return f"{goal} {objective} prior work citation evidence"
+
+
 def dynamic_literature_node_id(caller_id: str | None, query: str) -> str:
     caller = _safe_node_slug(caller_id or "workflow", "workflow")
     query_slug = _safe_node_slug(query, "research")
@@ -495,8 +1494,6 @@ REVIEWER_TOOLS = [
     "glob",
     "grep",
     "TodoWrite",
-    "LlmReview",
-    "Skill",
     "Sleep",
     "SendUserMessage",
     "Config",
@@ -518,12 +1515,95 @@ LITERATURE_WORKER_TOOLS = [
     "Config",
     "StructuredOutput",
 ]
+HIGH_RELEVANCE_LITERATURE_CSV_HEADER = (
+    "query,title,year,authors,venue,doi,openalex_id,cited_by_count,relevance_decision,"
+    "relevance_reason,supports_claim,gap_addressed,url,abstract"
+)
+HIGH_RELEVANCE_LITERATURE_COLUMNS = HIGH_RELEVANCE_LITERATURE_CSV_HEADER.split(",")
+OPENALEX_CANDIDATE_ABSTRACT_CSV_HEADER = (
+    "query,query_name,rank,title,year,authors,venue,doi,openalex_id,cited_by_count,"
+    "screening_decision,screening_reason,url,abstract"
+)
+OPENALEX_CANDIDATE_ABSTRACT_COLUMNS = OPENALEX_CANDIDATE_ABSTRACT_CSV_HEADER.split(",")
+OPENALEX_ABSTRACT_REVIEW_BATCH_CSV_HEADER = (
+    "query,query_name,batch_id,batch_index,parallel_wave,parallel_slot,start_rank,end_rank,"
+    "candidate_count,abstract_count,screened_high_count,retained_count,status"
+)
+OPENALEX_ABSTRACT_REVIEW_BATCH_COLUMNS = OPENALEX_ABSTRACT_REVIEW_BATCH_CSV_HEADER.split(",")
+MIN_OPENALEX_EVIDENCE_ROWS = 3
+OPENALEX_CANDIDATE_TARGET_PER_QUERY = 500
+OPENALEX_CANDIDATE_PAGE_SIZE = 200
+OPENALEX_ABSTRACT_REVIEW_BATCH_SIZE = 50
+OPENALEX_ABSTRACT_REVIEW_MAX_PARALLEL = 3
+OPENALEX_RETAINED_TOTAL_LIMIT = 80
+OPENALEX_RETAINED_PER_QUERY_LIMIT = 12
+OPENALEX_HTTP_RETRY_COUNT = 1
+OPENALEX_HTTP_RETRY_MAX_SECONDS = 8.0
+OPENALEX_WORKS_ENDPOINT = "https://api.openalex.org/works"
+OPENALEX_SELECT_FIELDS = ",".join(
+    [
+        "id",
+        "doi",
+        "title",
+        "display_name",
+        "publication_year",
+        "publication_date",
+        "type",
+        "cited_by_count",
+        "primary_location",
+        "authorships",
+        "abstract_inverted_index",
+        "topics",
+    ]
+)
+OPENALEX_LITERATURE_OUTPUTS = [
+    {"name": "literature_result.json", "type": "file", "required": True},
+    {
+        "name": "high_relevance_literature.csv",
+        "type": "file",
+        "required": True,
+        "description": "Curated OpenAlex table containing only high-relevance papers retained for the routed claim gap.",
+    },
+    {
+        "name": "openalex_candidates_title_abstract.csv",
+        "type": "file",
+        "required": True,
+        "description": "Downloaded OpenAlex candidate title/abstract table, up to the first 500 relevance-ranked works per query.",
+    },
+    {
+        "name": "openalex_candidates_raw.jsonl",
+        "type": "file",
+        "required": False,
+        "description": "Raw OpenAlex candidate records with query labels and screening decisions for audit.",
+    },
+    {
+        "name": "openalex_abstract_review_batches.csv",
+        "type": "file",
+        "required": True,
+        "description": "Audit log of 50-paper abstract review batches with at most three parallel reader slots.",
+    },
+    {
+        "name": "openalex_query_plan.json",
+        "type": "file",
+        "required": True,
+        "description": "Reproducible OpenAlex query plan used to create or refresh the curated CSV.",
+    },
+]
 CLONE_MARKER_RE = re.compile(
     r"\[(?P<tag>CLONE_WORKERS?|COPY_WORKERS?|复制员工)\s*:?\s*(?P<body>[^\]\n]{0,360})\]",
     re.IGNORECASE,
 )
 WORKER_QUESTION_RE = re.compile(
     r"\[(?P<tag>ASK_WORKER|QUESTION_FOR_WORKER|提问员工)\s*:?\s*(?P<body>[^\]\n]{0,520})\]",
+    re.IGNORECASE,
+)
+PROBLEM_BOARD_MARKER_RE = re.compile(
+    r"\[(?P<tag>PROBLEM_BOARD|BLOCKING_ISSUE|问题板)\s*:?\s*(?P<body>[^\]\n]{0,700})\]",
+    re.IGNORECASE,
+)
+BRACKET_PLACEHOLDER_RE = re.compile(
+    r"\[(?!(?:LITERATURE_NEEDED|CITATION_NEEDED|EVIDENCE_NEEDED|ASK_WORKER|QUESTION_FOR_WORKER|CLONE_WORKERS?|COPY_WORKERS?)\b)"
+    r"(?P<body>[A-Za-z_][^\]\n]{2,100})\](?!\()",
     re.IGNORECASE,
 )
 QUESTION_LINE_RE = re.compile(
@@ -533,16 +1613,268 @@ QUESTION_LINE_RE = re.compile(
     r").{0,240}[?？]",
     re.IGNORECASE,
 )
+LITERATURE_QUERY_HINTS = (
+    "literature",
+    "citation",
+    "citations",
+    "paper",
+    "papers",
+    "related work",
+    "prior work",
+    "arxiv",
+    "doi",
+    "source",
+    "sources",
+    "bibliography",
+    "reference",
+    "survey",
+    "文献",
+    "引用",
+    "论文",
+)
+WRITER_TASK_HINTS = (
+    "specific contribution",
+    "contribution",
+    "placeholder",
+    "revise",
+    "rewrite",
+    "draft",
+    "introduction",
+    "thesis",
+    "claim language",
+    "overstates",
+    "benchmark",
+    "key result",
+    "motivation",
+    "novelty",
+    "写作",
+    "改写",
+    "贡献",
+    "占位符",
+)
+REVIEW_TASK_HINTS = (
+    "check whether",
+    "review",
+    "audit",
+    "aligned",
+    "alignment",
+    "target spec",
+    "drift",
+    "pass",
+    "rework",
+    "blocking",
+    "审核",
+    "审查",
+)
+META_ONLY_TASK_HINTS = (
+    "fail with two concrete issues",
+    "two concrete issues maximum",
+    "return pass",
+    "pass/fail",
+)
+REWORK_HINTS = (
+    "blocking",
+    "blocker",
+    "rework",
+    "must revise",
+    "needs revision",
+    "unresolved",
+    "placeholder",
+    "unsupported claim",
+    "failed acceptance",
+    "cannot pass",
+    "not pass",
+    "issue found",
+    "阻塞",
+    "返工",
+    "未解决",
+    "占位符",
+)
+INTRODUCTION_BLOCKER_HINTS = (
+    "target task",
+    "target application",
+    "target scenario",
+    "target use case",
+    "benchmark pending",
+    "benchmark result",
+    "to be filled",
+    "tbd",
+    "todo",
+    "待补充",
+    "待填充",
+    "目标任务",
+    "目标应用",
+    "目标场景",
+    "具体应用场景",
+    "实验验证部分",
+    "unresolved prior work citations",
+    "prior work citations",
+    "specific paper citations",
+    "lack specific citations",
+    "lacks specific citations",
+    "lacking specific citations",
+    "lack specific paper citations",
+    "lacks specific paper citations",
+    "missing prior-work citations",
+    "missing prior work citations",
+    "missing citations remain",
+    "citation gaps remain",
+    "no concrete citation",
+    "no specific citation",
+    "revised draft — blockers remain",
+    "revised draft - blockers remain",
+    "blockers and evidence gaps",
+    "role; what i received",
+    "what i received",
+)
+NON_BLOCKING_REVIEW_HINTS = (
+    "non-blocking",
+    "watch item",
+    "watch items",
+    "watch-item",
+    "advisory",
+    "optional",
+    "建议 planning",
+    "建议 planner",
+    "非阻塞",
+    "观察项",
+    "后续可",
+)
+PLACEHOLDER_NEGATION_HINTS = (
+    "no unresolved",
+    "no bracket placeholders",
+    "no placeholder language",
+    "does not contain",
+    "do not contain",
+    "not contain",
+    "not present",
+    "not found",
+    "0 matches",
+    "zero matches",
+    "confirmed; no",
+    "confirmed: no",
+    "pass",
+    "不包含",
+    "未包含",
+    "已无",
+    "无占位符",
+    "无需修改",
+)
+NO_ISSUE_LINE_HINTS = (
+    "blockers: none",
+    "blockers**: none",
+    "blocking items: none",
+    "blocking items**: none",
+    "blocking issues: none",
+    "blocking issues**: none",
+    "阻塞项: 无",
+    "阻塞项：无",
+    "阻塞项:** 无",
+    "阻塞项：** 无",
+    "阻塞问题: 无",
+    "阻塞问题：无",
+    "无阻塞项",
+    "无阻塞问题",
+    "no placeholder language",
+    "no `[problem_board",
+    "no [problem_board",
+    "no problem board",
+    "passed all blocking criteria",
+    "draft passed all blocking criteria",
+)
+RESOLVED_BLOCKER_LINE_HINTS = (
+    " resolved",
+    "✅ resolved",
+    "all prior",
+    "all original",
+    "all blockers resolved",
+    "all blocking findings resolved",
+    "all blocking issues resolved",
+    "all blocking items resolved",
+    "均已",
+    "已解决",
+    "已处理",
+    "已添加",
+    "已修订",
+    "已修复",
+    "实质处理",
+    "不构成阻塞",
+    "不阻塞",
+    "无新的阻塞",
+    "无新阻塞",
+    "无新的 problem board",
+)
+PROBLEM_BOARD_EXAMPLE_ISSUES = (
+    "concise issue",
+    "concise blocking issue",
+    "concise blocker",
+    "reviewer reported a blocking issue",
+    "reviewer reported a blocking quality issue",
+    "reviewer found blocking quality issues",
+)
+GAP_MARKER_EXAMPLE_QUERIES = (
+    "focused query",
+    "one precise query",
+    "focused search query",
+    "focused evidence question",
+    "concrete literature gaps",
+    "query",
+)
+WORKER_QUESTION_EXAMPLE_HINTS = (
+    "concrete question",
+    "writer|literature scout",
+    "writer | concrete question",
+    "literature scout|",
+    "citation inserter|",
+    "reviewer |",
+)
 
 
-def _clean_gap_query(text: str, *, fallback: str) -> str:
+def _clean_gap_query(text: str, *, fallback: str, max_len: int = 180) -> str:
     query = re.sub(r"\s+", " ", text).strip("`'\"[](){}:;,. -")
     if len(query) < 12:
         query = fallback
     query = re.sub(r"\s+", " ", query).strip("`'\"[](){}:;,. -")
-    if len(query) > 180:
-        query = query[:180].rsplit(" ", 1)[0].strip() or query[:180].strip()
+    if max_len > 0 and len(query) > max_len:
+        query = query[:max_len].rsplit(" ", 1)[0].strip() or query[:max_len].strip()
     return query or fallback
+
+
+def _is_problem_board_example_issue(issue: str) -> bool:
+    normalized = re.sub(r"\s+", " ", issue).strip("`'\"[](){}:;,. -").lower()
+    if normalized in PROBLEM_BOARD_EXAMPLE_ISSUES:
+        return True
+    if "problem board" in normalized and any(
+        hint in normalized
+        for hint in (
+            "recorded",
+            "waiting planning",
+            "planning route",
+            "planning 路由",
+            "见 problem board",
+            "已记录",
+            "等待 planning",
+        )
+    ):
+        return True
+    return False
+
+
+def _is_gap_marker_example_query(query: str) -> bool:
+    normalized = re.sub(r"\s+", " ", query).strip("`'\"[](){}:;,. -").lower()
+    return not normalized or normalized in GAP_MARKER_EXAMPLE_QUERIES
+
+
+def _is_worker_question_example(body: str, question: str) -> bool:
+    normalized_body = re.sub(r"\s+", " ", body).strip("`'\"[](){}:;,. -").lower()
+    normalized_question = re.sub(r"\s+", " ", question).strip("`'\"[](){}:;,. -").lower()
+    if normalized_question in {"answer the planner question", "concrete question", "writer |"}:
+        return True
+    if len(normalized_question) < 12:
+        return True
+    if "..." in body or "…" in body:
+        return True
+    return any(hint in normalized_body for hint in WORKER_QUESTION_EXAMPLE_HINTS)
 
 
 def _node_gap_fallback_query(record: WorkflowRecord, node: WorkflowNode) -> str:
@@ -564,13 +1896,223 @@ def _split_gap_queries(body: str, *, fallback: str) -> list[str]:
     return queries or [cleaned]
 
 
+def _find_unresolved_placeholders(text: str, *, limit: int = 8) -> list[str]:
+    placeholders: list[str] = []
+    skip_placeholder_examples = 0
+    for line in text.splitlines():
+        line_lower = line.lower()
+        line_declares_absence = _line_declares_placeholder_absence(line)
+        if line_declares_absence:
+            skip_placeholder_examples = 8
+            continue
+        if skip_placeholder_examples > 0 and (
+            BRACKET_PLACEHOLDER_RE.search(line)
+            or any(hint in line_lower for hint in INTRODUCTION_BLOCKER_HINTS)
+        ):
+            skip_placeholder_examples -= 1
+            continue
+        if skip_placeholder_examples > 0 and not line.strip():
+            skip_placeholder_examples -= 1
+            continue
+        for marker in BRACKET_PLACEHOLDER_RE.finditer(line):
+            body = re.sub(r"\s+", " ", marker.group("body")).strip()
+            value = f"[{body}]"
+            lowered = value.lower()
+            if lowered in {item.lower() for item in placeholders}:
+                continue
+            placeholders.append(value)
+            if len(placeholders) >= limit:
+                return placeholders
+    return placeholders
+
+
+def _line_declares_placeholder_absence(line: str) -> bool:
+    line_lower = line.lower()
+    has_placeholder_context = (
+        "placeholder" in line_lower
+        or "prohibited language" in line_lower
+        or "forbidden language" in line_lower
+        or "禁止语言检查" in line
+        or "占位符" in line
+        or BRACKET_PLACEHOLDER_RE.search(line) is not None
+        or any(hint in line_lower for hint in INTRODUCTION_BLOCKER_HINTS)
+    )
+    if not has_placeholder_context:
+        return False
+    absence_hints = tuple(hint for hint in PLACEHOLDER_NEGATION_HINTS if hint != "pass")
+    return any(hint in line_lower for hint in absence_hints) or any(
+        hint in line for hint in ("无", "没有", "未发现", "不存在")
+    )
+
+
+def _strip_negated_placeholder_check_lines(text: str) -> str:
+    kept: list[str] = []
+    skip_placeholder_examples = 0
+    for line in text.splitlines():
+        if _line_declares_placeholder_absence(line):
+            skip_placeholder_examples = 8
+            continue
+        line_lower = line.lower()
+        if skip_placeholder_examples > 0 and (
+            BRACKET_PLACEHOLDER_RE.search(line)
+            or any(hint in line_lower for hint in INTRODUCTION_BLOCKER_HINTS)
+        ):
+            skip_placeholder_examples -= 1
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def _review_declares_pass_without_blockers(text: str) -> bool:
+    stripped_text = _strip_negated_placeholder_check_lines(text)
+    lowered = stripped_text.lower()
+    pass_declared = "review result: pass" in lowered or re.search(r"\bpass\b", lowered) is not None
+    no_blockers = any(
+        phrase in lowered
+        for phrase in (
+            "blocking items**: none",
+            "blocking items: none",
+            "blocking issues**: none",
+            "blocking issues: none",
+            "blockers**: none",
+            "blockers: none",
+            "no blocker remains",
+            "no blocking issue",
+            "no blocking issues",
+            "no new blocking",
+            "no new problem board",
+            "no problem board issue",
+            "all prior blocking findings resolved",
+            "all prior blockers resolved",
+            "all blocking findings resolved",
+            "all blocking issues resolved",
+            "all blocking items resolved",
+            "all original blocking items resolved",
+            "all blockers resolved",
+            "non-blocking watch",
+            "nonblocking watch",
+            "无阻塞",
+            "无阻塞项",
+            "无阻塞问题",
+            "阻塞项: 无",
+            "阻塞项：无",
+            "阻塞项:** 无",
+            "阻塞项：** 无",
+            "阻塞问题: 无",
+            "阻塞问题：无",
+            "无新的阻塞",
+            "无新阻塞",
+            "没有阻塞",
+            "非阻塞 watch",
+            "非阻塞观察",
+            "非阻塞项",
+            "无新的阻塞问题",
+            "全部阻塞问题",
+            "全部 7 个 blocking",
+            "均已实质处理",
+            "均不构成阻塞",
+            "无新的 problem board",
+            "未发现需要记录到 problem board",
+        )
+    ) or re.search(r"all\s+\d*\s*prior\s+blocking\s+findings\s+resolved", lowered) is not None
+    no_blockers = no_blockers or re.search(r"all\s+\d+.*blocking.*resolved", lowered, flags=re.DOTALL) is not None
+    no_blockers = no_blockers or re.search(r"全部\s*\d+\s*个\s*blocking.*(解决|处理)", lowered, flags=re.DOTALL) is not None
+    no_blockers = no_blockers or re.search(r"全部\s*\d+\s*个.*阻塞.*(解决|处理)", lowered, flags=re.DOTALL) is not None
+    resolved_context = pass_declared and no_blockers
+    explicit_rework = (
+        "[ask_worker:" in lowered
+        or "[problem_board:" in lowered
+        or ("concrete issue" in lowered and not resolved_context)
+        or ("blocking item" in lowered and "none" not in lowered and not resolved_context)
+        or ("blocking issue" in lowered and "none" not in lowered and not resolved_context)
+        or ("阻塞项" in lowered and "无" not in lowered and not resolved_context)
+    )
+    if resolved_context:
+        return not explicit_rework
+
+    for line in stripped_text.splitlines():
+        line_lower = line.lower()
+        if not any(hint in line_lower for hint in INTRODUCTION_BLOCKER_HINTS):
+            continue
+        if any(phrase in line_lower for phrase in NO_ISSUE_LINE_HINTS):
+            continue
+        if any(hint in line_lower for hint in PLACEHOLDER_NEGATION_HINTS):
+            continue
+        if any(hint in line_lower for hint in RESOLVED_BLOCKER_LINE_HINTS):
+            continue
+        return False
+    return bool(pass_declared and no_blockers and not explicit_rework)
+
+
+def _looks_like_meta_only_task(item: str) -> bool:
+    lowered = re.sub(r"\s+", " ", item).strip(" `'-.:;").lower()
+    if not lowered:
+        return True
+    return any(hint in lowered for hint in META_ONLY_TASK_HINTS)
+
+
+def _looks_like_literature_query(item: str) -> bool:
+    lowered = item.lower()
+    if DOI_RE.search(item) or ARXIV_RE.search(item):
+        return True
+    return any(hint in lowered for hint in LITERATURE_QUERY_HINTS)
+
+
+def _looks_like_writer_task(item: str) -> bool:
+    lowered = item.lower()
+    return (
+        bool(_find_unresolved_placeholders(item, limit=1))
+        or any(hint in lowered for hint in WRITER_TASK_HINTS)
+        or any(hint in lowered for hint in INTRODUCTION_BLOCKER_HINTS)
+    )
+
+
+def _looks_like_reviewer_task(item: str) -> bool:
+    lowered = item.lower()
+    return any(hint in lowered for hint in REVIEW_TASK_HINTS)
+
+
+def classify_team_work_item(
+    item: str,
+    *,
+    section: str | None = None,
+    gap_type: str | None = None,
+) -> str:
+    """Classify a queued research-state item into the next team owner."""
+
+    cleaned = _clean_gap_query(item, fallback="")
+    if _looks_like_meta_only_task(cleaned):
+        return "ignore"
+    if section == "Writing Queue":
+        return "writer"
+    if section == "Review Queue":
+        return "reviewer"
+    if gap_type in {"literature_gap", "citation_gap"}:
+        return "literature"
+    if _looks_like_literature_query(cleaned):
+        return "literature"
+    if _looks_like_writer_task(cleaned):
+        return "writer"
+    if _looks_like_reviewer_task(cleaned):
+        return "reviewer"
+    if gap_type == "evidence_gap":
+        return "writer"
+    return "planner"
+
+
 def detect_literature_gap_requests(record: WorkflowRecord, node: WorkflowNode, text: str) -> list[dict[str, str]]:
-    fallback = _node_gap_fallback_query(record, node)
+    if (node.team_role_kind or infer_role_kind_for_text(node)) != "planner":
+        return []
     requests: list[dict[str, str]] = []
     for marker in GAP_MARKER_RE.finditer(text):
         tag = marker.group("tag").lower()
         gap_type = "citation_gap" if "citation" in tag else "evidence_gap" if "evidence" in tag else "literature_gap"
-        for body in _split_gap_queries(marker.group("body") or "", fallback=fallback):
+        raw_query = _clean_gap_query(marker.group("body") or "", fallback="")
+        if _is_gap_marker_example_query(raw_query):
+            continue
+        for body in _split_gap_queries(raw_query, fallback=""):
+            if _is_gap_marker_example_query(body):
+                continue
             requests.append(
                 {
                     "gap_type": gap_type,
@@ -580,27 +2122,221 @@ def detect_literature_gap_requests(record: WorkflowRecord, node: WorkflowNode, t
             )
     if requests:
         return requests
+    return []
 
-    lowered = text.lower()
-    if not any(phrase in lowered for phrase in GAP_PHRASES):
+
+def dynamic_writer_rework_node_id(caller_id: str | None, instruction: str) -> str:
+    caller = _safe_node_slug(caller_id or "review", "review")
+    instruction_slug = _safe_node_slug(instruction, "writer-rework")
+    digest = hashlib.sha1(f"{caller_id or ''}\n{instruction}".encode("utf-8")).hexdigest()[:8]
+    return f"write-{caller}-{instruction_slug[:30]}-{digest}"
+
+
+def detect_writer_rework_requests(record: WorkflowRecord, node: WorkflowNode, text: str) -> list[dict[str, str]]:
+    if not text.strip():
         return []
-    for line in text.splitlines():
-        if any(phrase in line.lower() for phrase in GAP_PHRASES):
-            query = _clean_gap_query(line, fallback=fallback)
-            return [
+    role_kind = node.team_role_kind or infer_role_kind_for_text(node)
+    if role_kind == "reviewer" and _review_declares_pass_without_blockers(text):
+        return []
+    scan_text = _strip_negated_placeholder_check_lines(text)
+    lowered = scan_text.lower()
+    placeholders = _find_unresolved_placeholders(scan_text)
+    requests: list[dict[str, str]] = []
+
+    if placeholders and role_kind in {"writer", "reviewer", "citation", "literature"}:
+        requests.append(
+            {
+                "instruction": (
+                    "Revise the latest draft text to remove unresolved placeholders "
+                    f"{', '.join(placeholders)}. Use cautious concrete wording from available evidence; "
+                    "if a fact is unknown, state it as a blocker in WRITING_UPDATE.md instead of leaving placeholder prose."
+                ),
+                "reason": f"{node.name} left or reported unresolved draft placeholders",
+            }
+        )
+
+    actionable_review_text = "\n".join(
+        line
+        for line in scan_text.splitlines()
+        if not line.lstrip().startswith("#")
+        if not any(phrase in line.lower() for phrase in NO_ISSUE_LINE_HINTS)
+    ).lower()
+    if role_kind == "reviewer" and not placeholders and any(hint in actionable_review_text for hint in REWORK_HINTS):
+        relevant_lines = []
+        for line in scan_text.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            line_lower = line.lower()
+            if any(hint in line_lower for hint in NON_BLOCKING_REVIEW_HINTS):
+                continue
+            if any(phrase in line_lower for phrase in NO_ISSUE_LINE_HINTS):
+                continue
+            if any(hint in line_lower for hint in REWORK_HINTS) or _find_unresolved_placeholders(line, limit=1):
+                relevant_lines.append(re.sub(r"\s+", " ", line).strip(" -*"))
+            if len(relevant_lines) >= 3:
+                break
+        issue = "; ".join(item for item in relevant_lines if item)
+        if issue:
+            requests.append(
                 {
-                    "gap_type": "citation_gap" if "citation" in line.lower() or "引用" in line else "evidence_gap",
-                    "query": query,
-                    "reason": f"{node.name} reported a literature or evidence gap",
+                    "instruction": (
+                        "Revise the draft according to the reviewer blocking feedback: "
+                        f"{_clean_gap_query(issue, fallback='reviewer found blocking quality issues')}. "
+                        "Produce revised prose or an explicit blocker list; do not leave bracket placeholders."
+                    ),
+                    "reason": f"{node.name} requested writer rework after quality review",
                 }
-            ]
-    return [
-        {
-            "gap_type": "evidence_gap",
-            "query": fallback,
-            "reason": f"{node.name} reported a literature or evidence gap",
-        }
-    ]
+            )
+
+    deduped: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for request in requests:
+        key = _clean_gap_query(request["instruction"], fallback="").lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(request)
+    return deduped[:2]
+
+
+def detect_problem_board_issues(record: WorkflowRecord, node: WorkflowNode, text: str) -> list[dict[str, str]]:
+    if not text.strip():
+        return []
+    role_kind = node.team_role_kind or infer_role_kind_for_text(node)
+    if role_kind != "reviewer":
+        return []
+
+    issues: list[dict[str, str]] = []
+    scan_text = _strip_negated_placeholder_check_lines(text)
+    intro_blocker_issues: list[dict[str, str]] = []
+    for line in scan_text.splitlines():
+        stripped = re.sub(r"\s+", " ", line).strip(" -*")
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if any(phrase in lowered for phrase in NO_ISSUE_LINE_HINTS):
+            continue
+        if any(hint in lowered for hint in PLACEHOLDER_NEGATION_HINTS):
+            continue
+        if any(hint in lowered for hint in RESOLVED_BLOCKER_LINE_HINTS):
+            continue
+        if any(hint in lowered for hint in INTRODUCTION_BLOCKER_HINTS):
+            intro_blocker_issues.append(
+                {
+                    "issue": (
+                        "Revise the introduction to replace unresolved generic draft language "
+                        f"with concrete, evidence-grounded wording: {stripped}"
+                    ),
+                    "reason": f"{node.name} reported unresolved introduction-specific placeholder language",
+                }
+            )
+            if len(intro_blocker_issues) >= 3:
+                break
+
+    if role_kind == "reviewer" and _review_declares_pass_without_blockers(text) and not intro_blocker_issues:
+        return []
+    issues.extend(intro_blocker_issues)
+
+    for marker in PROBLEM_BOARD_MARKER_RE.finditer(text):
+        issue = _clean_gap_query(
+            marker.group("body") or "",
+            fallback="reviewer reported a blocking issue",
+            max_len=640,
+        )
+        if issue and not _is_problem_board_example_issue(issue):
+            issues.append(
+                {
+                    "issue": issue,
+                    "reason": f"{node.name} added {marker.group('tag')} to the problem board",
+                }
+            )
+    explicit_marker_count = len(issues)
+
+    if explicit_marker_count:
+        deduped: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for issue in issues:
+            key = _clean_gap_query(issue["issue"], fallback="", max_len=640).lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(issue)
+        return deduped[:3]
+
+    for line in scan_text.splitlines():
+        stripped = re.sub(r"\s+", " ", line).strip(" -*")
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if any(hint in lowered for hint in PLACEHOLDER_NEGATION_HINTS):
+            continue
+        if any(hint in lowered for hint in NON_BLOCKING_REVIEW_HINTS):
+            continue
+        if (
+            lowered.startswith(("blocking:", "blocker:", "blockers:", "unresolved:", "failed acceptance"))
+            or lowered.startswith(("阻塞", "未解决"))
+        ) and "none" not in lowered:
+            issue = _clean_gap_query(stripped, fallback="reviewer reported a blocking issue")
+            if _is_problem_board_example_issue(issue):
+                continue
+            issues.append(
+                {
+                    "issue": issue,
+                    "reason": f"{node.name} reported a blocking issue",
+                }
+            )
+
+    if explicit_marker_count == 0:
+        for rework in detect_writer_rework_requests(record, node, text):
+            if _is_problem_board_example_issue(rework["instruction"]):
+                continue
+            issues.append(
+                {
+                    "issue": rework["instruction"],
+                    "reason": rework.get("reason") or f"{node.name} reported a quality issue",
+                }
+            )
+        for line in scan_text.splitlines():
+            stripped = re.sub(r"\s+", " ", line).strip(" -*")
+            if not stripped:
+                continue
+            lowered = stripped.lower()
+            if any(hint in lowered for hint in PLACEHOLDER_NEGATION_HINTS):
+                continue
+            if any(hint in lowered for hint in RESOLVED_BLOCKER_LINE_HINTS):
+                continue
+            if any(hint in lowered for hint in INTRODUCTION_BLOCKER_HINTS):
+                issues.append(
+                    {
+                        "issue": (
+                            "Revise the introduction to replace unresolved generic draft language "
+                            f"with concrete, evidence-grounded wording: {stripped}"
+                        ),
+                        "reason": f"{node.name} reported unresolved introduction-specific placeholder language",
+                    }
+                )
+                if len(issues) >= 3:
+                    break
+
+    deduped: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for issue in issues:
+        key = _clean_gap_query(issue["issue"], fallback="").lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(issue)
+    return deduped[:3]
+
+
+def infer_role_kind_for_text(node: WorkflowNode) -> str:
+    return node.team_role_kind or (
+        "reviewer"
+        if (node.skill == "research-review" or "review" in (node.role or "").lower())
+        else "writer"
+        if (node.skill == "paper-write" or "writer" in (node.role or "").lower())
+        else "worker"
+    )
 
 
 def detect_literature_gap_request(record: WorkflowRecord, node: WorkflowNode, text: str) -> dict[str, str] | None:
@@ -651,13 +2387,38 @@ def _parse_worker_question_body(body: str) -> tuple[str, str]:
     return role, question
 
 
+def _is_worker_question_role_only(body: str, role: str, question: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", body).strip("`'\"[](){} ").lower()
+    if any(separator in cleaned for separator in ("|", "::", "：", ":")):
+        return False
+    known_roles = {
+        "writer",
+        "literature scout",
+        "citation inserter",
+        "reviewer",
+        "worker",
+        "planner",
+        "文献",
+        "审查",
+        "写作",
+    }
+    return role == "worker" and question.lower() in known_roles
+
+
 def detect_worker_question_requests(node: WorkflowNode, text: str) -> list[dict[str, str]]:
     if not node.can_ask_questions:
         return []
+    if (node.team_role_kind or infer_role_kind_for_text(node)) != "planner":
+        return []
     requests: list[dict[str, str]] = []
     for marker in WORKER_QUESTION_RE.finditer(text):
-        role, question = _parse_worker_question_body(marker.group("body") or "")
+        body = marker.group("body") or ""
+        role, question = _parse_worker_question_body(body)
         if not question:
+            continue
+        if _is_worker_question_role_only(body, role, question):
+            continue
+        if _is_worker_question_example(body, question):
             continue
         requests.append(
             {
@@ -672,7 +2433,7 @@ def detect_worker_question_requests(node: WorkflowNode, text: str) -> list[dict[
 def worker_question_role_spec(target_role: str) -> dict[str, str | None]:
     text = target_role.lower()
     if "literature" in text or "research" in text or "文献" in text or "调研" in text:
-        return {"role": "literature scout", "kind": "literature", "skill": "research-lit", "task_type": "research"}
+        return {"role": "literature scout", "kind": "literature", "skill": "openalex-search", "task_type": "research"}
     if "citation" in text or "reference" in text or "引用" in text or "插文献" in text:
         return {"role": "citation inserter", "kind": "citation", "skill": "paper-write", "task_type": "writing"}
     if "review" in text or "critic" in text or "审查" in text or "审阅" in text:
@@ -821,6 +2582,46 @@ def _safe_relative(workspace: Path, path: Path) -> str:
         return path.resolve().relative_to(workspace.resolve()).as_posix()
     except ValueError:
         return str(path)
+
+
+def write_runtime_log_snapshots(
+    workspace: Path,
+    workflow_id: str,
+    *,
+    summary: RuntimeSummary,
+    team_messages: list[TeamMessage],
+    handoffs: list[WorkflowHandoff],
+    blocked_sessions: list[dict[str, Any]],
+) -> None:
+    runtime_dir = workflow_runtime_dir(workspace, workflow_id)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+
+    def write_json(name: str, payload: Any) -> None:
+        (runtime_dir / name).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    snapshots = {
+        "runtime_summary.json": model_dict(summary),
+        "team_messages.json": [model_dict(message) for message in team_messages],
+        "handoffs.json": [model_dict(handoff) for handoff in handoffs],
+        "blocked_sessions.json": blocked_sessions,
+    }
+    for name, payload in snapshots.items():
+        write_json(name, payload)
+
+    write_json(
+        "log_manifest.json",
+        {
+            "generated_at": utc_now(),
+            "workflow_id": workflow_id,
+            "source_logs": {
+                "workflow_events": _safe_relative(workspace, workspace / ".aris" / "web" / "workflows" / workflow_id / "events.jsonl"),
+                "planner_decisions": _safe_relative(workspace, runtime_dir / "decisions.jsonl"),
+                "planner_deltas": _safe_relative(workspace, runtime_dir / "deltas.jsonl"),
+                "artifact_index": _safe_relative(workspace, runtime_dir / "artifact_index.json"),
+            },
+            "snapshots": {name: _safe_relative(workspace, runtime_dir / name) for name in snapshots},
+        },
+    )
 
 
 def _truncate_handoff_preview(value: str, limit: int = HANDOFF_PREVIEW_CHARS) -> str:
@@ -1092,6 +2893,535 @@ def build_team_chat_messages(workspace: Path, record: WorkflowRecord, artifacts:
     return sorted(messages, key=lambda item: item.timestamp)
 
 
+RESEARCH_STATE_SOURCE_NODE_ID = "research-state"
+RESEARCH_STATE_EMPTY_HINTS = (
+    "(none recorded yet)",
+    "none",
+    "n/a",
+    "no open gaps",
+    "no unresolved gaps",
+    "no next actions",
+    "nothing pending",
+)
+DOI_RE = re.compile(r"\b10\.\d{4,9}/[^\s\]\)>\"']+", re.IGNORECASE)
+ARXIV_RE = re.compile(r"\b(?:arxiv:\s*)?\d{4}\.\d{4,5}(?:v\d+)?\b", re.IGNORECASE)
+QUEUE_SECTION_TO_ROLE = {
+    "Search Queue": ("literature", "openalex-search", "research"),
+    "Writing Queue": ("writer", "paper-write", "writing"),
+    "Review Queue": ("reviewer", "research-review", "review"),
+}
+
+
+def _markdown_section_body(text: str, section: str) -> str:
+    match = re.search(rf"^## {re.escape(section)}\s*\n(?P<body>.*?)(?=^## |\Z)", text, flags=re.MULTILINE | re.DOTALL)
+    return match.group("body") if match else ""
+
+
+def _research_state_item_is_actionable(line: str) -> bool:
+    item = re.sub(r"^\s*[-*]\s*", "", line).strip()
+    if not item:
+        return False
+    lowered = item.lower().strip(" .;")
+    if "[resolved" in lowered or "[closed" in lowered or "[resolved_by=" in lowered:
+        return False
+    if "[open]" in lowered:
+        return True
+    if any(hint in lowered for hint in RESEARCH_STATE_EMPTY_HINTS):
+        return False
+    return True
+
+
+def _append_unique_section_items(text: str, section: str, items: list[str]) -> tuple[str, int]:
+    clean_items: list[str] = []
+    for item in items:
+        item = re.sub(r"\s+", " ", item).strip()
+        if not item:
+            continue
+        bullet = item if item.startswith(("- ", "* ")) else f"- {item}"
+        if bullet not in clean_items:
+            clean_items.append(bullet)
+    if not clean_items:
+        return text, 0
+
+    pattern = re.compile(rf"^## {re.escape(section)}\s*\n(?P<body>.*?)(?=^## |\Z)", flags=re.MULTILINE | re.DOTALL)
+    match = pattern.search(text)
+    if match is None:
+        suffix = "" if text.endswith("\n") else "\n"
+        text = f"{text}{suffix}\n## {section}\n\n"
+        match = pattern.search(text)
+        if match is None:
+            return text, 0
+
+    existing_lines = [line.rstrip() for line in match.group("body").splitlines()]
+    retained = [
+        line
+        for line in existing_lines
+        if line.strip() and _research_state_item_is_actionable(line)
+    ]
+    existing_norm = {line.strip().lower() for line in retained}
+    added = [item for item in clean_items if item.strip().lower() not in existing_norm]
+    if not added:
+        return text, 0
+
+    next_body = "\n".join([*retained, *added]).strip() + "\n\n"
+    return text[: match.start("body")] + next_body + text[match.end("body") :], len(added)
+
+
+def _problem_board_issue_id(source_node_id: str, issue: str) -> str:
+    normalized = _clean_gap_query(issue, fallback="problem").lower()
+    digest = hashlib.sha1(f"{source_node_id}\n{normalized}".encode("utf-8")).hexdigest()[:10]
+    return f"pb-{digest}"
+
+
+def _format_problem_board_issue(
+    *,
+    source_node_id: str,
+    issue: str,
+    evidence_ref: str = "",
+    severity: str = "blocking",
+) -> str:
+    cleaned = _clean_gap_query(issue, fallback="reviewer reported a blocking quality issue", max_len=640)
+    problem_id = _problem_board_issue_id(source_node_id, cleaned)
+    ref_text = evidence_ref.strip() or f"event:{source_node_id}"
+    return f"- [open][{severity}][untriaged] id={problem_id} source=`{source_node_id}` refs={ref_text} :: {cleaned}"
+
+
+def _problem_board_item_id(line: str) -> str | None:
+    match = re.search(r"\bid=(pb-[0-9a-f]{10})\b", line)
+    return match.group(1) if match else None
+
+
+def _append_problem_board_items(text: str, items: list[str]) -> tuple[str, int]:
+    if not items:
+        return text, 0
+
+    clean_items: list[str] = []
+    for item in items:
+        item = re.sub(r"\s+", " ", item).strip()
+        if not item:
+            continue
+        bullet = item if item.startswith(("- ", "* ")) else f"- {item}"
+        if bullet not in clean_items:
+            clean_items.append(bullet)
+    if not clean_items:
+        return text, 0
+
+    pattern = re.compile(r"^## Problem Board\s*\n(?P<body>.*?)(?=^## |\Z)", flags=re.MULTILINE | re.DOTALL)
+    match = pattern.search(text)
+    if match is None:
+        suffix = "" if text.endswith("\n") else "\n"
+        text = f"{text}{suffix}\n## Problem Board\n\n"
+        match = pattern.search(text)
+        if match is None:
+            return text, 0
+
+    retained: list[str] = []
+    existing_ids: set[str] = set()
+    existing_norm: set[str] = set()
+    for line in match.group("body").splitlines():
+        stripped = line.rstrip()
+        if not stripped.strip():
+            continue
+        problem_id = _problem_board_item_id(stripped)
+        if problem_id:
+            existing_ids.add(problem_id)
+            retained.append(stripped)
+            existing_norm.add(stripped.strip().lower())
+        elif _research_state_item_is_actionable(stripped):
+            retained.append(stripped)
+            existing_norm.add(stripped.strip().lower())
+
+    added: list[str] = []
+    seen_ids: set[str] = set()
+    for item in clean_items:
+        problem_id = _problem_board_item_id(item)
+        normalized = item.strip().lower()
+        if problem_id:
+            if problem_id in existing_ids or problem_id in seen_ids:
+                continue
+            seen_ids.add(problem_id)
+        elif normalized in existing_norm:
+            continue
+        added.append(item)
+        existing_norm.add(normalized)
+    if not added:
+        return text, 0
+
+    next_body = "\n".join([*retained, *added]).strip() + "\n\n"
+    return text[: match.start("body")] + next_body + text[match.end("body") :], len(added)
+
+
+def _research_state_problem_board_items(state_text: str, *, limit: int = 3) -> list[dict[str, Any]]:
+    body = _markdown_section_body(state_text, "Problem Board")
+    items: list[dict[str, Any]] = []
+    for line in body.splitlines():
+        if not _research_state_item_is_actionable(line):
+            continue
+        stripped = re.sub(r"^\s*[-*]\s*", "", line).strip()
+        lowered = stripped.lower()
+        if "[open]" not in lowered or "[resolved]" in lowered:
+            continue
+        issue = stripped.split("::", 1)[1].strip() if "::" in stripped else stripped
+        issue = _clean_gap_query(issue, fallback="", max_len=640)
+        if len(issue) < 8:
+            continue
+        problem_id = _problem_board_item_id(stripped) or _problem_board_issue_id("problem-board", issue)
+        refs = re.findall(r"(?:artifact|event):[^\s,]+", stripped)
+        source_match = re.search(r"source=`([^`]+)`", stripped)
+        if problem_id in {item["id"] for item in items}:
+            continue
+        items.append(
+            {
+                "id": problem_id,
+                "issue": issue,
+                "line": stripped,
+                "source": source_match.group(1) if source_match else "",
+                "refs": refs,
+                "triaged": "[triaged]" in lowered,
+            }
+        )
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _research_state_problem_board_line(state_text: str, problem_id: str) -> str:
+    if not problem_id:
+        return ""
+    body = _markdown_section_body(state_text, "Problem Board")
+    for line in body.splitlines():
+        if problem_id in line:
+            return re.sub(r"\s+", " ", line).strip()
+    return ""
+
+
+def _focused_artifact_excerpt(workspace: Path, ref: str, *, limit: int = 2600) -> str:
+    if not ref.startswith("artifact:"):
+        return ""
+    rel = ref.split(":", 1)[1].strip()
+    if not rel or rel.endswith((".csv", ".jsonl")):
+        return ""
+    path = workspace / rel
+    try:
+        resolved = path.resolve()
+        workspace_root = workspace.resolve()
+        if workspace_root not in resolved.parents and resolved != workspace_root:
+            return ""
+    except OSError:
+        return ""
+    if not path.exists() or not path.is_file():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    if len(text) <= limit:
+        excerpt = text
+    else:
+        marker = re.search(r"\[(?:PROBLEM_BOARD|Problem Board):", text, flags=re.IGNORECASE)
+        if marker:
+            start = max(0, marker.start() - 600)
+            excerpt = text[start : start + limit]
+        else:
+            excerpt = text[:limit]
+    excerpt = excerpt.strip()
+    if not excerpt:
+        return ""
+    return f"Artifact excerpt from `{rel}`:\n{excerpt}"
+
+
+def _mark_problem_board_issue_resolved(text: str, problem_id: str, resolver_node_id: str) -> tuple[str, bool]:
+    if not problem_id:
+        return text, False
+    lines = text.splitlines()
+    changed = False
+    for index, line in enumerate(lines):
+        if _problem_board_item_id(line) == problem_id:
+            if "[resolved]" in line.lower():
+                continue
+            updated = line.replace("[open]", "[resolved]", 1)
+            updated = updated.replace("[untriaged]", "[triaged]", 1)
+            if "resolved_by=" not in updated:
+                updated = f"{updated} resolved_by=`{resolver_node_id}`"
+            lines[index] = updated
+            changed = True
+            continue
+        if problem_id in line and "[resolved" not in line.lower():
+            lines[index] = f"{line} [resolved_by=`{resolver_node_id}`]"
+            changed = True
+    if not changed:
+        return text, False
+    trailing_newline = "\n" if text.endswith("\n") else ""
+    return "\n".join(lines) + trailing_newline, True
+
+
+def _mark_all_open_problem_board_issues_resolved(text: str, resolver_node_id: str) -> tuple[str, int]:
+    lines = text.splitlines()
+    changed = 0
+    for index, line in enumerate(lines):
+        lowered = line.lower()
+        if "[open]" not in lowered or _problem_board_item_id(line) is None:
+            continue
+        updated = line.replace("[open]", "[resolved]", 1)
+        updated = updated.replace("[untriaged]", "[triaged]", 1)
+        if "resolved_by=" not in updated:
+            updated = f"{updated} resolved_by=`{resolver_node_id}`"
+        lines[index] = updated
+        changed += 1
+    if not changed:
+        return text, 0
+    trailing_newline = "\n" if text.endswith("\n") else ""
+    return "\n".join(lines) + trailing_newline, changed
+
+
+def _research_state_open_gap_queries(state_text: str, *, limit: int = 3) -> list[str]:
+    body = _markdown_section_body(state_text, "Open Gaps")
+    queries: list[str] = []
+    for line in body.splitlines():
+        if not _research_state_item_is_actionable(line):
+            continue
+        item = re.sub(r"^\s*[-*]\s*", "", line).strip()
+        marker = GAP_MARKER_RE.search(item)
+        if marker:
+            item = marker.group("body") or item
+        item = item.split(" — ", 1)[0].strip(" `")
+        query = _clean_gap_query(item, fallback="")
+        if len(query) < 12:
+            continue
+        if query.lower() in {existing.lower() for existing in queries}:
+            continue
+        queries.append(query)
+        if len(queries) >= limit:
+            break
+    return queries
+
+
+def _research_state_queue_items(state_text: str, section: str, *, limit: int = 3) -> list[str]:
+    body = _markdown_section_body(state_text, section)
+    items: list[str] = []
+    item_max_len = 180 if section == "Search Queue" else 640
+    for line in body.splitlines():
+        if not _research_state_item_is_actionable(line):
+            continue
+        item = re.sub(r"^\s*[-*]\s*", "", line).strip()
+        item = item.split(" — ", 1)[0].strip(" `")
+        item = _clean_gap_query(item, fallback="", max_len=item_max_len)
+        if len(item) < 8:
+            continue
+        if item.lower() in {existing.lower() for existing in items}:
+            continue
+        items.append(item)
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _research_state_has_open_work(workspace: Path, workflow_id: str) -> bool:
+    state_text = read_research_state(workspace, workflow_id)
+    if not state_text.strip():
+        return False
+    for section in ("Search Queue", "Writing Queue", "Review Queue"):
+        if _research_state_queue_items(state_text, section, limit=1):
+            return True
+    if _research_state_problem_board_items(state_text, limit=1):
+        return True
+    if _research_state_open_gap_queries(state_text, limit=1):
+        return True
+    for section in ("Next Recommended Actions",):
+        body = _markdown_section_body(state_text, section)
+        if any(_research_state_item_is_actionable(line) for line in body.splitlines()):
+            return True
+    return False
+
+
+def _research_state_has_open_problems(workspace: Path, workflow_id: str) -> bool:
+    return bool(_research_state_problem_board_items(read_research_state(workspace, workflow_id), limit=1))
+
+
+def _research_state_dynamic_node_id(section: str, item: str) -> str:
+    section_slug = _safe_node_slug(section, "queue")
+    item_slug = _safe_node_slug(item, "task")
+    digest = hashlib.sha1(f"{section}\n{item}".encode("utf-8")).hexdigest()[:8]
+    return f"state-{section_slug}-{item_slug[:34]}-{digest}"
+
+
+def default_model_for_role(role_kind: str, skill_id: str | None = None, home: Path = WEB_HOME) -> str | None:
+    role_model = role_model_override(role_kind, home)
+    if role_kind == "literature" or skill_id in LITERATURE_SKILLS:
+        return (
+            os.environ.get("ARIS_WEB_LITERATURE_MODEL")
+            or os.environ.get("ARIS_WEB_MINIMAX_LITERATURE_MODEL")
+            or role_model
+        )
+    if role_kind == "reviewer":
+        return os.environ.get("ARIS_WEB_REVIEWER_MODEL") or role_model
+    if role_kind in {"writer", "citation"}:
+        return os.environ.get("ARIS_WEB_WRITER_MODEL") or role_model
+    if role_kind == "planner":
+        return os.environ.get("ARIS_WEB_PLANNER_MODEL") or role_model
+    return None
+
+
+def _artifact_text_for_state_update(workspace: Path, artifact: ArtifactIndexEntry, *, limit: int = 5000) -> str:
+    path = workspace / artifact.path
+    if path.suffix.lower() not in {".md", ".markdown", ".json", ".txt", ".tex", ".bib"}:
+        return ""
+    try:
+        if path.stat().st_size > 512_000:
+            return ""
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    if path.suffix.lower() == ".json":
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return ""
+        if not isinstance(parsed, dict):
+            return ""
+        gaps = parsed.get("gaps")
+        if isinstance(gaps, list):
+            gap_text = "\n".join(str(item).strip() for item in gaps if str(item).strip())
+            return gap_text[:limit]
+        if isinstance(gaps, str) and gaps.strip():
+            return gaps.strip()[:limit]
+        return ""
+    return text[:limit]
+
+
+def update_research_state_after_node(
+    workspace: Path,
+    record: WorkflowRecord,
+    node: WorkflowNode,
+    *,
+    final_summary: str,
+    artifact_entries: list[ArtifactIndexEntry],
+) -> dict[str, int | str]:
+    path = ensure_research_state(workspace, record.id, title=record.title, goal=record.goal)
+    state_text = path.read_text(encoding="utf-8", errors="replace")
+    node_artifacts = [artifact for artifact in artifact_entries if artifact.producer_node_id == node.id]
+    artifact_paths = [artifact.path for artifact in node_artifacts]
+    resolved_problem_count = 0
+    problem_request_id = ""
+    problem_request_issue = ""
+    if node.research_request and isinstance(node.research_request.get("problem_id"), str):
+        problem_request_id = str(node.research_request["problem_id"]).strip()
+        problem_request_issue = str(node.research_request.get("issue") or node.research_request.get("query") or "").strip()
+
+    artifact_scan_texts = [_artifact_text_for_state_update(workspace, artifact) for artifact in node_artifacts[:6]]
+    scan_texts = [*artifact_scan_texts, final_summary]
+    role_kind = node.team_role_kind or infer_role_kind_for_text(node)
+    if role_kind == "reviewer" and _review_declares_pass_without_blockers("\n".join(scan_texts)):
+        state_text, pass_resolved_count = _mark_all_open_problem_board_issues_resolved(state_text, node.id)
+        resolved_problem_count += pass_resolved_count
+    gap_items: list[str] = []
+    search_queue_items: list[str] = []
+    writing_queue_items: list[str] = []
+    review_queue_items: list[str] = []
+    problem_items: list[str] = []
+    paper_items: list[str] = []
+    for text_index, text in enumerate(scan_texts):
+        if not text.strip():
+            continue
+        for gap in detect_literature_gap_requests(record, node, text):
+            query = gap.get("query", "").strip()
+            if query:
+                gap_items.append(f"`{query}` — {gap.get('gap_type', 'gap')} reported by `{node.id}`")
+                owner = classify_team_work_item(query, gap_type=gap.get("gap_type"))
+                if owner == "literature":
+                    search_queue_items.append(f"`{query}` — requested by `{node.id}`")
+                elif owner == "reviewer":
+                    review_queue_items.append(f"`{query}` — requested by `{node.id}`")
+                elif owner in {"writer", "planner"}:
+                    writing_queue_items.append(f"`{query}` — requested by `{node.id}`")
+        is_summary_scan = text_index >= len(artifact_scan_texts)
+        evidence_ref = f"artifact:{artifact_paths[0]}" if artifact_paths and not is_summary_scan else f"event:{node.id}"
+        for problem in detect_problem_board_issues(record, node, text):
+            if is_summary_scan and problem_items:
+                continue
+            problem_items.append(
+                _format_problem_board_issue(
+                    source_node_id=node.id,
+                    issue=problem["issue"],
+                    evidence_ref=evidence_ref,
+                )
+            )
+        for doi in DOI_RE.findall(text):
+            paper_items.append(f"DOI `{doi.rstrip('.,;')}` — mentioned by `{node.id}`")
+        for arxiv in ARXIV_RE.findall(text):
+            paper_items.append(f"`{arxiv}` — mentioned by `{node.id}`")
+
+    if problem_request_id:
+        if role_kind == "literature" or node.skill in LITERATURE_SKILLS:
+            evidence_note = f" using `{artifact_paths[0]}`" if artifact_paths else ""
+            issue_note = problem_request_issue or research_query_from_request(node.research_request) or "the triaged evidence gap"
+            writing_queue_items.append(
+                f"Revise draft{evidence_note} to resolve Problem Board issue {problem_request_id}: {issue_note}"
+            )
+        else:
+            state_text, resolved = _mark_problem_board_issue_resolved(
+                state_text,
+                problem_request_id,
+                node.id,
+            )
+            resolved_problem_count = 1 if resolved else 0
+            if role_kind in {"writer", "citation"}:
+                issue_note = problem_request_issue or research_query_from_request(node.research_request) or "the triaged writing fix"
+                review_queue_items.append(
+                    f"Review resolution for Problem Board issue {problem_request_id}: {issue_note}"
+                )
+
+    progress_preview = _human_message_preview(final_summary or f"{node.name} finished with status {node.status}.", limit=420)
+    artifact_note = f" Artifacts: {', '.join(artifact_paths[:5])}." if artifact_paths else ""
+    progress_items = [f"{utc_now()} — `{node.id}` ({node.name}): {progress_preview}{artifact_note}"]
+
+    draft_items: list[str] = []
+    role_kind = node.team_role_kind or "worker"
+    if role_kind in {"writer", "citation"} or node.skill in {"paper-write", "paper-plan"}:
+        draft_items.append(f"`{node.id}` updated the draft/research narrative: {progress_preview}")
+
+    next_owner = "planner"
+    if gap_items:
+        next_owner = "literature"
+    elif role_kind == "literature":
+        next_owner = "writer"
+    elif role_kind == "writer":
+        next_owner = "reviewer"
+    elif role_kind == "reviewer":
+        next_owner = "planner"
+    handoff_items = [
+        (
+            f"{utc_now()} — `{node.id}` ({role_kind}) -> `{next_owner}`: "
+            f"{progress_preview}{artifact_note}"
+        )
+    ]
+
+    counts: dict[str, int | str] = {
+        "path": _safe_relative(workspace, path),
+        "progress": 0,
+        "gaps": 0,
+        "search_queue": 0,
+        "writing_queue": 0,
+        "review_queue": 0,
+        "problems": 0,
+        "resolved_problems": resolved_problem_count,
+        "papers": 0,
+        "draft_notes": 0,
+        "handoffs": 0,
+    }
+    state_text, counts["progress"] = _append_unique_section_items(state_text, "Recent Progress Log", progress_items)
+    state_text, counts["gaps"] = _append_unique_section_items(state_text, "Open Gaps", gap_items)
+    state_text, counts["search_queue"] = _append_unique_section_items(state_text, "Search Queue", search_queue_items)
+    state_text, counts["writing_queue"] = _append_unique_section_items(state_text, "Writing Queue", writing_queue_items)
+    state_text, counts["review_queue"] = _append_unique_section_items(state_text, "Review Queue", review_queue_items)
+    state_text, counts["problems"] = _append_problem_board_items(state_text, problem_items)
+    state_text, counts["papers"] = _append_unique_section_items(state_text, "Important Papers", paper_items)
+    state_text, counts["draft_notes"] = _append_unique_section_items(state_text, "Draft Evolution Notes", draft_items)
+    state_text, counts["handoffs"] = _append_unique_section_items(state_text, "Team Handoff Log", handoff_items)
+    path.write_text(state_text, encoding="utf-8")
+    return counts
+
+
 def time_from_stat(value: float) -> str:
     from datetime import datetime, timezone
 
@@ -1151,7 +3481,11 @@ def task_board_column_for_node(node: WorkflowNode, nodes_by_id: dict[str, Workfl
     if node.status in {"blocked", "waiting_dynamic_dependency"}:
         return "blocked"
     if node.status == "queued" and all(
-        dep in nodes_by_id and nodes_by_id[dep].status in SUCCESS_NODE_STATUSES
+        dep in nodes_by_id
+        and (
+            nodes_by_id[dep].status in SUCCESS_NODE_STATUSES
+            or (nodes_by_id[dep].status == "failed" and nodes_by_id[dep].failure_policy == "continue")
+        )
         for dep in node.depends_on
     ):
         return "ready"
@@ -1167,7 +3501,7 @@ def missing_concrete_outputs(workspace: Path, workflow_id: str | WorkflowNode, n
         node = workflow_id  # type: ignore[assignment]
         workflow_id = ""
     missing: list[str] = []
-    for output_path in concrete_output_paths(node.outputs):
+    for output_path in concrete_output_paths(node.outputs, required_only=True):
         resolved = (workflow_output_path(workspace, str(workflow_id), node, output_path) if workflow_id else workspace / output_path).resolve()
         if workspace.resolve() not in [resolved, *resolved.parents]:
             missing.append(output_path.as_posix())
@@ -1281,6 +3615,11 @@ def prepare_graph_for_task_board_run(graph: WorkflowGraph, *, restart: bool = Fa
                         "assistant stream produced no content",
                         "assistant stream ended",
                         "connection",
+                        "entity too large",
+                        "request entity too large",
+                        "context length",
+                        "context window",
+                        "exceeds limit",
                         "rate limit",
                         "timeout",
                         "temporarily unavailable",
@@ -1330,11 +3669,15 @@ def research_template_graph(goal: str, known_skills: set[str] | None = None) -> 
             type="sub_agent",
             name="Map related work",
             role="literature scout",
-            skill=skill("research-lit"),
-            prompt="Search and summarize the most relevant recent work. Save a concise literature map with gaps.",
+            skill=skill(preferred_literature_skill(known_skills)),
+            prompt=(
+                "Use the OpenAlex literature workflow to search, screen, and retain only high-relevance related work. "
+                "Maintain high_relevance_literature.csv as the curated source table, save openalex_query_plan.json for reproducibility, "
+                "and summarize the retained papers and remaining gaps in literature_result.json."
+            ),
             depends_on=["planner"],
             inputs=["problem framing"],
-            outputs=["literature map"],
+            outputs=OPENALEX_LITERATURE_OUTPUTS,
             position={"x": 260, "y": 0},
         ),
         WorkflowNode(
@@ -1411,6 +3754,25 @@ def paper_introduction_template_graph(goal: str, known_skills: set[str] | None =
     def skill(name: str) -> str | None:
         return name if known_skills is None or name in known_skills else None
 
+    intro_reviewer_guidance = (
+        "Academic Introduction review standard: judge the section as a paper Introduction, not a product summary. "
+        "A passable Introduction must first establish the research area and motivate the problem through concrete prior literature: "
+        "representative cited works or verified literature artifacts should show what existing systems do, where they fall short, "
+        "and why that gap matters. Reject generic phrases such as 'several lines of work', 'existing tools', 'prior systems', "
+        "or 'the growing body of work' when they are not tied to specific papers, artifact-backed citations, or a clearly routed "
+        "literature gap. The section may introduce ARIS only after the literature-backed deficiency is clear; it should not mainly "
+        "describe what this paper does, list internal components, or rely on future sections as evidence. Contributions should be "
+        "short, causal responses to the identified gap, not a feature inventory. Citation discipline: every factual claim about prior "
+        "work, novelty, dominance, limitations of existing methods, or comparison to other systems needs a concrete citation/source; "
+        "do not accept bare \\cite{}, fake citation keys, '(e.g., ...)' without source names, or citation gaps as non-blocking watch items. "
+        "If the draft lacks concrete prior-work citations for the motivation/gap, record a Problem Board blocker for Literature Scout "
+        "or Writer triage instead of passing. claim-to-citation audit: include a compact table in the review with columns "
+        "`location`, `claim`, `current citation/source`, `source relevance`, and `verdict`. Mark a claim as BLOCKING when the "
+        "citation is missing, only loosely related, unverifiable in the OpenAlex/high-relevance literature artifacts, or used to "
+        "support a stronger claim than the source actually supports. Do not give a pass based only on prose quality or reference "
+        "list completeness; the claim-level evidence match is the gate."
+    )
+
     planner_prompt = (
         "Act only as the Introduction control-plane planner. Do not read full paper materials or artifact contents. "
         "Use the team chat updates, task status, and artifact references available in the prompt. "
@@ -1421,6 +3783,10 @@ def paper_introduction_template_graph(goal: str, known_skills: set[str] | None =
         "as [LITERATURE_NEEDED: focused search query]. Mark non-literature support gaps as "
         "[ASK_WORKER: writer | focused evidence question]. "
         f"User goal:\n{goal}"
+    )
+    intro_literature_query = _clean_gap_query(
+        goal,
+        fallback="multi-agent research writing frameworks evidence-gated academic paper writing",
     )
     nodes = [
         WorkflowNode(
@@ -1445,6 +3811,45 @@ def paper_introduction_template_graph(goal: str, known_skills: set[str] | None =
             position={"x": 0, "y": 100},
         ),
         WorkflowNode(
+            id="intro-literature",
+            type="sub_agent",
+            name="Search introduction evidence",
+            role="literature scout",
+            skill=skill(preferred_literature_skill(known_skills)),
+            task_type="research",
+            team_role_kind="literature",
+            scope="Run the fixed OpenAlex literature workflow, maintain a high-relevance CSV, and hand verified evidence to Writer.",
+            objective="Build the curated OpenAlex literature evidence table that the Introduction writer must cite.",
+            acceptance_criteria=[
+                "openalex_query_plan.json contains executable OpenAlex works searches derived from the goal and INTRO_PLAN.md",
+                "openalex_candidates_title_abstract.csv downloads up to the first 500 relevance-ranked works per query before screening",
+                "openalex_abstract_review_batches.csv records 50-paper abstract review batches with at most 3 parallel reader slots",
+                "high_relevance_literature.csv contains at least one retained high-relevance paper row",
+                "literature_result.json summarizes retained papers, supported claims, remaining gaps, and artifact refs",
+                "No citation key is proposed without DOI, OpenAlex ID, title, or other resolvable source metadata",
+            ],
+            assignee_role="literature scout",
+            priority=2,
+            prompt=(
+                "Run the fixed OpenAlex literature workflow before any Writer drafts the Introduction. "
+                "Use the user goal and INTRO_PLAN.md to create 2-5 focused OpenAlex works searches. "
+                "Download up to the first 500 relevance-ranked OpenAlex works per query into openalex_candidates_title_abstract.csv, "
+                "then review abstracts in 50-paper batches until all downloaded candidates have been checked; "
+                "parallel abstract reading is allowed only up to 3 batches at a time. Screen title/abstract/venue/year for direct relevance to the Introduction's prior-work, "
+                "motivation, gap, and contribution claims, and retain only high-relevance papers in high_relevance_literature.csv. "
+                "Save openalex_query_plan.json for reproducibility and literature_result.json as the compact handoff for Writer and Reviewer. "
+                "If you cannot retain at least one directly relevant paper, mark literature_result.json status='inconclusive'; "
+                "the workflow will stop Writer rather than allowing citation-free prose."
+            ),
+            depends_on=["intro-planner"],
+            inputs=["INTRO_PLAN.md"],
+            outputs=OPENALEX_LITERATURE_OUTPUTS,
+            research_request={"query": intro_literature_query, "source": "intro_template_evidence_gate"},
+            auto_approve_after=True,
+            failure_policy="halt",
+            position={"x": 320, "y": 0},
+        ),
+        WorkflowNode(
             id="draft-introduction",
             type="sub_agent",
             name="Draft LaTeX introduction",
@@ -1456,23 +3861,28 @@ def paper_introduction_template_graph(goal: str, known_skills: set[str] | None =
             objective="Draft the paper introduction from approved context, outline, and any dynamically inserted literature results.",
             acceptance_criteria=[
                 "INTRODUCTION_DRAFT.md is written at the declared output path",
-                "Claims are grounded in available evidence or explicitly marked as needing literature",
-                "Citation placeholders are used only for known sources",
+                "INTRODUCTION_DRAFT.md contains only paper-section prose, not workflow notes or team handoffs",
+                "Claims are grounded in the current workflow's high_relevance_literature.csv rows",
+                "Citation placeholders are used only for sources present in current workflow literature artifacts",
             ],
             assignee_role="writer",
-            priority=2,
+            priority=3,
             prompt=(
-                "Draft only the paper Introduction from INTRO_PLAN.md and any dynamic literature artifacts already connected upstream. "
+                "Draft only the paper Introduction from INTRO_PLAN.md and the current workflow's literature artifacts. "
                 "You must write INTRODUCTION_DRAFT.md at the mapped node output path. "
+                "INTRODUCTION_DRAFT.md must contain only the paper-section prose for the Introduction; do not include status labels, "
+                "Problem Board summaries, blocker lists, role handoffs, or notes about what you received. "
                 "Do not use WebSearch/WebFetch; citation discovery belongs to the literature scout. "
-                "Use concrete claims grounded in available evidence, preserve citation placeholders only when the cited source is known, "
-                "and avoid generic hype. If drafting needs literature that is not yet available, write [LITERATURE_NEEDED: focused search query] "
+                "Use concrete claims grounded in high_relevance_literature.csv, preserve citation placeholders only when the cited source is present in that CSV or literature_result.json, "
+                "and do not read or import drafts from sibling `.aris/web/workflows/*` directories. "
+                "Avoid generic hype. Do not use unresolved generic draft language such as target task, target application, target benchmark, "
+                "具体应用场景, 目标任务, 待补充, or 待填充 in the introduction prose. If drafting needs literature that is not yet available, write [LITERATURE_NEEDED: focused search query] "
                 "instead of filling in invented citations."
             ),
-            depends_on=["intro-planner"],
-            inputs=["INTRO_PLAN.md"],
+            depends_on=["intro-literature"],
+            inputs=["INTRO_PLAN.md", "literature_result.json", "high_relevance_literature.csv", "openalex_query_plan.json"],
             outputs=["INTRODUCTION_DRAFT.md"],
-            position={"x": 320, "y": 100},
+            position={"x": 640, "y": 100},
         ),
         WorkflowNode(
             id="review-introduction",
@@ -1487,25 +3897,26 @@ def paper_introduction_template_graph(goal: str, known_skills: set[str] | None =
             acceptance_criteria=[
                 "INTRO_REVIEW.md lists prioritized pass/rework findings",
                 "Unsupported claims and citation gaps are tied to concrete text locations",
-                "Follow-up work is expressed as focused ASK_WORKER questions for the planner to route",
-                "Every non-passing review round contains at least one concrete planner-routed question",
+                "INTRO_REVIEW.md contains a claim-to-citation audit table that checks relevance, not just citation presence",
+                "Blocking follow-up work is recorded as Problem Board issues for the planner to triage",
+                "Every non-passing review round contains at least one concrete Problem Board issue",
             ],
             assignee_role="reviewer",
-            priority=3,
+            priority=4,
             prompt=(
                 "Review the drafted Introduction for unsupported claims, weak motivation, unclear novelty, citation gaps, "
                 "and mismatch between evidence and promises. You must save INTRO_REVIEW.md with prioritized fixes. "
+                f"{intro_reviewer_guidance} "
                 "Do not directly assign the next worker and do not use WebSearch/WebFetch. "
-                "If a fix requires fresh literature search, citation insertion, or writer revision, include explicit planner-routed "
-                "questions in both INTRO_REVIEW.md and the final summary using "
-                "[ASK_WORKER: literature scout | focused search query], [ASK_WORKER: citation inserter | concrete citation task], "
-                "or [ASK_WORKER: writer | concrete revision task]. "
-                "Keep asking concrete questions until the Introduction can pass without blocking evidence or citation gaps."
+                "If a fix requires fresh literature search, citation insertion, or writer revision, record the underlying blocking "
+                "problem in both INTRO_REVIEW.md and the final summary using [PROBLEM_BOARD: concise blocking issue]. "
+                "Treat generic unresolved introduction language (target task/application/benchmark, 具体应用场景, 目标任务, 待补充, 待填充) as blocking, not as a watch item. "
+                "Keep surfacing concrete issues until the Introduction can pass without blocking evidence or citation gaps."
             ),
             depends_on=["draft-introduction"],
-            inputs=["introduction draft"],
+            inputs=["introduction draft", "literature_result.json", "high_relevance_literature.csv"],
             outputs=["INTRO_REVIEW.md"],
-            position={"x": 640, "y": 0},
+            position={"x": 960, "y": 0},
         ),
         WorkflowNode(
             id="revise-introduction",
@@ -1519,20 +3930,25 @@ def paper_introduction_template_graph(goal: str, known_skills: set[str] | None =
             objective="Revise the introduction using review findings and any dynamically added literature evidence.",
             acceptance_criteria=[
                 "INTRODUCTION_REVISED.md incorporates review fixes",
+                "INTRODUCTION_REVISED.md contains only paper-section prose, not workflow notes or team handoffs",
                 "INTRO_REVISION_SUMMARY.md explains the changes and remaining risks",
                 "Unsupported claims are removed, softened, or backed by available evidence",
             ],
             assignee_role="writer",
-            priority=4,
+            priority=5,
             prompt=(
                 "Revise the Introduction using INTRO_REVIEW.md. Keep changes local to the Introduction artifact, "
                 "remove or soften unsupported claims, and write INTRODUCTION_REVISED.md plus INTRO_REVISION_SUMMARY.md explaining the changes. "
-                "Do not use WebSearch/WebFetch; leave unresolved citation checks as [LITERATURE_NEEDED: focused query] for the planner to route."
+                "INTRODUCTION_REVISED.md must contain only final paper-section prose; do not include status labels, 'Blockers and Evidence Gaps', "
+                "'Role; What I Received', Problem Board summaries, handoff notes, or process commentary. Put all blockers, risks, and handoff notes only in INTRO_REVISION_SUMMARY.md. "
+                "Use only current workflow literature artifacts for citations; do not remove citations as a substitute for verification, and do not read sibling workflow drafts. "
+                "Do not use WebSearch/WebFetch; leave unresolved citation checks as [LITERATURE_NEEDED: focused query] for the planner to route. "
+                "The revised prose must not contain target task, target application, target benchmark, 具体应用场景, 目标任务, 待补充, or 待填充."
             ),
             depends_on=["review-introduction"],
-            inputs=["introduction draft", "INTRO_REVIEW.md"],
+            inputs=["introduction draft", "INTRO_REVIEW.md", "literature_result.json", "high_relevance_literature.csv"],
             outputs=["INTRODUCTION_REVISED.md", "INTRO_REVISION_SUMMARY.md"],
-            position={"x": 960, "y": 100},
+            position={"x": 1280, "y": 100},
         ),
         WorkflowNode(
             id="final-review-introduction",
@@ -1546,23 +3962,25 @@ def paper_introduction_template_graph(goal: str, known_skills: set[str] | None =
             objective="Review the revised Introduction and keep surfacing concrete questions until remaining blockers are routed.",
             acceptance_criteria=[
                 "FINAL_INTRO_REVIEW.md states pass/rework status after revision",
-                "Remaining blockers are phrased as ASK_WORKER questions for planner routing",
+                "FINAL_INTRO_REVIEW.md contains a claim-to-citation audit table over the revised Introduction",
+                "Remaining blockers are recorded as Problem Board issues for planner triage",
                 "If no blocker remains, the review records pass status plus non-blocking watch items",
             ],
             assignee_role="reviewer",
-            priority=5,
+            priority=6,
             prompt=(
                 "Review INTRODUCTION_REVISED.md after the writer revision. You must save FINAL_INTRO_REVIEW.md. "
                 "Act as the team's persistent reviewer: look for at least one concrete unresolved issue in citations, evidence, "
-                "claim strength, or logical flow. If the issue blocks approval, write it as a planner-routed question using "
-                "[ASK_WORKER: literature scout | focused search query], [ASK_WORKER: citation inserter | concrete citation task], "
-                "or [ASK_WORKER: writer | concrete revision task] in both FINAL_INTRO_REVIEW.md and the final summary. "
-                "If no blocking issue remains, state PASS and list only non-blocking watch items without ASK_WORKER markers."
+                "claim strength, or logical flow. If the issue blocks approval, write it as [PROBLEM_BOARD: concise blocking issue] "
+                "in both FINAL_INTRO_REVIEW.md and the final summary. "
+                f"{intro_reviewer_guidance} "
+                "Generic unresolved introduction language such as target task/application/benchmark, 具体应用场景, 目标任务, 待补充, or 待填充 is blocking and must not be downgraded to a watch item. "
+                "If no blocking issue remains, state PASS and list only non-blocking watch items without Problem Board markers."
             ),
             depends_on=["revise-introduction"],
-            inputs=["INTRODUCTION_REVISED.md", "INTRO_REVISION_SUMMARY.md"],
+            inputs=["INTRODUCTION_REVISED.md", "INTRO_REVISION_SUMMARY.md", "literature_result.json", "high_relevance_literature.csv"],
             outputs=["FINAL_INTRO_REVIEW.md"],
-            position={"x": 1280, "y": 0},
+            position={"x": 1600, "y": 0},
         ),
         WorkflowNode(
             id="approve-introduction",
@@ -1576,13 +3994,13 @@ def paper_introduction_template_graph(goal: str, known_skills: set[str] | None =
                 "Review findings and revision summary have been inspected",
             ],
             assignee_role="human reviewer",
-            priority=5,
+            priority=7,
             prompt=(
                 "Inspect the revised Introduction, INTRO_REVIEW.md, and INTRO_REVISION_SUMMARY.md. "
                 "Approve when the Introduction is coherent enough to feed the rest of the paper-writing flow."
             ),
             depends_on=["final-review-introduction"],
-            position={"x": 1600, "y": 100},
+            position={"x": 1920, "y": 100},
         ),
     ]
     return normalize_workflow_graph(WorkflowGraph(nodes=nodes), known_skills)
@@ -1643,12 +4061,12 @@ Use 5-7 tasks. Use type="input" for user-supplied global context nodes that ever
 Use type="agent" only for planning/manager tasks that decide what should happen next.
 Use type="sub_agent" for independent role-agent tasks such as literature search, implementation, analysis, writing, or review.
 	Use type="human_gate" for visible human checkpoints and set task_type="gate".
-	Team protocol: keep scope as the role's core range only. Planner/manager reads human-language updates and routes work; workers must not call the planner. Literature, writing, and citation workers should set can_ask_questions=false and can_clone_workers=true. Reviewer tasks may ask questions but should not execute fixes.
+	Team protocol: keep scope as the role's core range only. Planner/manager reads human-language updates and routes work; workers must not call the planner. Literature, writing, and citation workers should set can_ask_questions=false and can_clone_workers=true. Reviewer tasks record blocking issues on the Problem Board and should not execute fixes or assign workers.
 	Include at least one reviewer task before a human checkpoint; reviewer tasks must have task_type="review" and acceptance criteria about evidence quality.
 Include at least one human_gate before expensive implementation and one human_gate after review when the goal implies implementation or publication work.
 For input and human_gate nodes set skill to null and gate to "none".
-For executable nodes, prefer inheriting a skill over writing a long prompt: planning -> paper-plan, research -> research-lit, OpenAlex metadata/export search -> openalex-search, writing -> paper-write, review -> research-review.
-Do not force every workflow through a fixed literature-search role. Add a static literature/search node only when literature review is itself a primary deliverable or must happen before any other task. Otherwise, instruct roles to emit [LITERATURE_NEEDED: focused query] or [EVIDENCE_NEEDED: focused question] in their artifacts; the runtime Manager can then insert a dynamic Literature task and resume the blocked role.
+For executable nodes, prefer inheriting a skill over writing a long prompt: planning -> paper-plan, literature/citation research -> openalex-search, general research -> research-lit, writing -> paper-write, review -> research-review.
+Do not force every workflow through a fixed literature-search role. Add a static literature/search node only when literature review is itself a primary deliverable or must happen before any other task. Otherwise, instruct roles to emit [LITERATURE_NEEDED: focused query], [EVIDENCE_NEEDED: focused question], or [PROBLEM_BOARD: concise blocking issue] in their artifacts; the runtime Manager can then diagnose the issue and route dynamic follow-up to the right team role.
 For sub_agent nodes, assume a fresh isolated run with no memory beyond declared upstream outputs and artifacts.
 When a planner/keyword node produces a variable-length JSON array, create one template sub_agent with a fanout object:
   "fanout": {{"source": "keyword-node-id", "path": "keyword_groups", "name_template": "Literature search: {{{{item.name}}}}", "max_items": 12}}
@@ -1889,11 +4307,11 @@ Use type="agent" only for planning/manager tasks that decide what should happen 
 Use type="input" for user-supplied global context nodes that every execution task should read.
 	Use type="sub_agent" for independent role-agent tasks such as literature search, implementation, analysis, writing, or review.
 	Use type="human_gate" for visible human checkpoints and set task_type="gate".
-	Team protocol: keep scope as the role's core range only. Planner/manager reads human-language updates and routes work; workers must not call the planner. Literature, writing, and citation workers should set can_ask_questions=false and can_clone_workers=true. Reviewer tasks may ask questions but should not execute fixes.
-	Reviewer tasks must have task_type="review" and acceptance criteria about evidence quality, pass/rework decisions, or follow-up task creation.
+	Team protocol: keep scope as the role's core range only. Planner/manager reads human-language updates and routes work; workers must not call the planner. Literature, writing, and citation workers should set can_ask_questions=false and can_clone_workers=true. Reviewer tasks record blocking issues on the Problem Board and should not execute fixes or assign workers.
+	Reviewer tasks must have task_type="review" and acceptance criteria about evidence quality, pass/rework decisions, or Problem Board issue creation.
 For input and human_gate nodes set skill to null and gate to "none".
-For executable nodes, prefer inheriting a skill over writing a long prompt: planning -> paper-plan, research -> research-lit, OpenAlex metadata/export search -> openalex-search, writing -> paper-write, review -> research-review.
-Do not turn the graph into a mandatory linear literature-first pipeline unless the user explicitly asked for that. Keep literature/search as on-demand dynamic work when a role discovers missing citation or evidence needs; those roles should write [LITERATURE_NEEDED: focused query] or [EVIDENCE_NEEDED: focused question] into their declared artifacts.
+For executable nodes, prefer inheriting a skill over writing a long prompt: planning -> paper-plan, literature/citation research -> openalex-search, general research -> research-lit, writing -> paper-write, review -> research-review.
+Do not turn the graph into a mandatory linear literature-first pipeline unless the user explicitly asked for that. Keep literature/search as on-demand dynamic work when a role discovers missing citation needs; use [EVIDENCE_NEEDED: focused question] or [PROBLEM_BOARD: concise blocking issue] for non-literature evidence, writing, or review follow-up.
 For sub_agent nodes, assume a fresh isolated run with no memory beyond declared upstream outputs and artifacts.
 When the new requirements need variable-length parallel work based on upstream output, use a fanout template sub_agent:
   "fanout": {{"source": "keyword-node-id", "path": "keyword_groups", "name_template": "Literature search: {{{{item.name}}}}", "max_items": 12}}
@@ -2535,6 +4953,51 @@ def _render_port_templates(ports: list[Any], item: Any, index: int) -> list[Any]
     return rendered
 
 
+def _node_depends_on(graph: WorkflowGraph, source_id: str, target_id: str) -> bool:
+    nodes_by_id = {node.id: node for node in graph.nodes}
+    seen: set[str] = set()
+    stack = list(nodes_by_id.get(source_id).depends_on if source_id in nodes_by_id else [])
+    while stack:
+        current = stack.pop()
+        if current == target_id:
+            return True
+        if current in seen:
+            continue
+        seen.add(current)
+        dep = nodes_by_id.get(current)
+        if dep is not None:
+            stack.extend(dep.depends_on)
+    return False
+
+
+def _is_final_quality_review_node(node: WorkflowNode) -> bool:
+    label = f"{node.id} {node.name} {node.objective or ''}".lower()
+    return (
+        node.type != "human_gate"
+        and (node.team_role_kind == "reviewer" or node.task_type == "review")
+        and ("final" in label or "approval" in label or "approve" in label)
+    )
+
+
+def attach_dynamic_followup_to_quality_gates(graph: WorkflowGraph, new_node: WorkflowNode) -> list[str]:
+    """Make planner-created follow-up work complete before final review or approval."""
+
+    if not new_node.dynamic_parent_id:
+        return []
+    attached: list[str] = []
+    for target in graph.nodes:
+        if target.id == new_node.id or target.status != "queued":
+            continue
+        should_wait = _is_final_quality_review_node(target) or target.type == "human_gate"
+        if not should_wait or new_node.id in target.depends_on:
+            continue
+        if _node_depends_on(graph, new_node.id, target.id):
+            continue
+        target.depends_on.append(new_node.id)
+        attached.append(target.id)
+    return attached
+
+
 class WorkflowEventBus:
     def __init__(self) -> None:
         self._subscribers: dict[str, set[asyncio.Queue[WorkflowEvent]]] = {}
@@ -2710,6 +5173,14 @@ class WorkflowManager:
             policy_rejection_count=rejection_count,
             last_event_at=events[-1].timestamp if events else None,
         )
+        write_runtime_log_snapshots(
+            workspace,
+            workflow_id,
+            summary=summary,
+            team_messages=team_messages,
+            handoffs=handoffs,
+            blocked_sessions=blocked_sessions,
+        )
         return WorkflowRuntimeResponse(
             workflow_id=workflow_id,
             runtime_policy=self.runtime_policy(workspace, workflow_id),
@@ -2841,6 +5312,7 @@ class WorkflowManager:
         normalized = normalize_workflow_graph(graph or workflow_template_graph(template, goal, skills), skills)
         record = create_workflow_record(workspace, title, goal, normalized)
         insert_workflow(record)
+        state_path = ensure_research_state(workspace, record.id, title=record.title, goal=record.goal)
         await self._append_event(
             workspace,
             WorkflowEvent(
@@ -2848,7 +5320,7 @@ class WorkflowManager:
                 timestamp=utc_now(),
                 event_type="workflow",
                 message="Workflow created",
-                payload={"status": record.status},
+                payload={"status": record.status, "research_state_path": _safe_relative(workspace, state_path)},
             ),
         )
         return record
@@ -3651,6 +6123,8 @@ class WorkflowManager:
             }
             for artifact in artifacts[:40]
         ]
+        ensure_research_state(workspace, record.id, title=record.title, goal=record.goal)
+        research_state = compact_research_state_pack(workspace, record.id, limit=8000)
         return "\n".join(
             [
                 "You are the persistent Manager/Planner Agent for an ARIS Web task board runtime.",
@@ -3660,16 +6134,22 @@ class WorkflowManager:
                 "Rules:",
                 "- Keep the graph acyclic.",
                 "- Only the Manager/Planner may change the task dependency graph.",
+                "- Act as a team dispatcher: decide the next owner, not the full content solution.",
+                "- Do not search literature, write paper text, or review claims yourself; route that work to Literature, Writer, or Reviewer roles.",
                 "- New dynamic work must be a stateless sub_agent task with objective, assignee_role, acceptance_criteria, and expected artifacts.",
-                "- Use skill research-lit for literature gaps, research-review for reviewer follow-up, paper-write for writing, and null/ad-hoc skill only when no bundled skill fits.",
+                "- Use skill openalex-search for literature/citation gaps, research-review for reviewer follow-up, paper-write for writing, and null/ad-hoc skill only when no bundled skill fits.",
                 "- The dependency graph is only the current PlanSnapshot; history belongs to the EventLog and DeltaHistory.",
                 "- Every tick must produce a Decision Card. Use decision_type=noop when no mutation is justified.",
                 "- Dynamic add_node requests must cite gap_evidence_refs or source_artifact_refs; without evidence choose noop.",
                 "- Planner context is control-plane only: use Team chat messages, task status, and artifact references. Do not request or rely on raw full artifact text.",
-                "- When a planner/reviewer needs content details, route a worker question as a focused sub_agent instead of reading full text yourself.",
+                "- When the planner needs content details, route a worker question as a focused sub_agent instead of reading full text yourself.",
                 "- Use add_node plus block_node when a task needs new evidence, rework, review, code, literature, or analysis before it can continue.",
+                "- Use the Research State as the long-term memory of direction, claims, open gaps, and next actions across workflow rounds.",
+                "- Treat Search Queue as Literature work, Writing Queue as Writer work, and Review Queue as Reviewer work.",
+                "- Treat Problem Board as Planner-owned blocking issue intake: diagnose whether each issue needs Literature, Writer, or Reviewer work before assigning a worker.",
+                "- Reviewers do not dispatch workers. If reviewer output contains blocking issues, preserve them as Problem Board items and let Planning choose the next owner.",
                 "- Use resume_node only when a waiting_dynamic_dependency task has all dynamic dependencies complete.",
-                "- If a waiting_approval planning/writing/review task produced artifacts that explicitly mention evidence gaps, citation gaps, missing citations, literature needs, [EVIDENCE_NEEDED], unsupported claims, failed acceptance criteria, or reviewer-requested rework, insert a focused follow-up task and block that caller before human approval.",
+                "- If a waiting_approval planning/writing/review task produced artifacts that explicitly mention evidence gaps, citation gaps, missing citations, literature needs, [EVIDENCE_NEEDED], unsupported claims, failed acceptance criteria, or reviewer blocking issues, first record/consult the Problem Board, then insert a focused follow-up task when the next owner is clear.",
                 "- Do not add work only because a task is waiting for ordinary approval; require a concrete gap from events, artifacts, or the Research Wiki.",
                 "- Do not delete static nodes, rewrite user static definitions, or bypass human gates.",
                 "- Prefer no deltas when the current DAG can proceed.",
@@ -3688,7 +6168,7 @@ class WorkflowManager:
                 '  "resume_plan": "how the caller session should continue after research",',
                 '  "complete": false,',
                 '  "deltas": [',
-                '    {"action":"add_node","node":{"id":"follow-up-task","type":"sub_agent","name":"...","role":"...","skill":"research-lit|null","task_type":"research|analysis|coding|writing|review","objective":"...","acceptance_criteria":["..."],"assignee_role":"...","prompt":"...","outputs":[{"name":"artifact.md","type":"file"}],"dynamic_parent_id":"caller"},"research_request":{"query":"..."},"gap_evidence_refs":["artifact:..."],"expected_artifacts":["artifact.md"],"refresh":false},',
+                '    {"action":"add_node","node":{"id":"follow-up-task","type":"sub_agent","name":"...","role":"...","skill":"openalex-search|null","task_type":"research|analysis|coding|writing|review","objective":"...","acceptance_criteria":["..."],"assignee_role":"...","prompt":"...","outputs":[{"name":"artifact.md","type":"file"}],"dynamic_parent_id":"caller"},"research_request":{"query":"..."},"gap_evidence_refs":["artifact:..."],"expected_artifacts":["artifact.md"],"refresh":false},',
                 '    {"action":"add_edge","source":"node-a","target":"node-b"},',
                 '    {"action":"block_node","node_id":"caller","wait_for":["lit-node"],"reason":"...","resume_plan":"..."},',
                 '    {"action":"resume_node","node_id":"caller","reason":"..."},',
@@ -3711,6 +6191,9 @@ class WorkflowManager:
                 "",
                 "Artifact reference index (do not treat this as a full-text dump):",
                 json.dumps(artifact_refs, ensure_ascii=False, indent=2),
+                "",
+                "Research State (long-term working memory; concise, human-curated by runtime):",
+                research_state,
                 "",
                 "Research Wiki state:",
                 "initialized" if (workspace / "research-wiki").exists() else "not initialized",
@@ -3844,23 +6327,35 @@ class WorkflowManager:
         if not prompt:
             prompt = "\n".join(
                 [
-                    "Run a focused, stateless literature research task for the workflow.",
+                    "Run the fixed Literature Scout OpenAlex workflow for this routed evidence gap.",
                     f"Research query: {query}",
-                    "This is one precise routed question. Do not broaden it into a general survey.",
+                    "This is one precise routed question. Use OpenAlex as the primary source; do not fall back to generic WebSearch unless OpenAlex is unreachable and the result is marked inconclusive.",
+                    "",
+                    "Fixed workflow:",
+                    "1. Translate the query into 2-4 explicit OpenAlex works searches and save them in openalex_query_plan.json.",
+                    "2. Download up to the first 500 relevance-ranked OpenAlex works per query into openalex_candidates_title_abstract.csv before screening.",
+                    "3. Review downloaded abstracts in batches of 50 until every candidate has been checked; if cloning/parallelizing readers, run no more than 3 abstract-reading batches at once.",
+                    "4. Screen title/abstract/venue/year/citation count against the routed claim gap.",
+                    "5. Keep only high-relevance papers in high_relevance_literature.csv; exclude broad, off-topic, or unverifiable matches.",
+                    "6. Maintain the CSV across refreshes: dedupe by DOI first, then OpenAlex ID/title; preserve existing high-relevance rows unless a row is now clearly irrelevant.",
+                    "7. Save literature_result.json as the compact handoff for Writer/Reviewer, with citations, claim support, gaps, and artifact_refs pointing to the candidate CSV, batch log, retained CSV, and query plan.",
                     "",
                     "Deliverables:",
-                    "- Save literature_result.json with keys: query, papers, findings, gaps, sources, wiki_refs, artifact_refs.",
-                    "- If searches fail or the requested citation cannot be verified after 3 search/fetch failures, still save literature_result.json with status='inconclusive', papers=[], gaps explaining the failure, and sources tried.",
+                    f"- Save high_relevance_literature.csv with header: {HIGH_RELEVANCE_LITERATURE_CSV_HEADER}.",
+                    f"- Save openalex_candidates_title_abstract.csv with header: {OPENALEX_CANDIDATE_ABSTRACT_CSV_HEADER}.",
+                    f"- Save openalex_abstract_review_batches.csv with header: {OPENALEX_ABSTRACT_REVIEW_BATCH_CSV_HEADER}.",
+                    "- Save openalex_candidates_raw.jsonl with one raw OpenAlex candidate record per line when possible.",
+                    "- Save openalex_query_plan.json with the exact query groups, filters, and screening criteria.",
+                    "- Save literature_result.json with keys: query, status, papers, findings, gaps, sources, csv_path, candidate_csv_path, abstract_review_batches_path, query_plan_path, query_stats, wiki_refs, artifact_refs.",
+                    "- If OpenAlex fails or the requested citation cannot be verified, still save all declared artifacts: empty-header CSVs, the attempted query plan, and literature_result.json with status='inconclusive', papers=[], gaps explaining the failure, and sources tried.",
                     "- If research-wiki/ exists, upsert the relevant paper metadata and findings into it.",
-                    "- Return concise citations and source URLs where available. Do not invent citations.",
+                    "- Return concise citations, DOI/OpenAlex IDs, and source URLs where available. Do not invent citations.",
                     "- Final summary must be a short human-language update plus artifact path, not the full JSON.",
                 ]
             )
         if request and "Research request JSON:" not in prompt:
             prompt = f"{prompt}\n\nResearch request JSON:\n{json.dumps(request, ensure_ascii=False, indent=2)}"
-        requested_skill = (node.skill if node and node.skill in LITERATURE_SKILLS else None) or (
-            "openalex-search" if "openalex" in query.lower() else "research-lit"
-        )
+        requested_skill = preferred_literature_skill()
 
         update = {
             "id": node_id,
@@ -3869,15 +6364,16 @@ class WorkflowManager:
             "role": (node.role if node and node.role.strip() else "literature scout"),
             "skill": requested_skill,
             "prompt": prompt,
+            "model": (node.model if node and node.model else None) or default_model_for_role("literature", requested_skill),
             "depends_on": list(node.depends_on if node else []),
-            "outputs": [{"name": "literature_result.json", "type": "file", "required": True}],
+            "outputs": OPENALEX_LITERATURE_OUTPUTS,
             "auto_approve_after": True,
             "dynamic_parent_id": caller_id,
             "dynamic_reason": delta.reason or (node.dynamic_reason if node else None) or "Planner requested literature research",
             "research_request": request or {"query": query},
             "concurrency_class": "literature",
-            "failure_policy": "continue",
-            "timeout_seconds": node.timeout_seconds if node and node.timeout_seconds is not None else 180,
+            "failure_policy": node.failure_policy if node and node.failure_policy else "continue",
+            "timeout_seconds": node.timeout_seconds if node and node.timeout_seconds is not None else 420,
             "position": (node.position if node and node.position else {"x": 120, "y": 320}),
         }
         update.update(protocol_defaults("literature"))
@@ -3929,8 +6425,134 @@ class WorkflowManager:
             for item in graph.nodes
         )
 
+    def _local_writer_evidence_gate_decision(self, workspace: Path, record: WorkflowRecord) -> PlannerDecision | None:
+        graph = record.graph_json
+        nodes_by_id = {node.id: node for node in graph.nodes}
+        evidence = current_workflow_literature_evidence(workspace, record)
+        if evidence["valid"]:
+            return None
+
+        for node in graph.nodes:
+            if node.status != "queued" or not writer_requires_literature_evidence(record, node):
+                continue
+            if not all(
+                dep in nodes_by_id
+                and (
+                    nodes_by_id[dep].status in SUCCESS_NODE_STATUSES
+                    or (nodes_by_id[dep].status == "failed" and nodes_by_id[dep].failure_policy == "continue")
+                )
+                for dep in node.depends_on
+            ):
+                continue
+            if self._caller_has_pending_dynamic_work(graph, node.id):
+                continue
+            query = writer_literature_gate_query(record, node)
+            lit_id = dynamic_literature_node_id(node.id, query)
+            if lit_id in nodes_by_id:
+                if lit_id not in node.depends_on:
+                    return PlannerDecision(
+                        rationale=f"{node.name} requires verified literature evidence before writing.",
+                        decision_type="mutate",
+                        confidence=0.9,
+                        gap_type="literature_gap",
+                        gap_evidence_refs=[f"node:{node.id}"],
+                        dynamic_reason="Writer evidence gate found no valid high-relevance literature CSV",
+                        affected_session_ids=[_session_id_for_node(record.id, node)],
+                        blocked_node_ids=[node.id],
+                        expected_artifacts=["literature_result.json", "high_relevance_literature.csv", "openalex_candidates_title_abstract.csv", "openalex_abstract_review_batches.csv", "openalex_query_plan.json"],
+                        resume_plan=f"Resume {node.name} only after a non-empty high_relevance_literature.csv exists in this workflow.",
+                        deltas=[
+                            WorkflowDelta(
+                                action="block_node",
+                                node_id=node.id,
+                                wait_for=[lit_id],
+                                reason="Writer evidence gate: waiting for verified literature evidence",
+                                resume_plan=f"Resume {node.name} after {lit_id} succeeds with a non-empty curated CSV.",
+                            )
+                        ],
+                    )
+                continue
+            lit_node = WorkflowNode(
+                id=lit_id,
+                name=f"Literature evidence gate: {node.name[:48]}",
+                type="sub_agent",
+                role="literature scout",
+                skill=preferred_literature_skill(),
+                task_type="research",
+                team_role_kind="literature",
+                scope=default_scope_for_kind("literature"),
+                objective=f"Build verified literature evidence before {node.name}: {query}",
+                acceptance_criteria=[
+                    "openalex_query_plan.json records executable OpenAlex searches",
+                    "openalex_candidates_title_abstract.csv downloads up to the first 500 relevance-ranked works per query before screening",
+                    "openalex_abstract_review_batches.csv records 50-paper abstract review batches with no more than 3 parallel slots",
+                    "high_relevance_literature.csv contains at least one retained high-relevance row",
+                    "literature_result.json summarizes retained papers, supported claims, and remaining gaps",
+                    "Writer receives artifact_refs for the candidate CSV, retained CSV, and query plan before drafting",
+                ],
+                assignee_role="literature scout",
+                prompt=(
+                    "Run the fixed OpenAlex literature evidence gate before Writer continues. "
+                    f"Search query: {query}\n"
+                    "Create openalex_query_plan.json, download up to the first 500 relevance-ranked OpenAlex works per query into "
+                    "openalex_candidates_title_abstract.csv, review abstracts in 50-paper batches with at most 3 parallel batches, "
+                    "screen title/abstract relevance, "
+                    "and write high_relevance_literature.csv with only retained high-relevance rows. "
+                    "If no high-relevance papers can be retained, write literature_result.json with status='inconclusive'; "
+                    "the Writer must not continue with citation-bearing prose until this gate has a non-empty CSV."
+                ),
+                outputs=OPENALEX_LITERATURE_OUTPUTS,
+                dynamic_parent_id=node.id,
+                dynamic_reason="Writer evidence gate inserted literature prerequisite",
+                research_request={"query": query, "caller_id": node.id, "source": "writer_evidence_gate"},
+                auto_approve_after=True,
+                failure_policy="halt",
+                timeout_seconds=420,
+                can_ask_questions=False,
+                can_clone_workers=True,
+                can_call_planner=False,
+                peer_access=True,
+                reports_to_chat=True,
+                position={
+                    "x": float(node.position.get("x", 0)) - 80,
+                    "y": float(node.position.get("y", 0)) + 220,
+                },
+            )
+            return PlannerDecision(
+                rationale=f"{node.name} requires verified literature evidence before writing.",
+                decision_type="mutate",
+                confidence=0.92,
+                gap_type="literature_gap",
+                gap_evidence_refs=[f"node:{node.id}"],
+                dynamic_reason="Writer evidence gate found no valid high-relevance literature CSV",
+                affected_session_ids=[_session_id_for_node(record.id, node)],
+                blocked_node_ids=[node.id],
+                expected_artifacts=["literature_result.json", "high_relevance_literature.csv", "openalex_candidates_title_abstract.csv", "openalex_abstract_review_batches.csv", "openalex_query_plan.json"],
+                resume_plan=f"Resume {node.name} only after {lit_id} produces a non-empty high_relevance_literature.csv.",
+                deltas=[
+                    WorkflowDelta(
+                        action="add_node",
+	                        node=lit_node,
+	                        research_request=lit_node.research_request,
+	                        gap_type="literature_gap",
+	                        gap_evidence_refs=[f"node:{node.id}"],
+	                        expected_artifacts=["literature_result.json", "high_relevance_literature.csv", "openalex_candidates_title_abstract.csv", "openalex_abstract_review_batches.csv", "openalex_query_plan.json"],
+                        reason="Writer evidence gate inserted literature prerequisite",
+                    ),
+                    WorkflowDelta(
+                        action="block_node",
+                        node_id=node.id,
+                        wait_for=[lit_id],
+                        reason="Writer evidence gate: waiting for verified literature evidence",
+                        resume_plan=f"Resume {node.name} after {lit_id} succeeds with a non-empty curated CSV.",
+                    ),
+                ],
+            )
+        return None
+
     def _local_worker_question_decision(self, workspace: Path, record: WorkflowRecord) -> PlannerDecision | None:
         graph = record.graph_json
+        policy = self.runtime_policy(workspace, record.id)
         artifacts = build_artifact_index(workspace, record)
         artifacts_by_node: dict[str, list[ArtifactIndexEntry]] = {}
         for artifact in artifacts:
@@ -3943,6 +6565,10 @@ class WorkflowManager:
             if node.status not in {"waiting_approval", "succeeded"}:
                 continue
             if self._caller_has_pending_dynamic_work(graph, node.id):
+                continue
+            caller_dynamic_count = sum(1 for item in graph.nodes if item.dynamic_parent_id == node.id)
+            remaining_dynamic_slots = policy.max_dynamic_nodes_per_caller - caller_dynamic_count
+            if remaining_dynamic_slots <= 0:
                 continue
 
             evidence_ref = ""
@@ -3973,7 +6599,9 @@ class WorkflowManager:
 
             deltas: list[WorkflowDelta] = []
             wait_for: list[str] = []
-            for request in requests[:3]:
+            for request in requests:
+                if len(wait_for) >= remaining_dynamic_slots:
+                    break
                 spec = worker_question_role_spec(request["role"])
                 question = request["question"]
                 answer_id = dynamic_worker_question_node_id(node.id, str(spec["role"]), question)
@@ -3982,7 +6610,7 @@ class WorkflowManager:
                 kind = str(spec["kind"] or "worker")
                 answer_name = f"Answer: {question[:56]}"
                 answer_prompt = (
-                    f"Answer this planner/reviewer question for the team chat: {question}\n"
+                    f"Answer this planner-routed question for the team chat: {question}\n"
                     "Read only the artifacts needed to answer. Do not ask follow-up questions. "
                     "Write WORKER_ANSWER.md with a concise answer, artifact references, assumptions, and remaining uncertainty. "
                     "End with a compact human-language summary; do not paste full artifacts."
@@ -4003,7 +6631,7 @@ class WorkflowManager:
                     reports_to_chat=True,
                     auto_approve_after=True,
                     failure_policy="continue",
-                    timeout_seconds=180,
+                    timeout_seconds=240,
                     objective=f"Answer the routed team question: {question}",
                     acceptance_criteria=[
                         "WORKER_ANSWER.md directly answers the routed question",
@@ -4055,6 +6683,99 @@ class WorkflowManager:
                 deltas=deltas,
             )
         return None
+
+    def _local_problem_board_decision(self, workspace: Path, record: WorkflowRecord) -> PlannerDecision | None:
+        graph = record.graph_json
+        artifacts = build_artifact_index(workspace, record)
+        artifacts_by_node: dict[str, list[ArtifactIndexEntry]] = {}
+        for artifact in artifacts:
+            if artifact.producer_node_id:
+                artifacts_by_node.setdefault(artifact.producer_node_id, []).append(artifact)
+
+        for node in graph.nodes:
+            if node.type not in EXECUTABLE_NODE_TYPES or not node.run_id:
+                continue
+            is_review_waiting = node.status == "waiting_approval" and not node.approved_after
+            is_auto_approved = node.status == "succeeded" and node.auto_approve_after and node.approved_after
+            if not (is_review_waiting or is_auto_approved):
+                continue
+            if self._caller_has_pending_dynamic_work(graph, node.id):
+                continue
+
+            issue_items: list[str] = []
+            evidence_refs: list[str] = []
+            for artifact in artifacts_by_node.get(node.id, []):
+                path = workspace / artifact.path
+                try:
+                    if path.stat().st_size > 512_000:
+                        continue
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                evidence_ref = f"artifact:{artifact.path}"
+                for problem in detect_problem_board_issues(record, node, text):
+                    issue_items.append(
+                        _format_problem_board_issue(
+                            source_node_id=node.id,
+                            issue=problem["issue"],
+                            evidence_ref=evidence_ref,
+                        )
+                    )
+                    evidence_refs.append(evidence_ref)
+            message_path = last_message_path(workspace, node.run_id)
+            if message_path.exists():
+                try:
+                    message_text = message_path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    message_text = ""
+                for problem in detect_problem_board_issues(record, node, message_text):
+                    issue_items.append(
+                        _format_problem_board_issue(
+                            source_node_id=node.id,
+                            issue=problem["issue"],
+                            evidence_ref=f"event:{node.id}",
+                        )
+                    )
+                    evidence_refs.append(f"event:{node.id}")
+            if not issue_items:
+                continue
+
+            state_path = ensure_research_state(workspace, record.id, title=record.title, goal=record.goal)
+            state_text = state_path.read_text(encoding="utf-8", errors="replace")
+            state_text, added = _append_problem_board_items(state_text, issue_items)
+            if added:
+                state_path.write_text(state_text, encoding="utf-8")
+                continuation = self._local_research_state_continuation_decision(workspace, record)
+                if continuation is not None:
+                    continuation.rationale = (
+                        f"Problem Board recorded {added} blocking issue(s); Planner is triaging the next owner."
+                    )
+                    continuation.gap_evidence_refs = sorted(set([*continuation.gap_evidence_refs, *evidence_refs]))
+                    continuation.dynamic_reason = "Planner triaged Problem Board issues"
+                    return continuation
+                return PlannerDecision(
+                    rationale=f"Problem Board recorded {added} blocking issue(s); Planner will triage before assigning workers.",
+                    decision_type="mutate",
+                    confidence=0.84,
+                    gap_type="method_gap",
+                    gap_evidence_refs=sorted(set(evidence_refs)),
+                    dynamic_reason="Quality issues moved to Problem Board",
+                    affected_session_ids=[_session_id_for_node(record.id, node)],
+                    blocked_node_ids=[],
+                    expected_artifacts=[],
+                    resume_plan="Planner will classify Problem Board issues into literature, writing, or review follow-up.",
+                    deltas=[
+                        WorkflowDelta(
+                            action="mark_noop",
+                            reason="Recorded blocking issue(s) on Problem Board instead of assigning a worker directly.",
+                            gap_evidence_refs=sorted(set(evidence_refs)),
+                        )
+                    ],
+                )
+        return None
+
+    def _local_writer_rework_decision(self, workspace: Path, record: WorkflowRecord) -> PlannerDecision | None:
+        return self._local_problem_board_decision(workspace, record)
 
     def _local_worker_clone_decision(self, workspace: Path, record: WorkflowRecord) -> PlannerDecision | None:
         graph = record.graph_json
@@ -4243,10 +6964,10 @@ class WorkflowManager:
                 query = gap["query"]
                 if self._has_existing_literature_request(graph, node.id, query):
                     continue
-                skill_id = "openalex-search" if "openalex" in query.lower() else "research-lit"
+                skill_id = preferred_literature_skill()
                 lit_id = dynamic_literature_node_id(node.id, query)
                 wait_for.append(lit_id)
-                expected_artifacts.append("literature_result.json")
+                expected_artifacts.extend(["literature_result.json", "high_relevance_literature.csv", "openalex_candidates_title_abstract.csv", "openalex_abstract_review_batches.csv", "openalex_query_plan.json"])
                 gap_types.append(gap.get("gap_type") or "literature_gap")
                 deltas.append(
                     WorkflowDelta(
@@ -4259,15 +6980,19 @@ class WorkflowManager:
                             skill=skill_id,
                             task_type="research",
                             objective=f"Search and summarize literature needed by {node.name}: {query}",
-                            acceptance_criteria=[
-                                "literature_result.json is written with query, papers, findings, gaps, and sources",
-                                "Citations and source URLs are explicit; uncertain items are marked",
+	                            acceptance_criteria=[
+	                                "openalex_query_plan.json records the exact OpenAlex query strategy and screening criteria",
+	                                "openalex_candidates_title_abstract.csv contains downloaded candidate titles/abstracts before screening",
+	                                "openalex_abstract_review_batches.csv records 50-paper abstract review batches with at most 3 parallel slots",
+	                                "high_relevance_literature.csv contains only high-relevance retained papers and is deduplicated",
+	                                "literature_result.json is written with query, status, papers, findings, gaps, sources, csv_path, candidate_csv_path, abstract_review_batches_path, query_stats, and query_plan_path",
+                                "Citations, DOI/OpenAlex IDs, and source URLs are explicit; uncertain items are marked",
                                 "Findings directly answer the blocked role's request",
-                                "If search fails, write an inconclusive result instead of continuing indefinitely",
+                                "If OpenAlex search fails, write an inconclusive JSON result plus an empty-header CSV instead of continuing indefinitely",
                             ],
                             assignee_role="literature scout",
                             dynamic_parent_id=node.id,
-                            timeout_seconds=180,
+                            timeout_seconds=420,
                             failure_policy="continue",
                             position={
                                 "x": float(node.position.get("x", 0)) + 120,
@@ -4277,7 +7002,7 @@ class WorkflowManager:
                         research_request={"query": query, "caller_id": node.id, "source": "local-gap-detector"},
                         gap_type=gap.get("gap_type") or "literature_gap",
                         gap_evidence_refs=[evidence_ref],
-                        expected_artifacts=["literature_result.json"],
+	                        expected_artifacts=["literature_result.json", "high_relevance_literature.csv", "openalex_candidates_title_abstract.csv", "openalex_abstract_review_batches.csv", "openalex_query_plan.json"],
                         reason=gap.get("reason") or reason,
                     )
                 )
@@ -4306,6 +7031,208 @@ class WorkflowManager:
                 deltas=deltas,
             )
         return None
+
+    def _local_research_state_continuation_decision(self, workspace: Path, record: WorkflowRecord) -> PlannerDecision | None:
+        state_text = read_research_state(workspace, record.id)
+        existing_queries = {
+            _clean_gap_query(research_query_from_request(node.research_request), fallback="").lower()
+            for node in record.graph_json.nodes
+            if node.skill in LITERATURE_SKILLS and node.research_request
+        }
+        existing_node_ids = {node.id for node in record.graph_json.nodes}
+        state_ref = f"artifact:{_safe_relative(workspace, research_state_path(workspace, record.id))}"
+        deltas: list[WorkflowDelta] = []
+        expected_artifacts: list[str] = []
+        queue_items_by_section = {
+            section: _research_state_queue_items(state_text, section, limit=3)
+            for section in ("Search Queue", "Writing Queue", "Review Queue")
+        }
+        raw_items: list[tuple[str, str, str, dict[str, Any] | None]] = []
+        for problem in _research_state_problem_board_items(state_text, limit=3):
+            owner = classify_team_work_item(problem["issue"], section="Problem Board")
+            if owner in {"ignore", "planner"}:
+                owner = "reviewer"
+            source_node = next((node for node in record.graph_json.nodes if node.id == problem.get("source")), None)
+            if (
+                owner == "writer"
+                and source_node is not None
+                and source_node.dynamic_parent_id
+                and (source_node.team_role_kind == "writer" or source_node.skill == "paper-write")
+            ):
+                owner = "reviewer"
+            raw_items.append(("Problem Board", problem["issue"], owner, problem))
+        for item in queue_items_by_section["Search Queue"]:
+            raw_items.append(("Search Queue", item, classify_team_work_item(item, section="Search Queue"), None))
+        if not raw_items:
+            for item in _research_state_open_gap_queries(state_text, limit=3):
+                raw_items.append(("Open Gaps", item, classify_team_work_item(item, section="Open Gaps", gap_type="evidence_gap"), None))
+        for section in ("Writing Queue", "Review Queue"):
+            for item in queue_items_by_section[section]:
+                raw_items.append((section, item, classify_team_work_item(item, section=section), None))
+
+        def add_role_delta(section: str, item: str, role_kind: str, problem: dict[str, Any] | None = None) -> None:
+            if len(deltas) >= 3:
+                return
+            role_kind, skill_id, task_type = {
+                "writer": ("writer", "paper-write", "writing"),
+                "reviewer": ("reviewer", "research-review", "review"),
+            }[role_kind]
+            problem_id = str(problem.get("id")) if problem else ""
+            if not problem_id:
+                problem_id_match = re.search(r"\b(pb-[0-9a-f]{10})\b", item)
+                problem_id = problem_id_match.group(1) if problem_id_match else ""
+            id_basis = f"{problem_id} {item}".strip() if problem_id else item
+            node_id = _research_state_dynamic_node_id(f"{section} {role_kind}", id_basis)
+            if node_id in existing_node_ids:
+                return
+            output_name = "WRITING_UPDATE.md" if role_kind == "writer" else "REVIEW_REPORT.md"
+            role_instruction = (
+                "For writer work: produce revised prose or a precise blocker list. "
+                "If the task changes paper prose, include the complete clean replacement text under a '## Updated Draft' heading in WRITING_UPDATE.md, "
+                "separate from process notes and handoff text. Do not merely claim that the upstream draft was changed. "
+                "Do not leave unresolved bracket placeholders. Do not choose the next worker."
+                if role_kind == "writer"
+                else "For reviewer work: return PASS only if no blocker remains; otherwise record concise blocking issues for the Problem Board. Do not choose the next worker."
+            )
+            problem_context = (
+                f"This was triaged by Planning from Problem Board issue {problem_id}. "
+                if problem_id
+                else ""
+            )
+            prompt = (
+                f"Complete this queued team task from the Research State {section}: {item}\n\n"
+                f"{problem_context}"
+                "Use the long-term research state, team chat, and artifact references as the source of truth. "
+                f"{role_instruction} "
+                "Write the declared artifact with a concise result, blockers, and a team handoff. "
+                "Workers execute only the assigned task; Planning owns routing."
+            )
+            deltas.append(
+                WorkflowDelta(
+                    action="add_node",
+                    node=WorkflowNode(
+                        id=node_id,
+                        name=f"{role_kind.title()} queue: {item[:56]}",
+                        type="sub_agent",
+                        role=role_kind,
+                        skill=skill_id,
+                        model=default_model_for_role(role_kind, skill_id),
+                        task_type=task_type,  # type: ignore[arg-type]
+                        objective=f"Execute queued {role_kind} work from Research State: {item}",
+                        acceptance_criteria=[
+                            f"{output_name} is written under this node's artifact directory",
+                            "The artifact states what was received, what changed, blockers, and next owner",
+                            "Writer revisions include a complete clean replacement draft block when prose changes are made",
+                            "No unresolved bracket placeholders remain in writer-produced draft prose",
+                            "The final summary is a compact team handoff with artifact references",
+                        ],
+                        assignee_role=role_kind,
+                        prompt=prompt,
+                        outputs=[{"name": output_name, "type": "file", "required": True}],
+                        dynamic_parent_id=problem_id or RESEARCH_STATE_SOURCE_NODE_ID,
+                        dynamic_reason=(
+                            f"Planner triaged Problem Board issue {problem_id}: {item}"
+                            if problem_id
+                            else f"Terminal research-state check found {section}: {item}"
+                        ),
+                        research_request=(
+                            {"source": "problem_board", "problem_id": problem_id, "issue": item}
+                            if problem_id
+                            else None
+                        ),
+                        auto_approve_after=True,
+                        failure_policy="continue",
+                        timeout_seconds=360,
+                        retry=RetryPolicy(
+                            max_attempts=3,
+                            backoff_seconds=1.0,
+                            on=[
+                                "missing expected output",
+                                "assistant stream produced no content",
+                                "assistant stream ended",
+                                "connection",
+                                "entity too large",
+                                "request entity too large",
+                                "context length",
+                                "context window",
+                                "exceeds limit",
+                                "timeout",
+                            ],
+                        ),
+                        team_role_kind=role_kind,  # type: ignore[arg-type]
+                        scope=default_scope_for_kind(role_kind),
+                        can_ask_questions=protocol_defaults(role_kind)["can_ask_questions"],
+                        can_clone_workers=protocol_defaults(role_kind)["can_clone_workers"],
+                        can_call_planner=False,
+                        peer_access=True,
+                        reports_to_chat=True,
+                        position={"x": 180 + 180 * len(deltas), "y": 420},
+                    ),
+                    gap_type="method_gap" if role_kind == "writer" else "evidence_gap",
+                    gap_evidence_refs=list(problem.get("refs") or [state_ref]) if problem else [state_ref],
+                    expected_artifacts=[output_name],
+                    reason=(
+                        f"Planner triaged Problem Board issue {problem_id} as {role_kind} work: {item}"
+                        if problem_id
+                        else f"Research State still has queued {role_kind} work: {item}"
+                    ),
+                )
+            )
+            expected_artifacts.append(output_name)
+
+        seen_items: set[tuple[str, str]] = set()
+        for section, item, owner, problem in raw_items:
+            if len(deltas) >= 3:
+                break
+            normalized = _clean_gap_query(item, fallback=item).lower()
+            seen_key = (owner, normalized)
+            if seen_key in seen_items:
+                continue
+            seen_items.add(seen_key)
+            if owner == "ignore":
+                continue
+            if owner == "literature":
+                if normalized in existing_queries:
+                    continue
+                problem_id = str(problem.get("id")) if problem else ""
+                deltas.append(
+                    WorkflowDelta(
+                        action="add_node",
+                        research_request={
+                            "query": item,
+                            "caller_id": problem_id or RESEARCH_STATE_SOURCE_NODE_ID,
+                            "source": "problem_board" if problem_id else "research_state",
+                            **({"problem_id": problem_id, "issue": item} if problem_id else {}),
+                        },
+                        gap_type="literature_gap",
+                        gap_evidence_refs=list(problem.get("refs") or [state_ref]) if problem else [state_ref],
+                        expected_artifacts=["literature_result.json", "high_relevance_literature.csv", "openalex_candidates_title_abstract.csv", "openalex_abstract_review_batches.csv", "openalex_query_plan.json"],
+                        reason=(
+                            f"Planner triaged Problem Board issue {problem_id} as literature work: {item}"
+                            if problem_id
+                            else f"Research State still has an open literature gap: {item}"
+                        ),
+                    )
+                )
+                expected_artifacts.extend(["literature_result.json", "high_relevance_literature.csv", "openalex_candidates_title_abstract.csv", "openalex_abstract_review_batches.csv", "openalex_query_plan.json"])
+            elif owner in {"writer", "reviewer"}:
+                add_role_delta(section, item, owner, problem)
+
+        if not deltas:
+            return None
+        return PlannerDecision(
+            rationale="Research State contains queued team work at terminal check; continue with focused role follow-up tasks.",
+            decision_type="mutate",
+            confidence=0.82,
+            gap_type="literature_gap",
+            gap_evidence_refs=[state_ref],
+            dynamic_reason="Terminal research-state check found queued team work",
+            affected_session_ids=[_planner_session_id(record.id)],
+            blocked_node_ids=[],
+            expected_artifacts=expected_artifacts,
+            resume_plan="Use the follow-up team artifacts to update the next planning, writing, or review round.",
+            deltas=deltas,
+        )
 
     def _normalize_planner_decision(self, workflow_id: str, decision: PlannerDecision) -> PlannerDecision:
         if not decision.tick_id:
@@ -4534,7 +7461,7 @@ class WorkflowManager:
                     )
                     await self._record_delta_event(workspace, record, rationale=decision.rationale)
                     continue
-                if raw_node is None or raw_node.skill == "research-lit" or delta.research_request is not None:
+                if raw_node is None or raw_node.skill in LITERATURE_SKILLS or delta.research_request is not None:
                     prepared_node = self._prepare_dynamic_literature_node(raw_node, delta, working)
                 else:
                     prepared_node = raw_node
@@ -4598,6 +7525,7 @@ class WorkflowManager:
                     continue
                 working.nodes.append(new_node)
                 nodes_by_id[new_node.id] = new_node
+                attach_dynamic_followup_to_quality_gates(working, new_node)
                 delta_changed = True
             elif delta.action == "add_edge":
                 if not delta.source or not delta.target or delta.target not in nodes_by_id or delta.source not in nodes_by_id:
@@ -4750,12 +7678,16 @@ class WorkflowManager:
                         },
                     ),
                 )
-            decision = await self._run_planner(workspace, record, trigger)
+            decision = self._local_writer_evidence_gate_decision(workspace, record)
+            if decision is None:
+                decision = await self._run_planner(workspace, record, trigger)
             if decision is None:
                 decision = (
                     self._local_worker_question_decision(workspace, record)
+                    or self._local_problem_board_decision(workspace, record)
                     or self._local_worker_clone_decision(workspace, record)
                     or self._local_literature_gap_decision(workspace, record)
+                    or self._local_research_state_continuation_decision(workspace, record)
                 )
             if decision is None:
                 if planner_enabled:
@@ -4851,10 +7783,23 @@ class WorkflowManager:
                 continue
             if not node.depends_on:
                 continue
-            if all(nodes_by_id[dep].status in SUCCESS_NODE_STATUSES for dep in node.depends_on if dep in nodes_by_id):
-                node.status = "queued"
+            def dependency_allows_resume(dep_id: str) -> bool:
+                dep = nodes_by_id[dep_id]
+                if dep.status in SUCCESS_NODE_STATUSES:
+                    return True
+                return dep.status == "failed" and dep.failure_policy == "continue"
+
+            if all(dependency_allows_resume(dep) for dep in node.depends_on if dep in nodes_by_id):
+                has_completed_outputs = (
+                    bool(node.run_id)
+                    and not missing_concrete_outputs(workspace, workflow_id, node)
+                    and not node_output_validation_errors(workspace, workflow_id, node)
+                )
+                node.status = "succeeded" if has_completed_outputs else "queued"
                 node.error = None
                 node.approved_after = False
+                if node.status == "succeeded":
+                    node.approved_after = True
                 resumed.append(node.id)
         if not resumed:
             return False
@@ -4893,13 +7838,34 @@ class WorkflowManager:
         # "skip_descendants" and "continue" failure policies rely on this to
         # finish the workflow without a manual unpause.
         if not active and all(node.status in TERMINAL_NODE_STATUSES for node in graph.nodes):
-            if any(node.status == "failed" for node in graph.nodes):
+            blocking_failures = [
+                node
+                for node in graph.nodes
+                if node.status == "failed" and (node.failure_policy or "halt") != "continue"
+            ]
+            if blocking_failures:
                 update_workflow(workspace, workflow_id, status="failed", finished_at=utc_now())
                 await self._append_event(
                     workspace,
                     WorkflowEvent(workflow_id=workflow_id, timestamp=utc_now(), event_type="workflow", message="Workflow finished with failures"),
                 )
             else:
+                if _research_state_has_open_work(workspace, workflow_id):
+                    continued = await self._planner_tick(workspace, workflow_id, "terminal_research_state_check")
+                    if continued:
+                        await self._tick(workspace, workflow_id)
+                        return
+                    if _research_state_has_open_problems(workspace, workflow_id):
+                        await self._append_event(
+                            workspace,
+                            WorkflowEvent(
+                                workflow_id=workflow_id,
+                                timestamp=utc_now(),
+                                event_type="workflow",
+                                message="Workflow waiting: unresolved Problem Board issue(s) need planner triage",
+                            ),
+                        )
+                        return
                 update_workflow(workspace, workflow_id, status="succeeded", finished_at=utc_now())
                 await self._append_event(
                     workspace,
@@ -4920,6 +7886,7 @@ class WorkflowManager:
             return
 
         ready = []
+        ready_human_gates = []
         nodes_by_id = {node.id: node for node in graph.nodes}
         completed_inputs = []
         for node in graph.nodes:
@@ -4944,20 +7911,19 @@ class WorkflowManager:
         for node in graph.nodes:
             if node.status != "queued":
                 continue
-            if not all(nodes_by_id[dep].status in SUCCESS_NODE_STATUSES for dep in node.depends_on):
+            if not all(
+                nodes_by_id[dep].status in SUCCESS_NODE_STATUSES
+                or (nodes_by_id[dep].status == "failed" and nodes_by_id[dep].failure_policy == "continue")
+                for dep in node.depends_on
+            ):
                 continue
             if node.fanout is not None:
                 await self._expand_fanout_node(workspace, workflow_id, graph, node)
                 await self._tick(workspace, workflow_id)
                 return
             if node.type == "human_gate":
-                node.status = "waiting_approval"
-                update_workflow(workspace, workflow_id, status="paused", graph_json=graph)
-                await self._append_event(
-                    workspace,
-                    WorkflowEvent(workflow_id=workflow_id, timestamp=utc_now(), event_type="node", node_id=node.id, message=f"Human checkpoint waiting: {node.name}"),
-                )
-                return
+                ready_human_gates.append(node)
+                continue
             if node.gate in {"before", "both"} and not node.approved_before:
                 node.status = "waiting_approval"
                 update_workflow(workspace, workflow_id, status="paused", graph_json=graph)
@@ -4969,11 +7935,24 @@ class WorkflowManager:
             ready.append(node)
 
         if ready:
+            ready_ids = []
             for node in ready:
                 node.status = "running"
                 active.add(node.id)
-                asyncio.create_task(self._run_node_task(workspace, workflow_id, node.id))
+                ready_ids.append(node.id)
             update_workflow(workspace, workflow_id, graph_json=graph)
+            for ready_id in ready_ids:
+                asyncio.create_task(self._run_node_task(workspace, workflow_id, ready_id))
+            return
+
+        if ready_human_gates:
+            node = ready_human_gates[0]
+            node.status = "waiting_approval"
+            update_workflow(workspace, workflow_id, status="paused", graph_json=graph)
+            await self._append_event(
+                workspace,
+                WorkflowEvent(workflow_id=workflow_id, timestamp=utc_now(), event_type="node", node_id=node.id, message=f"Human checkpoint waiting: {node.name}"),
+            )
             return
 
         batch_waiting = [
@@ -5011,6 +7990,8 @@ class WorkflowManager:
         def transitively_blocked(node: WorkflowNode) -> bool:
             for dep_id in node.depends_on:
                 dep = nodes_by_id_post[dep_id]
+                if dep.status == "failed" and dep.failure_policy == "continue":
+                    continue
                 if dep.status in {"failed", "cancelled"}:
                     return True
                 if dep.status == "skipped":
@@ -5055,7 +8036,35 @@ class WorkflowManager:
                 record = self._require(workspace, workflow_id)
                 node = self._find_node(record.graph_json, node_id)
                 node = self._ensure_node_session_path(workspace, workflow_id, record.graph_json, node)
-                result = await self._run_node(workspace, record, node)
+                preflight_backfill = (
+                    await asyncio.to_thread(backfill_openalex_literature_outputs, workspace, workflow_id, node)
+                    if self.node_runner is None and node_declares_openalex_literature_contract(node)
+                    else None
+                )
+                if preflight_backfill and preflight_backfill.get("status") == "ok":
+                    await self._append_event(
+                        workspace,
+                        WorkflowEvent(
+                            workflow_id=workflow_id,
+                            timestamp=utc_now(),
+                            event_type="artifact",
+                            node_id=node_id,
+                            message="Backend OpenAlex evidence preflight completed",
+                            payload=preflight_backfill,
+                        ),
+                    )
+                    result = NodeRunResult(
+                        run_id=None,
+                        succeeded=True,
+                        message=(
+                            "Backend OpenAlex evidence preflight produced "
+                            f"{preflight_backfill.get('candidate_count', 0)} downloaded candidate work(s) and "
+                            f"{preflight_backfill.get('abstract_review_batch_count', 0)} abstract review batch(es), with "
+                            f"{preflight_backfill.get('retained_count', 0)} retained high-relevance paper(s)."
+                        ),
+                    )
+                else:
+                    result = await self._run_node(workspace, record, node)
                 latest = self._require(workspace, workflow_id)
                 graph = latest.graph_json
                 node = self._find_node(graph, node_id)
@@ -5068,6 +8077,83 @@ class WorkflowManager:
                 failure_error: str | None = None
                 if not result.succeeded:
                     failure_error = result.error or result.message or "Node failed"
+                    run_record = get_run(workspace, node.run_id) if node.run_id else None
+                    moved_outputs = reconcile_declared_outputs(
+                        workspace,
+                        workflow_id,
+                        node,
+                        not_before=(run_record.started_at or run_record.created_at) if run_record else None,
+                    )
+                    if moved_outputs:
+                        await self._append_event(
+                            workspace,
+                            WorkflowEvent(
+                                workflow_id=workflow_id,
+                                timestamp=utc_now(),
+                                event_type="artifact",
+                                node_id=node_id,
+                                run_id=node.run_id,
+                                message=f"Archived {len(moved_outputs)} declared output(s) from workspace root",
+                                payload={"moved": moved_outputs},
+                            ),
+                        )
+                    materialized_outputs = materialize_declared_output_aliases(workspace, workflow_id, node)
+                    if materialized_outputs:
+                        await self._append_event(
+                            workspace,
+                            WorkflowEvent(
+                                workflow_id=workflow_id,
+                                timestamp=utc_now(),
+                                event_type="artifact",
+                                node_id=node_id,
+                                run_id=node.run_id,
+                                message=f"Materialized {len(materialized_outputs)} declared output alias(es)",
+                                payload={"materialized": materialized_outputs},
+                            ),
+                        )
+                    if node.skill in LITERATURE_SKILLS or node.team_role_kind == "literature":
+                        backfill = await asyncio.to_thread(backfill_openalex_literature_outputs, workspace, workflow_id, node)
+                        if backfill:
+                            await self._append_event(
+                                workspace,
+                                WorkflowEvent(
+                                    workflow_id=workflow_id,
+                                    timestamp=utc_now(),
+                                    event_type="artifact",
+                                    node_id=node_id,
+                                    run_id=node.run_id,
+                                    message="Backend OpenAlex evidence backfill completed",
+                                    payload=backfill,
+                                ),
+                            )
+                    missing_outputs = missing_concrete_outputs(workspace, workflow_id, node)
+                    validation_errors = [] if missing_outputs else node_output_validation_errors(workspace, workflow_id, node)
+                    has_concrete_outputs = bool(concrete_output_paths(node.outputs, required_only=True))
+                    is_timeout = str(failure_error).startswith("timeout after")
+                    if validation_errors:
+                        failure_error = "Invalid expected output file(s): " + "; ".join(validation_errors)
+                    elif not missing_outputs and (has_concrete_outputs or is_timeout):
+                        original_error = failure_error
+                        failure_error = None
+                        await self._append_event(
+                            workspace,
+                            WorkflowEvent(
+                                workflow_id=workflow_id,
+                                timestamp=utc_now(),
+                                event_type="node",
+                                node_id=node_id,
+                                run_id=node.run_id,
+                                message=(
+                                    f"Node failure accepted because required outputs exist: {node.name}"
+                                    if not is_timeout
+                                    else f"Node timeout accepted because required outputs exist: {node.name}"
+                                ),
+                                payload={
+                                    "reason": "failed_with_outputs" if not is_timeout else "timeout_with_outputs",
+                                    "original_error": original_error,
+                                },
+                            ),
+                        )
                 else:
                     run_record = get_run(workspace, node.run_id) if node.run_id else None
                     moved_outputs = reconcile_declared_outputs(
@@ -5089,10 +8175,43 @@ class WorkflowManager:
                                 payload={"moved": moved_outputs},
                             ),
                         )
+                    materialized_outputs = materialize_declared_output_aliases(workspace, workflow_id, node)
+                    if materialized_outputs:
+                        await self._append_event(
+                            workspace,
+                            WorkflowEvent(
+                                workflow_id=workflow_id,
+                                timestamp=utc_now(),
+                                event_type="artifact",
+                                node_id=node_id,
+                                run_id=node.run_id,
+                                message=f"Materialized {len(materialized_outputs)} declared output alias(es)",
+                                payload={"materialized": materialized_outputs},
+                            ),
+                        )
+                    if node.skill in LITERATURE_SKILLS or node.team_role_kind == "literature":
+                        backfill = await asyncio.to_thread(backfill_openalex_literature_outputs, workspace, workflow_id, node)
+                        if backfill:
+                            await self._append_event(
+                                workspace,
+                                WorkflowEvent(
+                                    workflow_id=workflow_id,
+                                    timestamp=utc_now(),
+                                    event_type="artifact",
+                                    node_id=node_id,
+                                    run_id=node.run_id,
+                                    message="Backend OpenAlex evidence backfill completed",
+                                    payload=backfill,
+                                ),
+                            )
                     missing_outputs = missing_concrete_outputs(workspace, workflow_id, node)
                     if missing_outputs:
                         failure_error = "Missing expected output file(s): " + ", ".join(missing_outputs)
-                    elif node.can_ask_questions is False and node.run_id:
+                    else:
+                        validation_errors = node_output_validation_errors(workspace, workflow_id, node)
+                        if validation_errors:
+                            failure_error = "Invalid expected output file(s): " + "; ".join(validation_errors)
+                    if failure_error is None and node.can_ask_questions is False and node.run_id:
                         message_path = last_message_path(workspace, node.run_id)
                         if message_path.exists():
                             try:
@@ -5106,6 +8225,12 @@ class WorkflowManager:
                                 )
 
                 if failure_error is None:
+                    latest = self._require(workspace, workflow_id)
+                    graph = latest.graph_json
+                    node = self._find_node(graph, node_id)
+                    if node.status == "cancelled":
+                        return
+                    node.run_id = result.run_id or node.run_id
                     if node.auto_approve_after:
                         sync_literature_result_to_wiki(workspace, workflow_id, node)
                         node.status = "succeeded"
@@ -5134,7 +8259,7 @@ class WorkflowManager:
                             payload={"auto_approve_after": node.auto_approve_after},
                         ),
                     )
-                    final_summary = ""
+                    final_summary = _human_message_preview(result.message) if result.message else ""
                     if node.run_id:
                         message_path = last_message_path(workspace, node.run_id)
                         if message_path.exists():
@@ -5142,6 +8267,25 @@ class WorkflowManager:
                                 final_summary = _human_message_preview(message_path.read_text(encoding="utf-8", errors="replace"))
                             except OSError:
                                 final_summary = ""
+                    state_update = update_research_state_after_node(
+                        workspace,
+                        refreshed,
+                        node,
+                        final_summary=final_summary,
+                        artifact_entries=artifact_entries,
+                    )
+                    await self._append_event(
+                        workspace,
+                        WorkflowEvent(
+                            workflow_id=workflow_id,
+                            timestamp=utc_now(),
+                            event_type="artifact",
+                            node_id=node_id,
+                            run_id=node.run_id,
+                            message="Research state updated",
+                            payload=state_update,
+                        ),
+                    )
                     if final_summary and node.reports_to_chat is not False:
                         await self._append_event(
                             workspace,
@@ -5195,6 +8339,32 @@ class WorkflowManager:
                     and (not policy.on or any(token.lower() in error_lower for token in policy.on))
                 )
                 if should_retry:
+                    if any(
+                        token in error_lower
+                        for token in (
+                            "entity too large",
+                            "request entity too large",
+                            "context length",
+                            "context window",
+                            "exceeds limit",
+                        )
+                    ):
+                        for session_candidate in (
+                            node.session_path,
+                            workflow_node_session_path(workspace, workflow_id, node.id).as_posix(),
+                        ):
+                            if not session_candidate:
+                                continue
+                            session_path = Path(session_candidate)
+                            if not session_path.is_absolute():
+                                session_path = workspace / session_path
+                            try:
+                                resolved_session = session_path.resolve()
+                                resolved_workspace = workspace.resolve()
+                                if resolved_workspace in [resolved_session, *resolved_session.parents] and resolved_session.is_file():
+                                    resolved_session.unlink()
+                            except OSError:
+                                continue
                     node.attempt = attempt
                     update_workflow(workspace, workflow_id, graph_json=graph)
                     backoff = max(0.0, policy.backoff_seconds * (2 ** (attempt - 1)))
@@ -5328,11 +8498,60 @@ class WorkflowManager:
     ) -> str:
         subagent_dir.mkdir(parents=True, exist_ok=True)
         artifact_path = subagent_dir / "literature_result.json"
+        csv_path = subagent_dir / "high_relevance_literature.csv"
+        candidate_csv_path = subagent_dir / "openalex_candidates_title_abstract.csv"
+        candidate_jsonl_path = subagent_dir / "openalex_candidates_raw.jsonl"
+        batch_csv_path = subagent_dir / "openalex_abstract_review_batches.csv"
+        query_plan_path = subagent_dir / "openalex_query_plan.json"
         try:
             artifact_rel = artifact_path.resolve().relative_to(workspace.resolve()).as_posix()
         except ValueError:
             artifact_rel = str(artifact_path)
+        try:
+            csv_rel = csv_path.resolve().relative_to(workspace.resolve()).as_posix()
+        except ValueError:
+            csv_rel = str(csv_path)
+        try:
+            query_plan_rel = query_plan_path.resolve().relative_to(workspace.resolve()).as_posix()
+        except ValueError:
+            query_plan_rel = str(query_plan_path)
+        try:
+            candidate_csv_rel = candidate_csv_path.resolve().relative_to(workspace.resolve()).as_posix()
+        except ValueError:
+            candidate_csv_rel = str(candidate_csv_path)
+        try:
+            candidate_jsonl_rel = candidate_jsonl_path.resolve().relative_to(workspace.resolve()).as_posix()
+        except ValueError:
+            candidate_jsonl_rel = str(candidate_jsonl_path)
+        try:
+            batch_csv_rel = batch_csv_path.resolve().relative_to(workspace.resolve()).as_posix()
+        except ValueError:
+            batch_csv_rel = str(batch_csv_path)
         query = research_query_from_request(node.research_request) or node.objective or node.name
+        query_plan = {
+            "project": _safe_node_slug(record.title or record.id, "aris-literature"),
+            "description": f"OpenAlex query plan attempted for workflow literature node {node.id}",
+            "shared": {
+                "filter": "type:article",
+                "sort": "relevance_score:desc",
+            },
+            "queries": [
+                {
+                    "name": _safe_node_slug(query, "routed-literature-gap"),
+                    "search": query,
+                }
+            ],
+            "screening": {
+                "retain": "Only papers directly supporting the routed claim gap belong in high_relevance_literature.csv.",
+                "dedupe": "DOI first, then OpenAlex ID/title.",
+            },
+            "status": "inconclusive",
+        }
+        csv_path.write_text(HIGH_RELEVANCE_LITERATURE_CSV_HEADER + "\n", encoding="utf-8")
+        candidate_csv_path.write_text(OPENALEX_CANDIDATE_ABSTRACT_CSV_HEADER + "\n", encoding="utf-8")
+        candidate_jsonl_path.write_text("", encoding="utf-8")
+        batch_csv_path.write_text(OPENALEX_ABSTRACT_REVIEW_BATCH_CSV_HEADER + "\n", encoding="utf-8")
+        query_plan_path.write_text(json.dumps(query_plan, ensure_ascii=False, indent=2), encoding="utf-8")
         payload = {
             "query": query,
             "status": "inconclusive",
@@ -5343,8 +8562,13 @@ class WorkflowManager:
                 "Planner should route a narrower question, switch search source, or ask another worker if this evidence is still needed.",
             ],
             "sources": [],
+            "csv_path": csv_rel,
+            "candidate_csv_path": candidate_csv_rel,
+            "candidate_jsonl_path": candidate_jsonl_rel,
+            "abstract_review_batches_path": batch_csv_rel,
+            "query_plan_path": query_plan_rel,
             "wiki_refs": [],
-            "artifact_refs": [],
+            "artifact_refs": [csv_rel, candidate_csv_rel, batch_csv_rel, query_plan_rel],
             "tool_failures": failures[-5:],
             "workflow_id": record.id,
             "node_id": node.id,
@@ -5366,10 +8590,14 @@ class WorkflowManager:
             raise ValueError(f"Agent config not found: {node.config_file}")
         effective_skill_id = node.skill or (config.skill if config else None)
         role_kind = node.team_role_kind or "worker"
-        if role_kind == "planner":
+        if role_kind in {"planner", "reviewer"}:
             effective_skill_id = None
-        effective_model = node.model or (config.model if config else None)
         effective_effort = node.effort or (config.effort if config else None) or effective_effort_override()
+        effective_model = (
+            node.model
+            or (config.model if config else None)
+            or default_model_for_role(role_kind, effective_skill_id)
+        )
         # Prefer the node/config skill so web-launched sub-agents follow the
         # same ARIS skill contract as direct catalog runs. Fall back to a
         # compact generic executor only for ad-hoc nodes.
@@ -5458,7 +8686,8 @@ class WorkflowManager:
         def event_key(event: RunEvent) -> tuple[str, str, str, str]:
             payload_key = ""
             if event.payload is not None:
-                payload_key = json.dumps(event.payload, ensure_ascii=False, sort_keys=True, default=str)
+                compact_payload = _compact_workflow_event_payload(event.payload)
+                payload_key = json.dumps(compact_payload, ensure_ascii=False, sort_keys=True, default=str)
             return (event.timestamp, event.stream, event.message, payload_key)
 
         async def forward_once(event: RunEvent) -> None:
@@ -5638,6 +8867,9 @@ class WorkflowManager:
         for artifact in artifact_index:
             if artifact.producer_node_id:
                 artifacts_by_node.setdefault(artifact.producer_node_id, []).append(artifact)
+        team_chat_source = build_team_chat_messages(workspace, record, artifact_index)
+        team_chat_limit = 20 if role_kind == "planner" else 8
+        team_chat_message_limit = 900 if role_kind == "planner" else 650
         team_chat_items = [
             {
                 "timestamp": item.timestamp,
@@ -5645,12 +8877,36 @@ class WorkflowManager:
                 "role": item.role,
                 "role_kind": item.role_kind,
                 "scope": item.scope,
-                "message": item.message,
+                "message": _truncate_handoff_preview(item.message, limit=team_chat_message_limit),
                 "artifact_refs": [artifact.path for artifact in item.artifact_refs],
             }
-            for item in build_team_chat_messages(workspace, record, artifact_index)[-20:]
+            for item in team_chat_source[-team_chat_limit:]
         ]
         team_chat_text = json.dumps(team_chat_items, ensure_ascii=False, indent=2) if team_chat_items else "(no team chat updates yet)"
+        ensure_research_state(workspace, record.id, title=record.title, goal=record.goal)
+        research_state_limit = 7000 if role_kind == "planner" else 4500
+        research_state_text = compact_research_state_pack(workspace, record.id, limit=research_state_limit)
+        focused_issue_context = "(none)"
+        if node.research_request:
+            problem_id = str(node.research_request.get("problem_id") or "").strip()
+            if problem_id:
+                full_state_text = read_research_state(workspace, record.id)
+                problem_line = _research_state_problem_board_line(full_state_text, problem_id)
+                refs = re.findall(r"(?:artifact|event):[^\s,]+", problem_line)
+                excerpts = [
+                    excerpt
+                    for ref in refs[:2]
+                    if (excerpt := _focused_artifact_excerpt(workspace, ref))
+                ]
+                focused_parts = [
+                    f"Problem Board line: {problem_line}" if problem_line else "",
+                    *excerpts,
+                ]
+                focused_issue_context = "\n\n".join(part for part in focused_parts if part) or "(none)"
+        literature_evidence_text = ""
+        if role_kind in {"writer", "citation"} or node.skill == "paper-write":
+            evidence = current_workflow_literature_evidence(workspace, record)
+            literature_evidence_text = json.dumps(evidence, ensure_ascii=False, indent=2)
         fanout_source_id = None
         if node.fanout_parent_id:
             template_node = nodes_by_id.get(node.fanout_parent_id)
@@ -5763,20 +9019,51 @@ Output contract from config:
             reviewer_dialogue_text = """
 	Reviewer dialogue rules:
 	- Keep looking for concrete problems in evidence, citations, claims, and clarity.
-	- If an issue needs work, write `[ASK_WORKER: writer|literature scout|citation inserter | concrete question]` in your artifact and final summary.
-	- Do not perform the fix yourself and do not decide the assignee; the planner routes your questions.
+	- If an issue blocks success, write it as `[PROBLEM_BOARD: concise blocking issue]` or a `Blocking:` line in your artifact and final summary.
+	- Treat unresolved bracket placeholders, vague contribution statements, and unsupported thesis claims as blocking issues; do not mark PASS while they remain.
+	- Do not perform the fix yourself and do not decide the assignee; the planner diagnoses Problem Board items and routes the next owner.
 	- If no blocking question remains, explicitly say PASS and keep any notes as non-blocking watch items.
+"""
+        if role_kind == "planner":
+            team_handoff_text = """
+	Team handoff format:
+	- End your declared artifact and final summary with a compact handoff.
+	- Use this structure: Role; What I received; What I did; Artifact refs; Blockers; Request for another role; Suggested next owner.
+	- Literature hands evidence to Writer or Planner; Writer hands draft changes to Reviewer; Reviewer hands pass/rework decisions to Planner; Planner routes the next owner.
+	- As Planner only, put new searches in `[LITERATURE_NEEDED: focused query]` and missing non-literature support in `[EVIDENCE_NEEDED: focused evidence question]`.
+"""
+        elif role_kind == "reviewer":
+            team_handoff_text = """
+	Team handoff format:
+	- End your declared artifact and final summary with a compact handoff.
+	- Use this structure: Role; What I received; What I did; Artifact refs; Blockers; Request for another role; Suggested next owner.
+	- Put blocking review findings in `[PROBLEM_BOARD: concise issue]`; do not assign the worker inside the issue.
+	- Do not emit `[LITERATURE_NEEDED: ...]`, `[EVIDENCE_NEEDED: ...]`, or `[ASK_WORKER: ...]`; Planning routes from the Problem Board.
+"""
+        else:
+            team_handoff_text = """
+	Team handoff format:
+	- End your declared artifact and final summary with a compact handoff.
+	- Use this structure: Role; What I received; What I did; Artifact refs; Blockers; Request for another role; Suggested next owner.
+	- Workers execute only the assigned work. Do not emit bracketed routing markers such as `[LITERATURE_NEEDED: ...]`, `[EVIDENCE_NEEDED: ...]`, `[ASK_WORKER: ...]`, or `[PROBLEM_BOARD: ...]`.
+	- If something is missing, record it as a normal limitation or blocker in your artifact; Planning and Reviewer handle routing.
 """
         if role_kind == "planner":
             tool_contract = "- Planner tool contract: only write/edit/TodoWrite/Sleep/SendUserMessage/Config/StructuredOutput are available; do not attempt to inspect file contents."
         elif role_kind == "literature":
-            tool_contract = "- Literature tool contract: use search/fetch and artifact tools only for the routed query; stop with an inconclusive artifact after repeated failures."
+            tool_contract = "- Literature tool contract: use the openalex-search skill/OpenAlex Works metadata flow for the routed query, download candidate titles/abstracts into openalex_candidates_title_abstract.csv before screening, review abstracts in 50-paper batches with no more than 3 parallel reader slots, maintain high_relevance_literature.csv with only high-relevance retained papers, and stop with an inconclusive JSON plus empty-header CSV after repeated OpenAlex failures."
         elif role_kind in {"writer", "citation"}:
-            tool_contract = "- Artifact worker tool contract: read and edit artifacts, but do not use WebSearch/WebFetch and do not ask follow-up questions. If citations or evidence are missing, report focused [LITERATURE_NEEDED: ...] markers in the short human update."
+            tool_contract = "- Artifact worker tool contract: read and edit artifacts, but do not use WebSearch/WebFetch and do not ask follow-up questions. Use compact literature_result.json and high_relevance_literature.csv for citations; do not read openalex_candidates_title_abstract.csv, openalex_candidates_raw.jsonl, or openalex_abstract_review_batches.csv unless the task explicitly asks for audit debugging. When reading Markdown/CSV evidence, pass a small limit such as 80 lines, then read another small slice only if the exact missing key or paragraph requires it. Read only focused artifact_refs from this prompt; never run broad grep/glob/read_file over .aris/web/workflows, the workflow root, or all nodes. If searching is needed, search one named artifact file or one specific node attempt directory with a narrow pattern. Do not leave unresolved bracket placeholders in draft prose; use cautious concrete wording or report a normal blocker without bracketed routing markers."
         elif role_kind == "reviewer":
-            tool_contract = "- Reviewer tool contract: inspect artifacts and write review questions, but do not use WebSearch/WebFetch. Route follow-up work with [ASK_WORKER: writer|literature scout|citation inserter | concrete question]."
+            tool_contract = "- Reviewer tool contract: inspect only this workflow's upstream artifacts and artifact_refs, then write PASS or Problem Board issues, but do not use WebSearch/WebFetch and do not assign workers. Do not read same-named project-root drafts such as INTRO_OUTLINE.md unless they are explicitly listed as current workflow inputs. For citation audits, inspect exact retained CSV artifact paths one at a time; do not run content-mode grep over the whole workflow root or all nodes. Write the exact declared review filename; if you also create a generic REVIEW_REPORT.md, duplicate the same content to the declared output."
         else:
             tool_contract = "- Use the available workspace-safe tools directly for the assigned scope."
+        if role_kind == "planner":
+            evidence_gap_requirement = "If this task needs missing literature, citation anchors, or external evidence before it can make a claim, do not invent sources or silently continue. As Planner, write a clear marker like `[LITERATURE_NEEDED: focused search query]` or `[EVIDENCE_NEEDED: focused evidence question]`; the Manager will route it to the right team role."
+        elif role_kind == "reviewer":
+            evidence_gap_requirement = "If this review finds missing literature, citation anchors, external evidence, placeholders, or unsupported claims, do not assign a worker. Record the blocker as `[PROBLEM_BOARD: concise issue]` so Planning can diagnose and route it."
+        else:
+            evidence_gap_requirement = "If this task needs missing literature, citation anchors, or external evidence, do not invent sources and do not emit bracketed routing markers. State the limitation or blocker in normal prose and finish the assigned artifact; Planning and Reviewer own routing."
         skill_contract = (
             "- Planner role ignores suggested skills. Ask workers to read artifacts or search; do not load skill instructions."
             if role_kind == "planner"
@@ -5839,16 +9126,26 @@ Task execution namespace:
 	- Communicate in normal human language. Final summaries should be compact status updates plus artifact paths, not raw full-text dumps.
 	- The planner reads team chat updates and artifact references. Do not paste long artifacts into the final summary.
 	- If can_call_planner=false, do not ask, invoke, or route requests directly to the planner. State assumptions, blockers, and artifacts in your own update.
-	- If can_ask_questions=false, do not ask questions. Make a reasonable default assumption and record it as a statement. Use [LITERATURE_NEEDED: ...] or [EVIDENCE_NEEDED: ...] when evidence is missing.
+	- If can_ask_questions=false, do not ask questions. Make a reasonable default assumption and record it as a statement; do not emit bracketed routing markers.
 	- If can_clone_workers=true and the task needs parallel help, write [CLONE_WORKER: concise helper objective] in the declared artifact or final summary; the runtime planner will decide whether to materialize helper workers.
 {planner_control_text}
 {reviewer_dialogue_text}
+{team_handoff_text}
 
 	Dynamic fan-out assignment:
 {fanout_assignment or "(none)"}
 
 Team chat updates:
 {team_chat_text}
+
+Focused routed issue context:
+{focused_issue_context}
+
+Long-term research state:
+{research_state_text}
+
+Current workflow literature evidence:
+{literature_evidence_text or "(not required for this role)"}
 
 Upstream task outputs:
 {upstream_text}
@@ -5866,8 +9163,9 @@ Execution requirements:
 - Do not use Bash, shell scripts, PowerShell, REPL tools, or sub-agent spawning from the web runner.
 - {tool_contract[2:] if tool_contract.startswith("- ") else tool_contract}
 - If a skill suggests a helper script that requires Bash, perform the equivalent search, reading, or writing with the safe tools instead.
-- For literature or research tasks, keep external search bounded: use at most 12 WebSearch/WebFetch calls total, stop after 3 search/fetch failures, and then write the declared artifacts from available evidence. Mark uncertain or unverified entries explicitly instead of continuing to search.
-- If this task needs missing literature, citation anchors, or external evidence before it can make a claim, do not invent sources or silently continue. Write a clear marker like `[LITERATURE_NEEDED: focused search query]` or `[EVIDENCE_NEEDED: focused evidence question]` into this node's declared artifact; the Manager will insert a dynamic Literature task and rerun this role after it completes.
+- For literature or citation research tasks, use OpenAlex first and keep search bounded: create the query plan, download candidate titles/abstracts before screening, review abstracts in 50-paper batches with at most 3 parallel batches, retain only high-relevance rows in CSV, stop after 3 OpenAlex/search failures, and then write the declared artifacts from available evidence. Mark uncertain or unverified entries explicitly instead of continuing to search.
+- {evidence_gap_requirement}
+- Writer outputs must not contain unresolved bracket placeholders such as [specific contribution], [benchmark], or [key result]. Replace them with cautious supported wording, or move the uncertainty into a blocker/rework note outside the draft prose.
 - Use relative paths for file operations; do not use absolute workspace paths in commands or tool inputs.
 - Produce every expected output that names a concrete file path at the mapped path shown in "Concrete output storage paths".
 - If "Downstream fan-out requirements" is not "(none)", write those JSON fan-out artifacts under ARIS_SUBAGENT_DIR before the final summary.
@@ -5875,10 +9173,13 @@ Execution requirements:
 - If a declared output includes subdirectories, preserve that relative structure under ARIS_SUBAGENT_DIR unless the mapped path already starts with `.aris/`.
 - Treat upstream task outputs as read-only context. Do not rewrite upstream artifacts unless the current task explicitly declares that output path.
 - {skill_contract[2:] if skill_contract.startswith("- ") else skill_contract}
+- For Writer/Citation work, cite only sources present in this workflow's validated high_relevance_literature.csv or literature_result.json. Do not read OpenAlex candidate/raw/batch audit CSVs unless the task is explicitly about literature audit debugging; they are too large for drafting context. Do not read or import draft prose from sibling `.aris/web/workflows/*` directories; use only this workflow's upstream artifacts and current artifact_refs.
+- For Writer/Citation work, keep tool context small: do not grep or glob the whole workflow, `nodes`, or `.aris/web/workflows`; do not read large CSV/JSONL audit files; when reading CSV evidence, use a small limit and prefer `literature_result.json` plus the validated retained CSV. Never read `openalex_candidates_title_abstract.csv` during drafting unless the task explicitly says "audit OpenAlex candidates". Broad artifact sweeps can overflow the model context and count as a failed task.
+- For Reviewer work, keep audits bounded: read the draft/revision artifact, the cited high_relevance_literature.csv files, and the specific review artifacts named in artifact_refs. Avoid whole-workflow content searches; if a key must be checked, search one retained CSV file at a time.
 - Follow the agent configuration profile when present. Task fields override config defaults for skill/model/effort.
 - Satisfy the acceptance criteria explicitly in your final summary and name any criteria that remain unmet.
 - Respect the output contract from config when present.
-- Keep a concise final summary (roughly 200 words or fewer) that names files created or changed, artifact paths, risks, and blockers. Do not paste full artifact contents.
+- Keep a concise final summary (roughly 200 words or fewer) that names files created or changed, artifact paths, risks, blockers, and the suggested next owner. Do not paste full artifact contents.
 - Do not store API keys or credentials in files.
 """
 
@@ -5900,7 +9201,7 @@ Execution requirements:
                 node_id=node_id,
                 run_id=event.run_id,
                 message=event.message,
-                payload=event.payload,
+                payload=_compact_workflow_event_payload(event.payload),
             ),
         )
         # Surface token/cost on the node when ``aris prompt`` emits its final

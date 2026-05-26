@@ -447,6 +447,7 @@ class RunManager:
             if name == "stdout":
                 payload = parse_stdout_json_payload(text)
                 if payload is not None:
+                    payload = redact_sensitive_payload(payload)
                     for event in expand_codex_payload_events(run_id, payload):
                         await self._append_event(workspace, event)
                     continue
@@ -552,10 +553,39 @@ def _try_extract_json(body: str) -> Any | None:
 
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+API_KEY_RE = re.compile(r"\b(?:sk|ak|rk|tp)-[A-Za-z0-9_\-]{6,}\b")
+API_KEY_PREFIX_RE = re.compile(r"(?i)(api\s*key\s*prefix\s*:\s*)[A-Za-z0-9_\-]+")
+API_KEY_FIELD_RE = re.compile(
+    r"(?i)\b(api[_\s-]?key|secret|access[_\s-]?token|auth[_\s-]?token|[A-Z0-9_]*(?:KEY|TOKEN|SECRET))"
+    r"(\s*[:=]\s*)[^\s,;]+"
+)
+JSON_SECRET_FIELD_RE = re.compile(
+    r'(?i)("?(?:api[_-]?key|secret|access[_-]?token|auth[_-]?token|[A-Z0-9_]*(?:KEY|TOKEN|SECRET))"?\s*:\s*)"[^"]*"'
+)
+REQUEST_BODY_RE = re.compile(r"(?i)(\b(?:deepseek|minimax|openai|anthropic)\s+request\s+body\s*:\s*).+")
+
+
+def redact_sensitive_text(text: str) -> str:
+    redacted = REQUEST_BODY_RE.sub(r"\1<redacted>", text)
+    redacted = JSON_SECRET_FIELD_RE.sub(r'\1"<redacted>"', redacted)
+    redacted = API_KEY_PREFIX_RE.sub(r"\1<redacted>", redacted)
+    redacted = API_KEY_RE.sub("<redacted-api-key>", redacted)
+    redacted = API_KEY_FIELD_RE.sub(r"\1\2<redacted>", redacted)
+    return redacted
+
+
+def redact_sensitive_payload(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_sensitive_text(value)
+    if isinstance(value, list):
+        return [redact_sensitive_payload(item) for item in value]
+    if isinstance(value, dict):
+        return {key: redact_sensitive_payload(item) for key, item in value.items()}
+    return value
 
 
 def clean_terminal_text(text: str) -> str:
-    return ANSI_ESCAPE_RE.sub("", text).strip()
+    return redact_sensitive_text(ANSI_ESCAPE_RE.sub("", text).strip())
 
 
 def parse_stdout_json_payload(text: str) -> dict[str, Any] | None:
@@ -585,7 +615,7 @@ def runtime_meta_event_to_run_event(run_id: str, record: dict[str, Any]) -> RunE
         return None
     event_name = str(record.get("event") or "")
     timestamp = str(record.get("ts") or utc_now())
-    payload = {"kind": "runtime_event", **record}
+    payload = redact_sensitive_payload({"kind": "runtime_event", **record})
 
     if event_name == "llm_call_start":
         iteration = record.get("iteration")
@@ -609,7 +639,7 @@ def runtime_meta_event_to_run_event(run_id: str, record: dict[str, Any]) -> RunE
         )
     if event_name == "llm_call_error":
         iteration = record.get("iteration")
-        message = str(record.get("message") or "request failed")
+        message = redact_sensitive_text(str(record.get("message") or "request failed"))
         return RunEvent(
             run_id=run_id,
             timestamp=timestamp,
