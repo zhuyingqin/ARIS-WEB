@@ -757,6 +757,209 @@ def _fallback_openalex_queries(base_query: str, node: WorkflowNode) -> list[dict
     ]
 
 
+def _keyword_terms_from_value(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        terms: list[str] = []
+        for item in value:
+            terms.extend(_keyword_terms_from_value(item))
+        return list(dict.fromkeys(terms))
+    text = str(value).strip()
+    if not text:
+        return []
+    parts = re.split(r";|,|\n|\|", text)
+    return list(dict.fromkeys(part.strip(" `\"'") for part in parts if part.strip(" `\"'")))
+
+
+def _keyword_group_candidates_from_value(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        for key in ("keyword_groups", "groups", "search_groups", "queries"):
+            nested = value.get(key)
+            if isinstance(nested, list):
+                candidates = _keyword_group_candidates_from_value(nested)
+                if candidates:
+                    return candidates
+        return []
+    if not isinstance(value, list):
+        return []
+
+    groups: list[dict[str, Any]] = []
+    for index, item in enumerate(value, start=1):
+        if isinstance(item, str):
+            terms = _keyword_terms_from_value(item)
+            if terms:
+                groups.append({"name": f"keyword-group-{index}", "keywords": terms, "query": " ".join(terms)})
+            continue
+        if not isinstance(item, dict):
+            continue
+        name = next(
+            (
+                str(item.get(key)).strip()
+                for key in ("name", "group", "topic", "title", "label", "id")
+                if item.get(key) is not None and str(item.get(key)).strip()
+            ),
+            f"keyword-group-{index}",
+        )
+        terms: list[str] = []
+        for key in ("keywords", "keyword", "terms", "phrases", "search_terms", "english_keywords"):
+            terms.extend(_keyword_terms_from_value(item.get(key)))
+        terms = list(dict.fromkeys(terms))
+        query = str(item.get("query") or item.get("search") or item.get("openalex_query") or "").strip()
+        if not query and terms:
+            query = " ".join(terms[:8])
+        if not query:
+            continue
+        group: dict[str, Any] = {
+            "name": name,
+            "query": query,
+            "keywords": terms or _keyword_terms_from_value(query),
+        }
+        for key in ("rationale", "purpose", "description"):
+            if item.get(key):
+                group[key] = str(item.get(key)).strip()
+        groups.append(group)
+    return groups
+
+
+def _sorted_attempt_files(node_dir: Path, pattern: str) -> list[Path]:
+    def sort_key(path: Path) -> tuple[int, str]:
+        attempt = 0
+        match = re.fullmatch(r"attempt-(\d+)", path.parent.name)
+        if match:
+            attempt = int(match.group(1))
+        return (attempt, path.name.lower())
+
+    return sorted(node_dir.glob(pattern), key=sort_key, reverse=True)
+
+
+def _workflow_node_ancestors(record: WorkflowRecord, node: WorkflowNode) -> list[WorkflowNode]:
+    nodes_by_id = {item.id: item for item in record.graph_json.nodes}
+    ordered: list[WorkflowNode] = []
+    seen: set[str] = set()
+    queue = list(node.depends_on)
+    while queue:
+        node_id = queue.pop(0)
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        upstream = nodes_by_id.get(node_id)
+        if upstream is None:
+            continue
+        ordered.append(upstream)
+        queue.extend(upstream.depends_on)
+    return ordered
+
+
+def _relative_artifact_path(workspace: Path, artifact_path: Path) -> str:
+    try:
+        return artifact_path.resolve().relative_to(workspace.resolve()).as_posix()
+    except ValueError:
+        return str(artifact_path)
+
+
+def _openalex_query_plan_from_keyword_groups(
+    workspace: Path,
+    workflow_id: str,
+    node: WorkflowNode,
+) -> dict[str, Any] | None:
+    record = get_workflow(workspace, workflow_id)
+    if record is None:
+        return None
+    for source_node in _workflow_node_ancestors(record, node):
+        node_dir = workspace / ".aris" / "web" / "workflows" / workflow_id / "nodes" / source_node.id
+        if not node_dir.exists():
+            continue
+        json_candidates = [
+            *_sorted_attempt_files(node_dir, "attempt-*/SEARCH_KEYWORDS.json"),
+            *_sorted_attempt_files(node_dir, "attempt-*/keyword_groups.json"),
+            *_sorted_attempt_files(node_dir, "attempt-*/*.json"),
+        ]
+        seen_paths: set[Path] = set()
+        for json_path in json_candidates:
+            if json_path in seen_paths:
+                continue
+            seen_paths.add(json_path)
+            try:
+                root = json.loads(json_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            groups = _keyword_group_candidates_from_value(root)
+            if groups:
+                return _openalex_query_plan_for_keyword_groups(workspace, workflow_id, node, source_node, json_path, groups)
+        for markdown_path in [
+            *_sorted_attempt_files(node_dir, "attempt-*/*.md"),
+            *_sorted_attempt_files(node_dir, "attempt-*/*.markdown"),
+        ]:
+            try:
+                text = markdown_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            groups = _keyword_group_candidates_from_value(_try_extract_json_value(text))
+            if not groups:
+                groups = _parse_markdown_keyword_groups(text)
+            if groups:
+                return _openalex_query_plan_for_keyword_groups(workspace, workflow_id, node, source_node, markdown_path, groups)
+    return None
+
+
+def _openalex_query_plan_for_keyword_groups(
+    workspace: Path,
+    workflow_id: str,
+    node: WorkflowNode,
+    source_node: WorkflowNode,
+    source_path: Path,
+    groups: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    queries: list[dict[str, Any]] = []
+    seen_searches: set[str] = set()
+    for index, group in enumerate(groups, start=1):
+        search = re.sub(r"\s+", " ", str(group.get("query") or "").strip())
+        if not search:
+            continue
+        search_key = search.lower()
+        if search_key in seen_searches:
+            continue
+        seen_searches.add(search_key)
+        group_name = str(group.get("name") or f"keyword-group-{index}").strip() or f"keyword-group-{index}"
+        query: dict[str, Any] = {
+            "name": _safe_node_slug(group_name, f"keyword-group-{index}"),
+            "search": search,
+            "source_group": group_name,
+        }
+        keywords = group.get("keywords")
+        if isinstance(keywords, list) and keywords:
+            query["keywords"] = [str(item) for item in keywords if str(item).strip()]
+        for key in ("rationale", "purpose", "description"):
+            if group.get(key):
+                query[key] = str(group.get(key)).strip()
+        queries.append(query)
+        if len(queries) >= 12:
+            break
+    if not queries:
+        return None
+    source_rel = _relative_artifact_path(workspace, source_path)
+    return {
+        "project": _safe_node_slug(workflow_id, "aris-literature"),
+        "description": (
+            f"Backend OpenAlex plan generated for literature node {node.id} "
+            f"from upstream keyword groups in {source_node.id}."
+        ),
+        "derived_from": "upstream_keyword_groups",
+        "source_node_id": source_node.id,
+        "source_artifact": source_rel,
+        "shared": {
+            "filter": "type:article",
+            "sort": "relevance_score:desc",
+        },
+        "queries": queries,
+        "screening": {
+            "retain": "Backend keeps OpenAlex works whose title/abstract overlaps the planner keyword group query.",
+            "dedupe": "DOI first, then OpenAlex ID/title.",
+        },
+    }
+
+
 def _work_matches_query(work: dict[str, Any], query: str) -> tuple[bool, str]:
     terms = _query_terms(query)
     if not terms:
@@ -805,6 +1008,11 @@ def _load_or_create_openalex_query_plan(workspace: Path, workflow_id: str, node:
                     return raw
         except (json.JSONDecodeError, OSError):
             pass
+    keyword_plan = _openalex_query_plan_from_keyword_groups(workspace, workflow_id, node)
+    if keyword_plan is not None:
+        query_plan_path.parent.mkdir(parents=True, exist_ok=True)
+        query_plan_path.write_text(json.dumps(keyword_plan, ensure_ascii=False, indent=2), encoding="utf-8")
+        return keyword_plan
     query = research_query_from_request(node.research_request) or node.objective or node.name
     queries = _fallback_openalex_queries(query, node) or [
         {
@@ -1232,7 +1440,7 @@ def backfill_openalex_literature_outputs(workspace: Path, workflow_id: str, node
             )
 
     run_queries(queries, start_index=1)
-    if len(rows) < MIN_OPENALEX_EVIDENCE_ROWS:
+    if len(rows) < MIN_OPENALEX_EVIDENCE_ROWS and plan.get("derived_from") != "upstream_keyword_groups":
         base_query = research_query_from_request(node.research_request) or node.objective or node.name
         fallback_queries = _fallback_openalex_queries(base_query, node)
         existing_searches = {

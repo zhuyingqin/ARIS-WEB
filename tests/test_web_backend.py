@@ -232,6 +232,118 @@ def test_openalex_nodes_default_to_openalex_search_skill() -> None:
     assert default_skill_for_node(node, {"research-lit", "openalex-search"}) == "openalex-search"
 
 
+def test_openalex_query_plan_prefers_upstream_keyword_groups(tmp_path: Path) -> None:
+    planner = WorkflowNode(
+        id="keywords",
+        type="agent",
+        name="Keyword planner",
+        role="planner",
+        outputs=[{"name": "SEARCH_KEYWORDS.json", "type": "file", "required": True}],
+    )
+    literature = WorkflowNode(
+        id="lit",
+        name="Literature Search",
+        type="sub_agent",
+        skill="openalex-search",
+        team_role_kind="literature",
+        depends_on=["keywords"],
+        objective="Use planner keyword groups to run bounded continuous literature search across all groups.",
+        outputs=workflows_module.OPENALEX_LITERATURE_OUTPUTS,
+    )
+    record = workflows_module.create_workflow_record(
+        tmp_path,
+        "Keyword plan",
+        "Search LLM-agent literature",
+        WorkflowGraph(nodes=[planner, literature]),
+    )
+    workflows_module.insert_workflow(record)
+    keyword_path = workflow_output_path(tmp_path, record.id, planner, Path("SEARCH_KEYWORDS.json"))
+    keyword_path.parent.mkdir(parents=True, exist_ok=True)
+    keyword_path.write_text(
+        json.dumps(
+            {
+                "keyword_groups": [
+                    {
+                        "name": "ReAct reasoning-action paradigm",
+                        "keywords": ["ReAct", "reasoning acting", "LLM agents"],
+                        "rationale": "Core paradigm.",
+                    },
+                    {
+                        "name": "Toolformer and tool use",
+                        "keywords": ["Toolformer", "API use", "LLM tool use"],
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    query_plan_path = workflow_output_path(tmp_path, record.id, literature, Path("openalex_query_plan.json"))
+    plan = workflows_module._load_or_create_openalex_query_plan(tmp_path, record.id, literature, query_plan_path)
+
+    searches = [query["search"] for query in plan["queries"]]
+    assert plan["derived_from"] == "upstream_keyword_groups"
+    assert plan["source_node_id"] == "keywords"
+    assert plan["source_artifact"].endswith("SEARCH_KEYWORDS.json")
+    assert searches == ["ReAct reasoning acting LLM agents", "Toolformer API use LLM tool use"]
+    assert "PaperOrchestrator" not in json.dumps(plan)
+    assert "Use planner keyword groups" not in json.dumps(plan)
+
+
+def test_openalex_backfill_does_not_add_objective_fallback_for_keyword_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    planner = WorkflowNode(
+        id="keywords",
+        type="agent",
+        name="Keyword planner",
+        role="planner",
+        outputs=[{"name": "SEARCH_KEYWORDS.json", "type": "file", "required": True}],
+    )
+    literature = WorkflowNode(
+        id="lit",
+        name="Literature Search",
+        type="sub_agent",
+        skill="openalex-search",
+        team_role_kind="literature",
+        depends_on=["keywords"],
+        objective="Use planner keyword groups to run bounded continuous literature search for agent writing papers.",
+        outputs=workflows_module.OPENALEX_LITERATURE_OUTPUTS,
+    )
+    record = workflows_module.create_workflow_record(
+        tmp_path,
+        "Keyword plan",
+        "Search LLM-agent literature",
+        WorkflowGraph(nodes=[planner, literature]),
+    )
+    workflows_module.insert_workflow(record)
+    keyword_path = workflow_output_path(tmp_path, record.id, planner, Path("SEARCH_KEYWORDS.json"))
+    keyword_path.parent.mkdir(parents=True, exist_ok=True)
+    keyword_path.write_text(
+        json.dumps({"keyword_groups": [{"name": "ReAct", "keywords": ["ReAct", "LLM agents"]}]}),
+        encoding="utf-8",
+    )
+    calls: list[str] = []
+
+    def fake_fetch_page(query: dict, shared: dict, *, per_page: int = 200, cursor: str | None = None, timeout: float = 20.0):
+        calls.append(str(query.get("search") or ""))
+        return [], 0, None
+
+    monkeypatch.setattr(workflows_module, "_openalex_fetch_works_page", fake_fetch_page)
+    monkeypatch.setattr(workflows_module, "OPENALEX_CANDIDATE_TARGET_PER_QUERY", 1)
+
+    result = workflows_module.backfill_openalex_literature_outputs(tmp_path, record.id, literature)
+    query_plan_path = workflow_output_path(tmp_path, record.id, literature, Path("openalex_query_plan.json"))
+    plan = json.loads(query_plan_path.read_text(encoding="utf-8"))
+
+    assert result is not None
+    assert result["status"] == "inconclusive"
+    assert calls == ["ReAct LLM agents"]
+    assert plan["derived_from"] == "upstream_keyword_groups"
+    assert "backend_fallback_queries" not in plan
+    assert "PaperOrchestrator" not in json.dumps(plan)
+
+
 def test_high_relevance_literature_csv_requires_retained_rows(tmp_path: Path) -> None:
     workflow_id = "wf"
     node = WorkflowNode(
