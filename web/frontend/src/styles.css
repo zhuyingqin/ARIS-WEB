@@ -95,6 +95,366 @@
   letter-spacing: 0;
 }
 
+.office-legacy-hidden {
+  display: none;
+}
+
+.office-3d-shell {
+  position: relative;
+  min-height: min(78vh, 820px);
+  height: clamp(620px, 74vh, 860px);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(238, 244, 238, 0.96)),
+    #f6f8f4;
+  box-shadow: var(--shadow-sm);
+}
+
+.office-3d-canvas {
+  position: absolute;
+  inset: 0;
+}
+
+.office-3d-canvas canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.office-3d-fallback {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: grid;
+  place-content: center;
+  gap: 6px;
+  padding: 32px;
+  background:
+    linear-gradient(145deg, rgba(246, 248, 244, 0.88), rgba(232, 239, 234, 0.92)),
+    repeating-linear-gradient(90deg, rgba(26, 110, 96, 0.06) 0 1px, transparent 1px 64px),
+    repeating-linear-gradient(0deg, rgba(26, 110, 96, 0.05) 0 1px, transparent 1px 64px);
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.office-3d-fallback strong {
+  color: var(--text-strong);
+}
+
+.office-3d-topbar,
+.office-3d-board,
+.office-3d-detail,
+.office-3d-feed {
+  position: absolute;
+  z-index: 2;
+  border: 1px solid rgba(42, 59, 52, 0.14);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.84);
+  box-shadow: 0 14px 34px rgba(29, 43, 37, 0.12);
+  backdrop-filter: blur(14px);
+}
+
+.office-3d-topbar {
+  top: 18px;
+  left: 50%;
+  display: flex;
+  width: min(660px, calc(100% - 48px));
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 14px 18px;
+  transform: translateX(-50%);
+}
+
+.office-3d-topbar div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.office-3d-topbar strong {
+  color: var(--text-strong);
+  font-size: 1.22rem;
+  line-height: 1.05;
+}
+
+.office-3d-topbar span,
+.office-3d-topbar em {
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  font-style: normal;
+  white-space: nowrap;
+}
+
+.office-3d-board {
+  top: 108px;
+  left: 22px;
+  width: min(330px, calc(100% - 44px));
+  padding: 14px;
+}
+
+.office-3d-board-head,
+.office-3d-feed-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-strong);
+}
+
+.office-3d-board-head b {
+  margin-left: auto;
+  min-width: 28px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  color: var(--brand);
+  text-align: center;
+}
+
+.office-3d-board-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.office-3d-board-item,
+.office-3d-feed-item,
+.office-3d-role-label {
+  border: 1px solid rgba(42, 59, 52, 0.14);
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--text-strong);
+  text-align: left;
+}
+
+.office-3d-board-item {
+  display: grid;
+  gap: 4px;
+  padding: 10px 11px;
+  border-left: 5px solid var(--brand);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.office-3d-board-item-blocked,
+.office-3d-board-item-active {
+  border-left-color: var(--danger);
+}
+
+.office-3d-board-item strong,
+.office-3d-feed-item strong,
+.office-3d-detail strong,
+.office-3d-role-label strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.office-3d-board-item small,
+.office-3d-feed-item small,
+.office-3d-detail p,
+.office-3d-role-label span {
+  color: var(--text-muted);
+}
+
+.office-3d-label-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+}
+
+.office-3d-role-label {
+  position: absolute;
+  display: grid;
+  width: 154px;
+  max-width: 22vw;
+  gap: 2px;
+  padding: 8px 10px;
+  border-left: 4px solid var(--brand);
+  border-radius: 8px;
+  box-shadow: 0 10px 24px rgba(32, 46, 40, 0.12);
+  cursor: pointer;
+  pointer-events: auto;
+  transform: translate(-50%, -50%);
+}
+
+.office-3d-role-label-planner { border-left-color: var(--brand); }
+.office-3d-role-label-literature { border-left-color: var(--info); }
+.office-3d-role-label-writer,
+.office-3d-role-label-citation,
+.office-3d-role-label-worker { border-left-color: var(--success); }
+.office-3d-role-label-reviewer { border-left-color: var(--warning); }
+.office-3d-role-label-gate { border-left-color: #7b6f91; }
+
+.office-3d-role-label-selected {
+  box-shadow: 0 0 0 3px var(--brand-ring), 0 16px 34px rgba(32, 46, 40, 0.16);
+}
+
+.office-3d-detail {
+  right: 22px;
+  bottom: 140px;
+  width: min(360px, calc(100% - 44px));
+  padding: 15px 16px;
+  border-left: 5px solid var(--brand);
+}
+
+.office-3d-detail-literature { border-left-color: var(--info); }
+.office-3d-detail-writer,
+.office-3d-detail-citation,
+.office-3d-detail-worker { border-left-color: var(--success); }
+.office-3d-detail-reviewer { border-left-color: var(--warning); }
+
+.office-3d-detail div,
+.office-3d-detail span {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.office-3d-detail em {
+  border-radius: 999px;
+  background: var(--surface-3);
+  color: var(--neutral-text);
+  font-style: normal;
+  font-weight: 700;
+  padding: 4px 9px;
+}
+
+.office-3d-detail p {
+  margin: 10px 0 12px;
+  line-height: 1.4;
+}
+
+.office-3d-detail b {
+  color: var(--brand);
+}
+
+.office-3d-feed {
+  right: 22px;
+  bottom: 22px;
+  width: min(430px, calc(100% - 44px));
+  padding: 13px;
+}
+
+.office-3d-feed-head {
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.office-3d-feed-item {
+  display: grid;
+  grid-template-columns: 72px 90px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 42px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-left: 5px solid var(--brand);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.office-3d-feed-item-problem { border-left-color: var(--danger); }
+.office-3d-feed-item-worker { border-left-color: var(--success); }
+.office-3d-feed-item-reviewer { border-left-color: var(--warning); }
+.office-3d-feed-item-runtime { border-left-color: var(--text-muted); }
+
+.office-3d-feed-item span {
+  color: var(--text-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.78rem;
+}
+
+.office-3d-board-item:hover,
+.office-3d-board-item:focus-visible,
+.office-3d-feed-item:hover,
+.office-3d-feed-item:focus-visible,
+.office-3d-role-label:hover,
+.office-3d-role-label:focus-visible {
+  border-color: rgba(71, 116, 101, 0.4);
+  outline: none;
+  transform: translateY(-1px);
+}
+
+.office-3d-role-label:hover,
+.office-3d-role-label:focus-visible {
+  transform: translate(-50%, calc(-50% - 1px));
+}
+
+@media (max-width: 980px) {
+  .office-3d-shell {
+    height: 760px;
+  }
+
+  .office-3d-topbar {
+    top: 12px;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+  }
+
+  .office-3d-board {
+    top: 96px;
+  }
+
+  .office-3d-detail {
+    right: 14px;
+    bottom: 156px;
+  }
+
+  .office-3d-feed {
+    right: 14px;
+    bottom: 14px;
+  }
+
+  .office-3d-role-label {
+    width: 132px;
+    max-width: 30vw;
+    font-size: 0.82rem;
+  }
+}
+
+@media (max-width: 640px) {
+  .office-3d-shell {
+    height: 880px;
+  }
+
+  .office-3d-board,
+  .office-3d-detail,
+  .office-3d-feed {
+    left: 12px;
+    right: 12px;
+    width: auto;
+  }
+
+  .office-3d-board {
+    top: 102px;
+  }
+
+  .office-3d-detail {
+    bottom: 210px;
+  }
+
+  .office-3d-feed {
+    bottom: 12px;
+  }
+
+  .office-3d-feed-item {
+    grid-template-columns: 58px 78px minmax(0, 1fr);
+    gap: 7px;
+    font-size: 0.82rem;
+  }
+
+  .office-3d-role-label {
+    width: 112px;
+    max-width: 34vw;
+    padding: 7px 8px;
+  }
+}
+
 * { box-sizing: border-box; }
 
 * {

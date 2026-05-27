@@ -77,6 +77,7 @@ import type {
   WorkspaceInfo,
 } from "./types"
 import { Badge, Button, Card, Dialog, Input, Select, Tabs, Textarea } from "./components/ui"
+import { Office3DScene, type Office3DDesk, type Office3DProblem, type Office3DSignal } from "./Office3DScene"
 
 const navItems = [
   { value: "orchestrator", label: "Orchestrator", icon: <GitBranch size={16} /> },
@@ -3274,6 +3275,29 @@ function TaskBoardsPage({ workspace }: { workspace: string }) {
   const officeActiveDesks = officeRoleDesks.filter((desk) => desk.status === "running" || desk.status === "review" || desk.status === "blocked").length
   const officeProblemCards = openProblemLanes.slice(0, 3)
   const officeTimeline = collaborationSignals.slice(0, 5)
+  const office3DDesks = officeRoleDesks as Office3DDesk[]
+  const office3DProblems = useMemo<Office3DProblem[]>(
+    () =>
+      officeProblemCards.map((lane) => ({
+        id: lane.id,
+        title: lane.title,
+        status: lane.status,
+        route: problemLaneRoute(lane),
+      })),
+    [officeProblemCards],
+  )
+  const office3DSignals = useMemo<Office3DSignal[]>(
+    () =>
+      officeTimeline.map(({ key, timestamp, summary }) => ({
+        key,
+        timestamp,
+        actor: summary.actor,
+        title: summary.title,
+        tone: summary.tone,
+        nodeId: summary.nodeId,
+      })),
+    [officeTimeline],
+  )
 
   const flowEdges: WorkflowCanvasEdge[] = useMemo(
     () => {
@@ -3863,6 +3887,40 @@ function TaskBoardsPage({ workspace }: { workspace: string }) {
                 </div>
               </div>
               {canvasMode === "office" ? (
+                <>
+                  <Office3DScene
+                    activeCount={officeActiveDesks}
+                    artifactCount={runtimeSummary?.artifact_count ?? 0}
+                    desks={office3DDesks}
+                    executionLabel={executionStateLabel(executionState)}
+                    openIssueCount={activeProblemCount}
+                    problems={office3DProblems}
+                    signals={office3DSignals}
+                    onOpenProblem={(problem) => {
+                      const lane = officeProblemCards.find((item) => item.id === problem.id)
+                      if (!lane?.primaryTaskId) return
+                      setSelectedNodeId(lane.primaryTaskId)
+                      setSelectedEdgeId("")
+                      setCanvasMode("task")
+                      const node = draft.graph_json.nodes.find((item) => item.id === lane.primaryTaskId)
+                      if (node) setSelectedRole(canonicalRoleForNode(node, boardTaskById.get(node.id)))
+                    }}
+                    onOpenSignal={(signal) => {
+                      if (!signal.nodeId) return
+                      setSelectedNodeId(signal.nodeId)
+                      setSelectedEdgeId("")
+                      setCanvasMode("task")
+                      const node = draft.graph_json.nodes.find((item) => item.id === signal.nodeId)
+                      if (node) setSelectedRole(canonicalRoleForNode(node, boardTaskById.get(node.id)))
+                    }}
+                    onSelectDesk={(desk) => {
+                      setSelectedRole(desk.role)
+                      setOfficeDetailRole(desk.role)
+                      setSelectedNodeId(desk.taskId)
+                      setSelectedEdgeId("")
+                    }}
+                  />
+                  <div className="office-legacy-hidden" aria-hidden="true">
                 <div className={`office-shell office-shell-${executionState}`}>
                   <div className="office-stage" aria-label="Animated team office">
                     <div className="office-room-fixtures" aria-hidden="true">
@@ -4118,6 +4176,8 @@ function TaskBoardsPage({ workspace }: { workspace: string }) {
                     </div>
                   </div>
                 </div>
+                  </div>
+                </>
               ) : (
                 <div className="flow-shell role-flow-shell">
                   {roleRuntimeLive && (
