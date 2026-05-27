@@ -101,6 +101,7 @@
 
 .office-3d-shell {
   position: relative;
+  container-type: inline-size;
   min-height: min(78vh, 820px);
   height: clamp(620px, 74vh, 860px);
   overflow: hidden;
@@ -157,15 +158,14 @@
 }
 
 .office-3d-topbar {
-  top: 18px;
-  left: 50%;
+  top: 14px;
+  left: 16px;
   display: flex;
-  width: min(660px, calc(100% - 48px));
+  width: min(330px, calc(100% - 32px));
   align-items: center;
   justify-content: space-between;
-  gap: 18px;
-  padding: 14px 18px;
-  transform: translateX(-50%);
+  gap: 12px;
+  padding: 10px 12px;
 }
 
 .office-3d-topbar div {
@@ -176,7 +176,7 @@
 
 .office-3d-topbar strong {
   color: var(--text-strong);
-  font-size: 1.22rem;
+  font-size: 1rem;
   line-height: 1.05;
 }
 
@@ -189,10 +189,10 @@
 }
 
 .office-3d-board {
-  top: 108px;
-  left: 22px;
-  width: min(330px, calc(100% - 44px));
-  padding: 14px;
+  top: 14px;
+  right: 16px;
+  width: min(280px, calc(100% - 32px));
+  padding: 12px;
 }
 
 .office-3d-board-head,
@@ -266,11 +266,12 @@
 
 .office-3d-role-label {
   position: absolute;
-  display: grid;
-  width: 154px;
-  max-width: 22vw;
+  display: flex;
+  width: auto;
+  max-width: 150px;
+  align-items: center;
   gap: 2px;
-  padding: 8px 10px;
+  padding: 6px 9px;
   border-left: 4px solid var(--brand);
   border-radius: 8px;
   box-shadow: 0 10px 24px rgba(32, 46, 40, 0.12);
@@ -292,9 +293,9 @@
 }
 
 .office-3d-detail {
-  right: 22px;
-  bottom: 140px;
-  width: min(360px, calc(100% - 44px));
+  left: 16px;
+  bottom: 16px;
+  width: min(320px, calc(100% - 32px));
   padding: 15px 16px;
   border-left: 5px solid var(--brand);
 }
@@ -332,9 +333,9 @@
 }
 
 .office-3d-feed {
-  right: 22px;
-  bottom: 22px;
-  width: min(430px, calc(100% - 44px));
+  right: 16px;
+  bottom: 16px;
+  width: min(380px, calc(100% - 32px));
   padding: 13px;
 }
 
@@ -345,9 +346,9 @@
 
 .office-3d-feed-item {
   display: grid;
-  grid-template-columns: 72px 90px minmax(0, 1fr);
+  grid-template-columns: 64px 88px minmax(0, 1fr);
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   width: 100%;
   min-height: 42px;
   margin-top: 8px;
@@ -355,6 +356,60 @@
   border-left: 5px solid var(--brand);
   border-radius: 8px;
   cursor: pointer;
+}
+
+@container (max-width: 860px) {
+  .office-3d-topbar,
+  .office-3d-board,
+  .office-3d-detail,
+  .office-3d-feed {
+    background: rgba(255, 255, 255, 0.76);
+  }
+
+  .office-3d-topbar {
+    width: 250px;
+  }
+
+  .office-3d-topbar em {
+    display: none;
+  }
+
+  .office-3d-board {
+    width: 250px;
+  }
+
+  .office-3d-board-list {
+    gap: 6px;
+    margin-top: 8px;
+  }
+
+  .office-3d-board-item {
+    padding: 8px 9px;
+  }
+
+  .office-3d-detail {
+    width: 270px;
+  }
+
+  .office-3d-feed {
+    width: 340px;
+  }
+
+  .office-3d-feed-item {
+    grid-template-columns: 58px 84px minmax(0, 1fr);
+    min-height: 38px;
+    padding: 7px 9px;
+  }
+
+  .office-3d-role-label {
+    max-width: 156px;
+    padding: 5px 7px;
+    font-size: 0.82rem;
+  }
+
+  .office-3d-role-label span {
+    display: none;
+  }
 }
 
 .office-3d-feed-item-problem { border-left-color: var(--danger); }
@@ -435,23 +490,43 @@
   }
 
   .office-3d-detail {
-    bottom: 210px;
+    bottom: 250px;
   }
 
   .office-3d-feed {
     bottom: 12px;
+    max-height: 220px;
+    overflow-y: auto;
   }
 
   .office-3d-feed-item {
-    grid-template-columns: 58px 78px minmax(0, 1fr);
+    grid-template-columns: 78px minmax(0, 1fr);
     gap: 7px;
     font-size: 0.82rem;
   }
 
+  .office-3d-feed-item strong {
+    display: none;
+  }
+
+  .office-3d-feed-item small {
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+
   .office-3d-role-label {
-    width: 112px;
-    max-width: 34vw;
+    width: auto;
+    max-width: 150px;
     padding: 7px 8px;
+  }
+
+  .office-3d-role-label-reviewer,
+  .office-3d-role-label-citation,
+  .office-3d-role-label-worker,
+  .office-3d-role-label-gate {
+    display: none;
   }
 }
 

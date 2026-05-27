@@ -79,6 +79,16 @@ const KIND_POSITIONS: Record<TeamRoleKind, THREE.Vector3> = {
   gate: new THREE.Vector3(0, 0, 3.25),
 }
 
+const LABEL_POSITIONS: Partial<Record<TeamRoleKind, { left: string; top: string }>> = {
+  planner: { left: "53%", top: "33%" },
+  literature: { left: "25%", top: "49%" },
+  writer: { left: "79%", top: "49%" },
+  reviewer: { left: "42%", top: "66%" },
+  citation: { left: "24%", top: "72%" },
+  worker: { left: "76%", top: "72%" },
+  gate: { left: "53%", top: "80%" },
+}
+
 function truncateText(value: string, limit: number) {
   const text = value.trim()
   return text.length > limit ? `${text.slice(0, Math.max(0, limit - 1))}…` : text
@@ -108,15 +118,15 @@ function canvasTexture(lines: string[], options: { title: string; width?: number
   ctx.fillRect(0, 0, canvas.width, canvas.height)
   ctx.fillStyle = "rgba(255,255,255,0.08)"
   for (let y = 72; y < canvas.height; y += 70) ctx.fillRect(56, y, canvas.width - 112, 2)
-  ctx.font = "700 58px Inter, Arial, sans-serif"
+  ctx.font = "700 64px Inter, Arial, sans-serif"
   ctx.fillStyle = "#f6fff8"
-  ctx.fillText(options.title, 58, 82)
-  ctx.font = "600 34px Inter, Arial, sans-serif"
+  ctx.fillText(options.title, 58, 88)
+  ctx.font = "650 42px Inter, Arial, sans-serif"
   ctx.fillStyle = "#d8efe6"
   lines.slice(0, 5).forEach((line, index) => {
-    const y = 150 + index * 78
+    const y = 164 + index * 84
     ctx.fillStyle = index === 0 ? "#fff8d6" : "#d8efe6"
-    ctx.fillText(`• ${truncateText(line, 42)}`, 76, y)
+    ctx.fillText(`• ${truncateText(line, 34)}`, 76, y)
   })
   const texture = new THREE.CanvasTexture(canvas)
   texture.colorSpace = THREE.SRGBColorSpace
@@ -281,11 +291,11 @@ function addRoom(scene: THREE.Scene, problemTexture: THREE.Texture) {
     scene.add(book)
   }
 
-  const blackboard = new THREE.Mesh(new THREE.PlaneGeometry(2.45, 1.38), material(0xffffff, { map: problemTexture, roughness: 0.6 }))
-  blackboard.position.set(0, 2.17, -3.515)
+  const blackboard = new THREE.Mesh(new THREE.PlaneGeometry(3.45, 1.62), material(0xffffff, { map: problemTexture, roughness: 0.6 }))
+  blackboard.position.set(0, 2.08, -3.515)
   scene.add(blackboard)
-  const frame = roundedBox(2.62, 1.54, 0.06, 0x8c7a58)
-  frame.position.set(0, 2.17, -3.54)
+  const frame = roundedBox(3.62, 1.78, 0.06, 0x8c7a58)
+  frame.position.set(0, 2.08, -3.54)
   scene.add(frame)
   blackboard.position.z = -3.49
 }
@@ -359,6 +369,7 @@ export function Office3DScene({
   const onSelectDeskRef = useRef(onSelectDesk)
   const [webglUnavailable, setWebglUnavailable] = useState(false)
   const selectedDesk = desks.find((desk) => desk.selected) ?? desks[0]
+  const labelPositionFor = (desk: Office3DDesk) => LABEL_POSITIONS[desk.kind] ?? { left: desk.left, top: desk.top }
   const sceneKey = useMemo(
     () =>
       JSON.stringify({
@@ -388,7 +399,7 @@ export function Office3DScene({
 
     let renderer: THREE.WebGLRenderer
     try {
-      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false })
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, preserveDrawingBuffer: true })
       setWebglUnavailable(false)
     } catch {
       setWebglUnavailable(true)
@@ -414,7 +425,7 @@ export function Office3DScene({
 
     const boardLines = problems.length
       ? problems.map((problem) => `${problem.title} · ${problem.status}`)
-      : ["No open blockers", "Planner is waiting for useful new signals"]
+      : ["No open blockers", "Planner watches useful new signals"]
     const problemTexture = canvasTexture(boardLines, { title: `Problem Board (${openIssueCount})` })
     addRoom(scene, problemTexture)
 
@@ -576,8 +587,9 @@ export function Office3DScene({
             className={`office-3d-role-label office-3d-role-label-${desk.kind}${desk.selected ? " office-3d-role-label-selected" : ""}`}
             key={desk.role}
             onClick={() => onSelectDesk(desk)}
-            style={{ left: desk.left, top: desk.top }}
+            style={labelPositionFor(desk)}
             type="button"
+            aria-label={`${desk.role}: ${desk.statusLabel}`}
           >
             <strong>{desk.role}</strong>
             <span>{desk.statusLabel}</span>
@@ -604,7 +616,7 @@ export function Office3DScene({
           <strong>Information Flow</strong>
           <MousePointer2 size={13} />
         </div>
-        {signals.slice(0, 4).map((signal) => (
+        {signals.slice(0, 3).map((signal) => (
           <button className={`office-3d-feed-item office-3d-feed-item-${signal.tone}`} key={signal.key} onClick={() => onOpenSignal(signal)} type="button">
             <span>{signal.timestamp.slice(11, 19)}</span>
             <strong>{signal.actor}</strong>
